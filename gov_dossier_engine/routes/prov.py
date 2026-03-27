@@ -7,6 +7,8 @@ PROV export and visualization endpoints.
 
 from __future__ import annotations
 
+from collections import defaultdict
+from datetime import datetime
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import HTMLResponse
@@ -262,16 +264,13 @@ def register_prov_routes(app, registry: PluginRegistry, get_user):
             # Add activities as nodes
             for idx, act in enumerate(activities):
                 act_id = f"act-{act.id}"
-                label = act.type
-                if act.started_at:
-                    label += f"\n{act.started_at.strftime('%H:%M:%S')}"
                 nodes.append({
                     "id": act_id,
                     "label": act.type,
                     "type": "activity",
                     "order": idx,
                     "time": act.started_at.isoformat() if act.started_at else "",
-                    "detail": f"Activity: {act.type}",
+                    "detail": f"Activity: {act.type}\nTime: {act.started_at.strftime('%Y-%m-%d %H:%M:%S') if act.started_at else 'n/a'}\nID: {act.id}",
                     "informed_by": str(act.informed_by) if act.informed_by else None,
                 })
                 node_ids.add(act_id)
@@ -293,13 +292,13 @@ def register_prov_routes(app, registry: PluginRegistry, get_user):
                             "id": agent_id,
                             "label": assoc.agent_name or assoc.agent_id,
                             "type": "agent",
-                            "detail": f"Agent: {assoc.agent_name} ({assoc.agent_type})",
+                            "detail": f"Agent: {assoc.agent_name}\nType: {assoc.agent_type}\nID: {assoc.agent_id}",
                         })
                         node_ids.add(agent_id)
                     edges.append({
                         "source": agent_id,
                         "target": act_id,
-                        "label": f"wasAssociatedWith\n({assoc.role})",
+                        "label": f"wasAssociatedWith ({assoc.role})",
                         "type": "associated",
                     })
 
@@ -309,14 +308,16 @@ def register_prov_routes(app, registry: PluginRegistry, get_user):
                     if entity:
                         ent_id = f"ent-{entity.id}"
                         if ent_id not in node_ids:
-                            ent_label = f"{entity.type}"
+                            entity_url = f"/dossiers/{dossier_id}/entities/{entity.type}/{entity.entity_id}/{entity.id}"
                             nodes.append({
                                 "id": ent_id,
-                                "label": ent_label,
+                                "label": entity.type,
                                 "type": "entity",
                                 "entity_type": entity.type,
+                                "logical_id": str(entity.entity_id),
                                 "time": entity.created_at.isoformat() if entity.created_at else "",
-                                "detail": f"Entity: {entity.type}\nID: {entity.entity_id}\nVersion: {entity.id}",
+                                "url": entity_url,
+                                "detail": f"Entity: {entity.type}\nLogical ID: {entity.entity_id}\nVersion: {entity.id}\nAttributed to: {entity.attributed_to or 'n/a'}",
                             })
                             node_ids.add(ent_id)
                         edges.append({
@@ -326,19 +327,59 @@ def register_prov_routes(app, registry: PluginRegistry, get_user):
                             "type": "used",
                         })
 
+            # Build version ordering per logical entity
+            # Group entities by (type, logical_id) to determine version_order
+            logical_groups = defaultdict(list)
+            for entity in all_entities:
+                key = f"{entity.type}:{entity.entity_id}"
+                logical_groups[key].append(entity)
+
+            # Sort each group by created_at
+            for key in logical_groups:
+                logical_groups[key].sort(key=lambda e: e.created_at or datetime.min)
+
+            # Assign version_order and row_key
+            entity_version_order = {}
+            logical_row_keys = list(logical_groups.keys())
+            for entity in all_entities:
+                key = f"{entity.type}:{entity.entity_id}"
+                group = logical_groups[key]
+                version_idx = next(i for i, e in enumerate(group) if e.id == entity.id)
+                entity_version_order[str(entity.id)] = {
+                    "version_order": version_idx,
+                    "row_index": logical_row_keys.index(key),
+                    "total_rows": len(logical_row_keys),
+                }
+
             # Add entities and wasGeneratedBy edges
             for entity in all_entities:
                 ent_id = f"ent-{entity.id}"
+                entity_url = f"/dossiers/{dossier_id}/entities/{entity.type}/{entity.entity_id}/{entity.id}"
+                ver_info = entity_version_order.get(str(entity.id), {})
+
                 if ent_id not in node_ids:
                     nodes.append({
                         "id": ent_id,
-                        "label": f"{entity.type}",
+                        "label": entity.type,
                         "type": "entity",
                         "entity_type": entity.type,
+                        "logical_id": str(entity.entity_id),
+                        "version_order": ver_info.get("version_order", 0),
+                        "row_index": ver_info.get("row_index", 0),
+                        "total_rows": ver_info.get("total_rows", 1),
                         "time": entity.created_at.isoformat() if entity.created_at else "",
-                        "detail": f"Entity: {entity.type}\nID: {entity.entity_id}\nVersion: {entity.id}",
+                        "url": entity_url,
+                        "detail": f"Entity: {entity.type}\nLogical ID: {entity.entity_id}\nVersion: {entity.id}\nAttributed to: {entity.attributed_to or 'n/a'}",
                     })
                     node_ids.add(ent_id)
+                else:
+                    # Update existing node with version info
+                    for n in nodes:
+                        if n["id"] == ent_id:
+                            n["version_order"] = ver_info.get("version_order", 0)
+                            n["row_index"] = ver_info.get("row_index", 0)
+                            n["total_rows"] = ver_info.get("total_rows", 1)
+                            break
 
                 # wasGeneratedBy
                 edges.append({
@@ -347,6 +388,16 @@ def register_prov_routes(app, registry: PluginRegistry, get_user):
                     "label": "wasGeneratedBy",
                     "type": "generated",
                 })
+
+                # wasAttributedTo
+                if entity.attributed_to:
+                    attr_agent_id = f"agent-{entity.attributed_to}"
+                    edges.append({
+                        "source": attr_agent_id,
+                        "target": ent_id,
+                        "label": "wasAttributedTo",
+                        "type": "attributed",
+                    })
 
                 # wasDerivedFrom
                 if entity.derived_from:
@@ -373,7 +424,7 @@ def register_prov_routes(app, registry: PluginRegistry, get_user):
 
 
 def _build_graph_html(dossier_id: str, workflow: str, nodes_json: str, edges_json: str) -> str:
-    """Build the interactive timeline-based PROV graph HTML page."""
+    """Build the interactive timeline PROV graph with horizontal entity version chains."""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -411,19 +462,16 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; 
 .legend-line {{ width: 20px; height: 2px; }}
 
 svg {{ width: 100vw; height: 100vh; }}
-
-.link {{ fill: none; stroke-opacity: 0.4; }}
-.link:hover {{ stroke-opacity: 0.9; }}
+.link {{ fill: none; stroke-opacity: 0.35; }}
 .link-label {{ font-size: 8px; fill: #64748b; pointer-events: none; }}
-
 .node-activity {{ fill: #3b82f6; stroke: #93c5fd; stroke-width: 2; }}
-.node-entity {{ fill: #10b981; stroke: #6ee7b7; stroke-width: 1.5; }}
+.node-entity {{ fill: #10b981; stroke: #6ee7b7; stroke-width: 1.5; cursor: pointer; }}
+.node-entity:hover {{ fill: #059669; stroke: #a7f3d0; stroke-width: 2.5; }}
 .node-agent {{ fill: #f59e0b; stroke: #fcd34d; stroke-width: 1.5; }}
-
 .node-label {{ fill: #f1f5f9; pointer-events: none; text-anchor: middle; font-weight: 500; }}
 .node-time {{ font-size: 9px; fill: #64748b; pointer-events: none; text-anchor: middle; }}
-
-.timeline-line {{ stroke: #334155; stroke-width: 1; stroke-dasharray: 4,4; }}
+.row-label {{ font-size: 10px; fill: #475569; font-style: italic; }}
+.timeline-line {{ stroke: #1e293b; stroke-width: 1; }}
 </style>
 </head>
 <body>
@@ -438,14 +486,15 @@ svg {{ width: 100vw; height: 100vh; }}
 
 <div id="legend">
     <div class="legend-item"><div class="legend-dot" style="background:#3b82f6"></div> Activity</div>
-    <div class="legend-item"><div class="legend-dot" style="background:#10b981"></div> Entity</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#10b981"></div> Entity (click to view)</div>
     <div class="legend-item"><div class="legend-dot" style="background:#f59e0b"></div> Agent</div>
     <div style="margin-top:6px; border-top:1px solid #475569; padding-top:6px;">
     <div class="legend-item"><div class="legend-line" style="background:#60a5fa"></div> wasGeneratedBy</div>
     <div class="legend-item"><div class="legend-line" style="background:#f472b6"></div> used</div>
     <div class="legend-item"><div class="legend-line" style="background:#a78bfa"></div> wasInformedBy</div>
-    <div class="legend-item"><div class="legend-line" style="background:#34d399"></div> wasDerivedFrom</div>
+    <div class="legend-item"><div class="legend-line" style="background:#34d399;height:3px"></div> wasDerivedFrom</div>
     <div class="legend-item"><div class="legend-line" style="background:#fbbf24"></div> wasAssociatedWith</div>
+    <div class="legend-item"><div class="legend-line" style="background:#fb923c"></div> wasAttributedTo</div>
     </div>
 </div>
 
@@ -466,92 +515,95 @@ const edgeColors = {{
     informed: "#a78bfa",
     derived: "#34d399",
     associated: "#fbbf24",
+    attributed: "#fb923c",
 }};
 
-// ── Layout constants ──
-const MARGIN = {{ top: 80, right: 80, bottom: 80, left: 80 }};
-const ACTIVITY_ROW_Y = height * 0.45;    // activities on the middle band
-const AGENT_ROW_Y = height * 0.15;       // agents above
-const ENTITY_ROW_Y = height * 0.75;      // entities below
-const COL_SPACING = 200;                  // horizontal space between activity columns
+// ── Layout ──
+const COL_SPACING = 180;
+const ROW_SPACING = 55;
+const MARGIN = {{ top: 80, left: 100, bottom: 40, right: 80 }};
 
-// ── Pre-compute positions ──
-// Activities get fixed X positions based on their order
 const activityNodes = nodes.filter(n => n.type === "activity").sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 const entityNodes = nodes.filter(n => n.type === "entity");
 const agentNodes = nodes.filter(n => n.type === "agent");
 
-const totalWidth = Math.max(width, (activityNodes.length + 1) * COL_SPACING + MARGIN.left + MARGIN.right);
+const numCols = activityNodes.length;
+const ACTIVITY_Y = MARGIN.top + 60;
 
-// Map activity IDs to their column X
+// Activities: evenly spaced left to right
 const actXMap = {{}};
 activityNodes.forEach((act, i) => {{
-    const x = MARGIN.left + (i + 0.5) * COL_SPACING;
-    act.fx = x;
-    act.fy = ACTIVITY_ROW_Y;
-    actXMap[act.id] = x;
+    act.fx = MARGIN.left + i * COL_SPACING;
+    act.fy = ACTIVITY_Y;
+    actXMap[act.id] = act.fx;
 }});
 
-// Position entities below the activity that generated them
+// Entity rows: one row per logical entity (type + logical_id)
+// Collect unique row keys from entity nodes
+const rowKeys = [];
+const rowKeySeen = new Set();
+// Sort entities by their version_order to get consistent row assignment
+const sortedEntities = [...entityNodes].sort((a, b) => (a.row_index ?? 0) - (b.row_index ?? 0));
+sortedEntities.forEach(ent => {{
+    const key = (ent.entity_type || "") + ":" + (ent.logical_id || ent.id);
+    if (!rowKeySeen.has(key)) {{
+        rowKeySeen.add(key);
+        rowKeys.push(key);
+    }}
+}});
+
+const ENTITY_BASE_Y = ACTIVITY_Y + 90;
+
+// Position entities: row by logical entity, X by version_order
+// Find the generating activity's X as the base position, then offset by version_order
 const genEdges = edges.filter(e => e.type === "generated");
-const entityColCount = {{}};  // track how many entities per activity column
 
 entityNodes.forEach(ent => {{
-    // Find which activity generated this entity
-    const genEdge = genEdges.find(e => e.target === ent.id || (e.target && e.target.id === ent.id));
-    let parentX = totalWidth / 2;
+    const key = (ent.entity_type || "") + ":" + (ent.logical_id || ent.id);
+    const rowIdx = rowKeys.indexOf(key);
+    ent.fy = ENTITY_BASE_Y + rowIdx * ROW_SPACING;
+
+    // Find which activity generated this version
+    const genEdge = genEdges.find(e => e.target === ent.id);
+    let baseX = MARGIN.left;
     if (genEdge) {{
         const sourceId = typeof genEdge.source === "string" ? genEdge.source : genEdge.source.id;
-        parentX = actXMap[sourceId] || parentX;
+        baseX = actXMap[sourceId] ?? baseX;
     }}
-
-    // Stack entities vertically if multiple per activity
-    const colKey = Math.round(parentX);
-    entityColCount[colKey] = (entityColCount[colKey] || 0);
-    const offset = entityColCount[colKey] * 50;
-    entityColCount[colKey]++;
-
-    ent.fx = parentX;
-    ent.fy = ENTITY_ROW_Y + offset;
+    ent.fx = baseX;
 }});
 
-// Position agents above their first associated activity
-const assocEdges = edges.filter(e => e.type === "associated");
+// Agents: above the timeline, positioned near their first activity
 const agentPlaced = {{}};
+const assocEdges = edges.filter(e => e.type === "associated");
+const AGENT_Y = MARGIN.top - 10;
 
 agentNodes.forEach(agent => {{
-    const assocEdge = assocEdges.find(e => {{
+    const assoc = assocEdges.find(e => {{
         const sid = typeof e.source === "string" ? e.source : e.source.id;
         return sid === agent.id;
     }});
-    let parentX = totalWidth / 2;
-    if (assocEdge) {{
-        const targetId = typeof assocEdge.target === "string" ? assocEdge.target : assocEdge.target.id;
-        parentX = actXMap[targetId] || parentX;
+    let x = MARGIN.left;
+    if (assoc) {{
+        const tid = typeof assoc.target === "string" ? assoc.target : assoc.target.id;
+        x = actXMap[tid] ?? x;
     }}
-
-    // Offset if multiple agents at same X
-    const colKey = Math.round(parentX);
-    agentPlaced[colKey] = (agentPlaced[colKey] || 0);
-    const offset = agentPlaced[colKey] * 45;
-    agentPlaced[colKey]++;
-
-    agent.fx = parentX + offset - 20;
-    agent.fy = AGENT_ROW_Y;
+    const col = Math.round(x);
+    agentPlaced[col] = (agentPlaced[col] || 0);
+    agent.fx = x + agentPlaced[col] * 50;
+    agent.fy = AGENT_Y;
+    agentPlaced[col]++;
 }});
 
-// ── SVG setup ──
-const svg = d3.select("#graph")
-    .attr("width", width)
-    .attr("height", height);
-
-// Arrow markers
+// ── SVG ──
+const svg = d3.select("#graph").attr("width", width).attr("height", height);
 const defs = svg.append("defs");
+
 Object.entries(edgeColors).forEach(([type, color]) => {{
     defs.append("marker")
         .attr("id", `arrow-${{type}}`)
         .attr("viewBox", "0 -4 8 8")
-        .attr("refX", 30)
+        .attr("refX", type === "derived" ? 52 : 30)
         .attr("refY", 0)
         .attr("markerWidth", 5)
         .attr("markerHeight", 5)
@@ -562,97 +614,104 @@ Object.entries(edgeColors).forEach(([type, color]) => {{
 }});
 
 const g = svg.append("g");
-
-// Zoom + pan
-const zoom = d3.zoom()
-    .scaleExtent([0.15, 3])
-    .on("zoom", (event) => g.attr("transform", event.transform));
+const zoom = d3.zoom().scaleExtent([0.15, 3]).on("zoom", e => g.attr("transform", e.transform));
 svg.call(zoom);
 
-// ── Timeline baseline ──
+// ── Row labels ──
+rowKeys.forEach((key, i) => {{
+    const label = key.split(":")[0].replace("oe:", "");
+    g.append("text")
+        .attr("class", "row-label")
+        .attr("x", MARGIN.left - 15)
+        .attr("y", ENTITY_BASE_Y + i * ROW_SPACING + 4)
+        .attr("text-anchor", "end")
+        .text(label);
+    // Row background line
+    g.append("line")
+        .attr("class", "timeline-line")
+        .attr("x1", MARGIN.left - 10)
+        .attr("y1", ENTITY_BASE_Y + i * ROW_SPACING)
+        .attr("x2", MARGIN.left + (numCols - 1) * COL_SPACING + 10)
+        .attr("y2", ENTITY_BASE_Y + i * ROW_SPACING)
+        .attr("stroke-dasharray", "2,6")
+        .attr("stroke-opacity", 0.3);
+}});
+
+// Activity timeline line
 g.append("line")
     .attr("class", "timeline-line")
-    .attr("x1", MARGIN.left - 30)
-    .attr("y1", ACTIVITY_ROW_Y)
-    .attr("x2", totalWidth - MARGIN.right + 30)
-    .attr("y2", ACTIVITY_ROW_Y);
+    .attr("x1", MARGIN.left - 20).attr("y1", ACTIVITY_Y)
+    .attr("x2", MARGIN.left + (numCols - 1) * COL_SPACING + 20).attr("y2", ACTIVITY_Y)
+    .attr("stroke-dasharray", "4,4").attr("stroke-opacity", 0.4);
 
-// ── Links (curved paths) ──
-const link = g.append("g")
-    .selectAll("path")
-    .data(edges)
-    .join("path")
+// ── Edges ──
+const link = g.append("g").selectAll("path").data(edges).join("path")
     .attr("class", "link")
     .attr("stroke", d => edgeColors[d.type] || "#475569")
-    .attr("stroke-width", d => d.type === "informed" ? 2 : 1.5)
+    .attr("stroke-width", d => d.type === "derived" ? 2.5 : d.type === "informed" ? 2 : 1.2)
+    .attr("stroke-dasharray", d => d.type === "attributed" ? "3,3" : null)
     .attr("marker-end", d => `url(#arrow-${{d.type}})`)
     .attr("fill", "none");
 
-// Link labels (hidden by default, show on hover — less clutter)
-const linkLabel = g.append("g")
-    .selectAll("text")
-    .data(edges)
-    .join("text")
+const linkLabel = g.append("g").selectAll("text").data(edges).join("text")
     .attr("class", "link-label")
     .text(d => d.label.split("\\n")[0])
     .style("opacity", 0);
 
 // ── Nodes ──
-const node = g.append("g")
-    .selectAll("g")
-    .data(nodes)
-    .join("g")
-    .attr("cursor", "pointer");
+const node = g.append("g").selectAll("g").data(nodes).join("g").attr("cursor", d => d.url ? "pointer" : "default");
 
-// Node shapes
 node.each(function(d) {{
     const el = d3.select(this);
-
     if (d.type === "activity") {{
-        el.append("rect")
-            .attr("x", -55).attr("y", -20)
-            .attr("width", 110).attr("height", 40)
-            .attr("rx", 8)
-            .attr("class", "node-activity");
+        el.append("rect").attr("x", -55).attr("y", -18).attr("width", 110).attr("height", 36).attr("rx", 8).attr("class", "node-activity");
     }} else if (d.type === "entity") {{
-        el.append("ellipse")
-            .attr("rx", 50).attr("ry", 16)
-            .attr("class", "node-entity");
+        el.append("rect").attr("x", -44).attr("y", -14).attr("width", 88).attr("height", 28).attr("rx", 14).attr("class", "node-entity");
     }} else {{
-        el.append("circle")
-            .attr("r", 16)
-            .attr("class", "node-agent");
+        el.append("circle").attr("r", 14).attr("class", "node-agent");
     }}
 }});
 
-// Node labels
 node.append("text")
     .attr("class", "node-label")
     .attr("dy", d => d.type === "entity" ? 4 : d.type === "agent" ? 5 : 5)
-    .attr("font-size", d => d.type === "activity" ? "10px" : "9px")
+    .attr("font-size", d => d.type === "activity" ? "9px" : d.type === "entity" ? "8.5px" : "9px")
     .text(d => {{
         let label = d.label;
-        // Strip "oe:" prefix for cleaner display
         if (label.startsWith("oe:")) label = label.slice(3);
-        return label.length > 20 ? label.slice(0, 18) + "…" : label;
+        return label.length > 18 ? label.slice(0, 16) + "…" : label;
     }});
+
+// Version number badge on entities
+node.filter(d => d.type === "entity" && d.version_order !== undefined)
+    .append("text")
+    .attr("font-size", "7px")
+    .attr("fill", "#94a3b8")
+    .attr("text-anchor", "middle")
+    .attr("dy", -18)
+    .text(d => `v${{d.version_order + 1}}`);
 
 // Time labels below activities
 node.filter(d => d.type === "activity" && d.time)
     .append("text")
     .attr("class", "node-time")
-    .attr("dy", 34)
+    .attr("dy", 30)
     .text(d => {{
         const date = new Date(d.time);
         return date.toLocaleTimeString("nl-BE", {{ hour: "2-digit", minute: "2-digit", second: "2-digit" }});
     }});
 
+// ── Click: open entity endpoint ──
+node.filter(d => d.url).on("click", (event, d) => {{
+    window.open(d.url, "_blank");
+}});
+
 // ── Tooltip ──
 const tooltip = d3.select("#tooltip");
-
 node.on("mouseover", (event, d) => {{
-    tooltip.style("opacity", 1).html(d.detail || d.label);
-    // Show labels on connected edges
+    let html = d.detail || d.label;
+    if (d.url) html += "\\n\\n(click to view entity)";
+    tooltip.style("opacity", 1).html(html);
     linkLabel.style("opacity", e => {{
         const sid = typeof e.source === "string" ? e.source : e.source.id;
         const tid = typeof e.target === "string" ? e.target : e.target.id;
@@ -660,39 +719,36 @@ node.on("mouseover", (event, d) => {{
     }});
 }})
 .on("mousemove", (event) => {{
-    tooltip.style("left", (event.clientX + 16) + "px")
-        .style("top", (event.clientY - 10) + "px");
+    tooltip.style("left", (event.clientX + 16) + "px").style("top", (event.clientY - 10) + "px");
 }})
 .on("mouseout", () => {{
     tooltip.style("opacity", 0);
     linkLabel.style("opacity", 0);
 }});
 
-// ── Minimal simulation (just to resolve edge references, positions are fixed) ──
+// ── Minimal simulation for edge resolution ──
 const simulation = d3.forceSimulation(nodes)
     .force("link", d3.forceLink(edges).id(d => d.id).strength(0))
     .alphaDecay(0.5)
     .on("tick", () => {{
-        // Curved links
         link.attr("d", d => {{
             const sx = d.source.x, sy = d.source.y;
             const tx = d.target.x, ty = d.target.y;
-            const dx = tx - sx, dy = ty - sy;
+            const dx = Math.abs(tx - sx), dy = Math.abs(ty - sy);
 
-            // Slight curve for horizontal links, more curve for vertical
-            if (Math.abs(dy) < 30) {{
-                // Nearly horizontal — gentle arc
-                const mid = (sy + ty) / 2 - 30;
+            if (d.type === "derived") {{
+                // Horizontal arrow between versions in same row
+                return `M${{sx + 44}},${{sy}} L${{tx - 44}},${{ty}}`;
+            }}
+            if (dy < 10) {{
+                // Horizontal: gentle arc
+                const mid = (sy + ty) / 2 - 25;
                 return `M${{sx}},${{sy}} Q${{(sx+tx)/2}},${{mid}} ${{tx}},${{ty}}`;
             }}
-            // Default: straight line
+            // Vertical or diagonal: straight
             return `M${{sx}},${{sy}} L${{tx}},${{ty}}`;
         }});
-
-        linkLabel
-            .attr("x", d => (d.source.x + d.target.x) / 2)
-            .attr("y", d => (d.source.y + d.target.y) / 2 - 5);
-
+        linkLabel.attr("x", d => (d.source.x + d.target.x) / 2).attr("y", d => (d.source.y + d.target.y) / 2 - 5);
         node.attr("transform", d => `translate(${{d.x}},${{d.y}})`);
     }});
 
@@ -703,13 +759,10 @@ setTimeout(() => {{
     const bh = bounds.height || height;
     const midX = bounds.x + bw / 2;
     const midY = bounds.y + bh / 2;
-    const scale = 0.85 / Math.max(bw / width, bh / height);
-    const tx = width / 2 - scale * midX;
-    const ty = height / 2 - scale * midY;
-
+    const scale = Math.min(0.9, 0.85 / Math.max(bw / width, bh / height));
     svg.transition().duration(600).call(
         zoom.transform,
-        d3.zoomIdentity.translate(tx, ty).scale(scale)
+        d3.zoomIdentity.translate(width / 2 - scale * midX, height / 2 - scale * midY).scale(scale)
     );
 }}, 500);
 

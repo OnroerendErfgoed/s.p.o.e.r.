@@ -318,6 +318,143 @@ def register_routes(app: FastAPI, registry: PluginRegistry, get_user):
 
             return {"dossiers": items}
 
+    # --- Entity endpoints ---
+
+    @app.get(
+        "/dossiers/{dossier_id}/entities/{entity_type}",
+        tags=["entities"],
+        summary="Get all versions of an entity type",
+        description="Returns all versions of a given entity type in this dossier, ordered by creation time. Respects dossier_access visibility.",
+    )
+    async def get_entity_versions(
+        dossier_id: UUID,
+        entity_type: str,
+        user: User = Depends(get_user),
+    ):
+        session_factory = get_session_factory()
+        async with session_factory() as session:
+            repo = Repository(session)
+
+            dossier = await repo.get_dossier(dossier_id)
+            if not dossier:
+                raise HTTPException(404, detail="Dossier not found")
+
+            # Check dossier_access
+            visible_types = await _get_visible_types(repo, dossier_id, user)
+            if visible_types is not None and entity_type not in visible_types:
+                raise HTTPException(403, detail=f"No access to entity type '{entity_type}'")
+
+            entities = await repo.get_entities_by_type(dossier_id, entity_type)
+            if not entities:
+                raise HTTPException(404, detail=f"No entities of type '{entity_type}' found")
+
+            return {
+                "dossier_id": str(dossier_id),
+                "entity_type": entity_type,
+                "versions": [
+                    {
+                        "versionId": str(e.id),
+                        "entityId": str(e.entity_id),
+                        "content": e.content,
+                        "generatedBy": str(e.generated_by),
+                        "derivedFrom": str(e.derived_from) if e.derived_from else None,
+                        "attributedTo": e.attributed_to,
+                        "createdAt": e.created_at.isoformat() if e.created_at else None,
+                    }
+                    for e in entities
+                ],
+            }
+
+    @app.get(
+        "/dossiers/{dossier_id}/entities/{entity_type}/{entity_id}",
+        tags=["entities"],
+        summary="Get all versions of a specific logical entity",
+        description="Returns all versions of a specific logical entity (by entity_id), ordered by creation time.",
+    )
+    async def get_logical_entity_versions(
+        dossier_id: UUID,
+        entity_type: str,
+        entity_id: UUID,
+        user: User = Depends(get_user),
+    ):
+        session_factory = get_session_factory()
+        async with session_factory() as session:
+            repo = Repository(session)
+
+            dossier = await repo.get_dossier(dossier_id)
+            if not dossier:
+                raise HTTPException(404, detail="Dossier not found")
+
+            # Check dossier_access
+            visible_types = await _get_visible_types(repo, dossier_id, user)
+            if visible_types is not None and entity_type not in visible_types:
+                raise HTTPException(403, detail=f"No access to entity type '{entity_type}'")
+
+            entities = await repo.get_entity_versions(dossier_id, entity_id)
+            # Filter by type to be safe
+            versions = [e for e in entities if e.type == entity_type]
+            if not versions:
+                raise HTTPException(404, detail=f"Entity not found")
+
+            return {
+                "dossier_id": str(dossier_id),
+                "entity_type": entity_type,
+                "entity_id": str(entity_id),
+                "versions": [
+                    {
+                        "versionId": str(e.id),
+                        "content": e.content,
+                        "generatedBy": str(e.generated_by),
+                        "derivedFrom": str(e.derived_from) if e.derived_from else None,
+                        "attributedTo": e.attributed_to,
+                        "createdAt": e.created_at.isoformat() if e.created_at else None,
+                    }
+                    for e in versions
+                ],
+            }
+
+    @app.get(
+        "/dossiers/{dossier_id}/entities/{entity_type}/{entity_id}/{version_id}",
+        tags=["entities"],
+        summary="Get a specific entity version",
+        description="Returns a single entity version by its version ID.",
+    )
+    async def get_entity_version(
+        dossier_id: UUID,
+        entity_type: str,
+        entity_id: UUID,
+        version_id: UUID,
+        user: User = Depends(get_user),
+    ):
+        session_factory = get_session_factory()
+        async with session_factory() as session:
+            repo = Repository(session)
+
+            dossier = await repo.get_dossier(dossier_id)
+            if not dossier:
+                raise HTTPException(404, detail="Dossier not found")
+
+            # Check dossier_access
+            visible_types = await _get_visible_types(repo, dossier_id, user)
+            if visible_types is not None and entity_type not in visible_types:
+                raise HTTPException(403, detail=f"No access to entity type '{entity_type}'")
+
+            entity = await repo.get_entity(version_id)
+            if not entity or entity.dossier_id != dossier_id or entity.type != entity_type:
+                raise HTTPException(404, detail="Entity version not found")
+
+            return {
+                "dossier_id": str(dossier_id),
+                "entity_type": entity_type,
+                "entity_id": str(entity.entity_id),
+                "versionId": str(entity.id),
+                "content": entity.content,
+                "generatedBy": str(entity.generated_by),
+                "derivedFrom": str(entity.derived_from) if entity.derived_from else None,
+                "attributedTo": entity.attributed_to,
+                "createdAt": entity.created_at.isoformat() if entity.created_at else None,
+            }
+
     # --- Per-workflow typed route wrappers for docs ---
 
     for plugin in registry.all_plugins():
@@ -485,3 +622,22 @@ def _build_activity_description(act_def: dict, plugin: Plugin) -> str:
         desc += "\n"
 
     return desc
+
+
+async def _get_visible_types(repo: Repository, dossier_id, user) -> set[str] | None:
+    """Get the set of entity types visible to this user, or None if no filtering."""
+    access_entity = await repo.get_latest_entity(dossier_id, "oe:dossier_access")
+    if not access_entity or not access_entity.content:
+        return None  # no access entity = no filtering
+
+    for entry in access_entity.content.get("access", []):
+        entry_role = entry.get("role")
+        if entry_role and entry_role in user.roles:
+            view_list = entry.get("view", [])
+            return set(view_list) if view_list else None
+        entry_agents = entry.get("agents", [])
+        if user.id in entry_agents:
+            view_list = entry.get("view", [])
+            return set(view_list) if view_list else None
+
+    return set()  # no match = see nothing

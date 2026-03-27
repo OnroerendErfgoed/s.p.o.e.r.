@@ -427,7 +427,7 @@ async def execute_activity(
                 content=content,
                 entity_id=parsed["id"],
                 id=parsed["version"],
-                attributed_to=None,
+                attributed_to=user.id,
             )
         else:
             # Reference to existing entity

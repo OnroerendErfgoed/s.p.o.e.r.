@@ -272,6 +272,17 @@ class Repository:
         )
         return list(result.scalars().all())
 
+    async def get_entity_versions(self, dossier_id: UUID, entity_id: UUID) -> list[EntityRow]:
+        """Get all versions of a specific logical entity, ordered by creation time."""
+        from sqlalchemy import select
+        result = await self.session.execute(
+            select(EntityRow)
+            .where(EntityRow.dossier_id == dossier_id)
+            .where(EntityRow.entity_id == entity_id)
+            .order_by(EntityRow.created_at)
+        )
+        return list(result.scalars().all())
+
     async def entity_type_exists(self, dossier_id: UUID, entity_type: str) -> bool:
         from sqlalchemy import select, func
         result = await self.session.execute(
