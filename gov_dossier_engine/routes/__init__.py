@@ -176,7 +176,7 @@ def register_routes(app: FastAPI, registry: PluginRegistry, get_user):
             visible_prefixes = None  # None = no filtering (full access)
             activity_view_mode = "all"
 
-            access_entity = await repo.get_latest_entity(dossier_id, "dossier_access")
+            access_entity = await repo.get_latest_entity(dossier_id, "oe:dossier_access")
             if access_entity and access_entity.content:
                 access_entries = access_entity.content.get("access", [])
                 matched_entry = None
@@ -197,9 +197,7 @@ def register_routes(app: FastAPI, registry: PluginRegistry, get_user):
                     raise HTTPException(403, detail="No access to this dossier")
 
                 # Extract visibility rules from the matched entry
-                view_list = matched_entry.get("view", [])
-                if view_list:
-                    visible_prefixes = set(view_list)
+                visible_prefixes = set(matched_entry.get("view", []))
                 activity_view_mode = matched_entry.get("activity_view", "all")
 
             status = await derive_status(repo, dossier_id)
@@ -624,20 +622,4 @@ def _build_activity_description(act_def: dict, plugin: Plugin) -> str:
     return desc
 
 
-async def _get_visible_types(repo: Repository, dossier_id, user) -> set[str] | None:
-    """Get the set of entity types visible to this user, or None if no filtering."""
-    access_entity = await repo.get_latest_entity(dossier_id, "oe:dossier_access")
-    if not access_entity or not access_entity.content:
-        return None  # no access entity = no filtering
-
-    for entry in access_entity.content.get("access", []):
-        entry_role = entry.get("role")
-        if entry_role and entry_role in user.roles:
-            view_list = entry.get("view", [])
-            return set(view_list) if view_list else None
-        entry_agents = entry.get("agents", [])
-        if user.id in entry_agents:
-            view_list = entry.get("view", [])
-            return set(view_list) if view_list else None
-
-    return set()  # no match = see nothing
+from .access import get_visible_types as _get_visible_types
