@@ -285,3 +285,176 @@ echo "============================================"
 echo "List all dossiers"
 echo "============================================"
 curl -s "$BASE_URL/dossiers" -H "X-POC-User: claeyswo" | python3 -m json.tool
+echo ""
+echo ""
+
+echo "============================================"
+echo "DOSSIER 3: Batch — bewerkAanvraag + doeVoorstelBeslissing in one call"
+echo "============================================"
+echo ""
+
+echo "--- D3 Step 1: dienAanvraagIn ---"
+curl -s -X PUT "$BASE_URL/dossiers/d3000000-0000-0000-0000-000000000001/activities/a3000000-0000-0000-0000-000000000001/dienAanvraagIn" \
+  -H "Content-Type: application/json" \
+  -H "X-POC-User: jan.aanvrager" \
+  -d '{
+    "workflow": "toelatingen",
+    "used": [
+      { "entity": "https://id.erfgoed.net/erfgoedobjecten/30001" }
+    ],
+    "generated": [
+      {
+        "entity": "oe:aanvraag/e3000000-0000-0000-0000-000000000001@f3000000-0000-0000-0000-000000000001",
+        "content": {
+          "onderwerp": "Batch test — renovatie kapel",
+          "handeling": "renovatie",
+          "aanvrager": { "rrn": "85010100123" },
+          "gemeente": "Brugge",
+          "object": "https://id.erfgoed.net/erfgoedobjecten/30001"
+        }
+      }
+    ]
+  }' | python3 -m json.tool
+echo ""
+
+echo "--- D3 Step 2: BATCH bewerkAanvraag + doeVoorstelBeslissing ---"
+curl -s -X PUT "$BASE_URL/dossiers/d3000000-0000-0000-0000-000000000001/activities" \
+  -H "Content-Type: application/json" \
+  -H "X-POC-User: marie.brugge" \
+  -d '{
+    "workflow": "toelatingen",
+    "activities": [
+      {
+        "activity_id": "a3000000-0000-0000-0000-000000000002",
+        "type": "bewerkAanvraag",
+        "used": [
+          { "entity": "https://id.erfgoed.net/erfgoedobjecten/30001" }
+        ],
+        "generated": [
+          {
+            "entity": "oe:aanvraag/e3000000-0000-0000-0000-000000000001@f3000000-0000-0000-0000-000000000002",
+            "derivedFrom": "oe:aanvraag/e3000000-0000-0000-0000-000000000001@f3000000-0000-0000-0000-000000000001",
+            "content": {
+              "onderwerp": "Batch test — renovatie kapel (bewerkt met advies)",
+              "handeling": "renovatie",
+              "aanvrager": { "rrn": "85010100123" },
+              "gemeente": "Brugge",
+              "object": "https://id.erfgoed.net/erfgoedobjecten/30001"
+            }
+          }
+        ]
+      },
+      {
+        "activity_id": "a3000000-0000-0000-0000-000000000003",
+        "type": "doeVoorstelBeslissing",
+        "generated": [
+          {
+            "entity": "oe:beslissing/e3000000-0000-0000-0000-000000000002@f3000000-0000-0000-0000-000000000003",
+            "content": {
+              "beslissing": "goedgekeurd",
+              "datum": "2026-03-30T12:00:00Z",
+              "object": "https://id.erfgoed.net/erfgoedobjecten/30001",
+              "brief": "https://dms.example.com/brieven/d3-brief-001"
+            }
+          }
+        ]
+      }
+    ]
+  }' | python3 -m json.tool
+echo ""
+
+echo "--- D3 Final status (expect: beslissing_te_tekenen) ---"
+curl -s "$BASE_URL/dossiers/d3000000-0000-0000-0000-000000000001" \
+  -H "X-POC-User: marie.brugge" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Status: {d[\"status\"]}')"
+echo ""
+
+echo "D3 Graph: $BASE_URL/dossiers/d3000000-0000-0000-0000-000000000001/prov/graph"
+echo ""
+echo ""
+
+echo "============================================"
+echo "DOSSIER 4: Batch — explicit used ref between activities"
+echo "  bewerkAanvraag generates oe:aanvraag@new_version"
+echo "  doeVoorstelBeslissing explicitly uses that version"
+echo "============================================"
+echo ""
+
+echo "--- D4 Step 1: dienAanvraagIn ---"
+curl -s -X PUT "$BASE_URL/dossiers/d4000000-0000-0000-0000-000000000001/activities/a4000000-0000-0000-0000-000000000001/dienAanvraagIn" \
+  -H "Content-Type: application/json" \
+  -H "X-POC-User: jan.aanvrager" \
+  -d '{
+    "workflow": "toelatingen",
+    "used": [
+      { "entity": "https://id.erfgoed.net/erfgoedobjecten/40001" }
+    ],
+    "generated": [
+      {
+        "entity": "oe:aanvraag/e4000000-0000-0000-0000-000000000001@f4000000-0000-0000-0000-000000000001",
+        "content": {
+          "onderwerp": "Explicit ref batch test — restauratie toren",
+          "handeling": "renovatie",
+          "aanvrager": { "rrn": "85010100123" },
+          "gemeente": "Brugge",
+          "object": "https://id.erfgoed.net/erfgoedobjecten/40001"
+        }
+      }
+    ]
+  }' | python3 -m json.tool
+echo ""
+
+echo "--- D4 Step 2: BATCH bewerkAanvraag + doeVoorstelBeslissing (explicit used ref) ---"
+curl -s -X PUT "$BASE_URL/dossiers/d4000000-0000-0000-0000-000000000001/activities" \
+  -H "Content-Type: application/json" \
+  -H "X-POC-User: marie.brugge" \
+  -d '{
+    "workflow": "toelatingen",
+    "activities": [
+      {
+        "activity_id": "a4000000-0000-0000-0000-000000000002",
+        "type": "bewerkAanvraag",
+        "used": [
+          { "entity": "https://id.erfgoed.net/erfgoedobjecten/40001" }
+        ],
+        "generated": [
+          {
+            "entity": "oe:aanvraag/e4000000-0000-0000-0000-000000000001@f4000000-0000-0000-0000-000000000002",
+            "derivedFrom": "oe:aanvraag/e4000000-0000-0000-0000-000000000001@f4000000-0000-0000-0000-000000000001",
+            "content": {
+              "onderwerp": "Explicit ref batch test — restauratie toren (bewerkt)",
+              "handeling": "renovatie",
+              "aanvrager": { "rrn": "85010100123" },
+              "gemeente": "Brugge",
+              "object": "https://id.erfgoed.net/erfgoedobjecten/40001"
+            }
+          }
+        ]
+      },
+      {
+        "activity_id": "a4000000-0000-0000-0000-000000000003",
+        "type": "doeVoorstelBeslissing",
+        "used": [
+          { "entity": "oe:aanvraag/e4000000-0000-0000-0000-000000000001@f4000000-0000-0000-0000-000000000002" }
+        ],
+        "generated": [
+          {
+            "entity": "oe:beslissing/e4000000-0000-0000-0000-000000000002@f4000000-0000-0000-0000-000000000003",
+            "content": {
+              "beslissing": "goedgekeurd",
+              "datum": "2026-03-30T14:00:00Z",
+              "object": "https://id.erfgoed.net/erfgoedobjecten/40001",
+              "brief": "https://dms.example.com/brieven/d4-brief-001"
+            }
+          }
+        ]
+      }
+    ]
+  }' | python3 -m json.tool
+echo ""
+
+echo "--- D4 Final status (expect: beslissing_te_tekenen) ---"
+curl -s "$BASE_URL/dossiers/d4000000-0000-0000-0000-000000000001" \
+  -H "X-POC-User: marie.brugge" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Status: {d[\"status\"]}')"
+echo ""
+
+echo "D4 Graph: $BASE_URL/dossiers/d4000000-0000-0000-0000-000000000001/prov/graph"

@@ -129,7 +129,6 @@ activities:
         description: "Valideert de aanvraag bij indiening"
 
     side_effects:
-      - activity: "setDossierAccess"
       - activity: "duidVerantwoordelijkeOrganisatieAan"
       - activity: "setSystemFields"
 
@@ -175,7 +174,6 @@ activities:
         description: "Valideert de bewerkte aanvraag"
 
     side_effects:
-      - activity: "setDossierAccess"
       - activity: "duidVerantwoordelijkeOrganisatieAan"
       - activity: "setSystemFields"
 
@@ -219,7 +217,6 @@ activities:
         description: "Valideert de vervolledigde aanvraag"
 
     side_effects:
-      - activity: "setDossierAccess"
       - activity: "duidVerantwoordelijkeOrganisatieAan"
       - activity: "setSystemFields"
 
@@ -407,6 +404,7 @@ activities:
     validators: []
     side_effects:
       - activity: "duidBehandelaarAan"
+      - activity: "setDossierAccess"
     tasks:
       - type: "custom"
         name: "duid_verantwoordelijke_org_tasks"
