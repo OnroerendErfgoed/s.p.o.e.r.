@@ -100,6 +100,11 @@ authorization:
   create_dossier:
     access: "authenticated"
 
+# =====================================================================
+# used  = things this activity reads/references (not modified)
+# generates = things this activity creates (new or revision)
+# =====================================================================
+
 activities:
 
   - name: "dienAanvraagIn"
@@ -111,10 +116,6 @@ activities:
       access: "authenticated"
 
     used:
-      - type: "oe:aanvraag"
-        accept: "new"
-        required: true
-        description: "De nieuwe aanvraag"
       - type: "object"
         external: true
         required: true
@@ -158,10 +159,6 @@ activities:
         - "klaar_voor_behandeling"
 
     used:
-      - type: "oe:aanvraag"
-        accept: "new"
-        required: true
-        description: "Nieuwe versie van de aanvraag"
       - type: "object"
         external: true
         required: true
@@ -203,10 +200,6 @@ activities:
         - "aanvraag_onvolledig"
 
     used:
-      - type: "oe:aanvraag"
-        accept: "new"
-        required: true
-        description: "Vervolledigde versie van de aanvraag"
       - type: "object"
         external: true
         required: true
@@ -251,14 +244,9 @@ activities:
 
     used:
       - type: "oe:aanvraag"
-        accept: "reference"
         required: false
         auto_resolve: "latest"
         description: "De aanvraag"
-      - type: "oe:beslissing"
-        accept: "any"
-        required: true
-        description: "De voorgestelde beslissing (nieuw of revisie)"
 
     generates:
       - "oe:beslissing"
@@ -287,14 +275,9 @@ activities:
 
     used:
       - type: "oe:beslissing"
-        accept: "reference"
         required: false
         auto_resolve: "latest"
         description: "De beslissing die getekend wordt"
-      - type: "oe:handtekening"
-        accept: "new"
-        required: true
-        description: "De handtekening (getekend: true/false)"
 
     generates:
       - "oe:handtekening"
@@ -329,12 +312,10 @@ activities:
 
     used:
       - type: "oe:handtekening"
-        accept: "any"
         required: false
         auto_resolve: "latest"
         description: "De handtekening"
       - type: "oe:beslissing"
-        accept: "any"
         required: false
         auto_resolve: "latest"
         description: "De beslissing"
@@ -371,7 +352,6 @@ activities:
 
     used:
       - type: "oe:aanvraag"
-        accept: "reference"
         required: false
         auto_resolve: "latest"
         description: "De aanvraag"
@@ -404,7 +384,6 @@ activities:
 
     used:
       - type: "oe:aanvraag"
-        accept: "reference"
         required: false
         auto_resolve: "latest"
         description: "De aanvraag"
@@ -440,12 +419,10 @@ activities:
 
     used:
       - type: "oe:verantwoordelijke_organisatie"
-        accept: "reference"
         required: false
         auto_resolve: "latest"
         description: "De verantwoordelijke organisatie"
       - type: "oe:aanvraag"
-        accept: "reference"
         required: false
         auto_resolve: "latest"
         description: "De aanvraag"
@@ -479,7 +456,6 @@ activities:
 
     used:
       - type: "oe:aanvraag"
-        accept: "reference"
         required: false
         auto_resolve: "latest"
         description: "De aanvraag"

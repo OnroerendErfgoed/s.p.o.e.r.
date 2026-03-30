@@ -25,8 +25,14 @@ from ..engine import execute_activity, derive_status, derive_allowed_activities,
 # =====================================================================
 
 class UsedItem(BaseModel):
+    """Reference to an existing entity or external URI."""
     entity: str
-    content: Optional[dict[str, Any]] = None
+
+
+class GeneratedItem(BaseModel):
+    """New entity or new version of an existing entity."""
+    entity: str
+    content: dict[str, Any]
     derivedFrom: Optional[str] = None
 
 
@@ -35,6 +41,7 @@ class ActivityRequest(BaseModel):
     workflow: Optional[str] = None  # only needed for first activity
     role: str
     used: list[UsedItem] = []
+    generated: list[GeneratedItem] = []
 
 
 class AssociatedWith(BaseModel):
@@ -141,6 +148,7 @@ def register_routes(app: FastAPI, registry: PluginRegistry, get_user):
                         user=user,
                         role=request.role,
                         used_items=[item.model_dump() for item in request.used],
+                        generated_items=[item.model_dump() for item in request.generated],
                         workflow_name=request.workflow,
                     )
                 except ActivityError as e:
@@ -526,6 +534,7 @@ def _register_typed_route(
                         user=user,
                         role=request.role,
                         used_items=[item.model_dump() for item in request.used],
+                        generated_items=[item.model_dump() for item in request.generated],
                         workflow_name=request.workflow,
                     )
                 except ActivityError as e:

@@ -325,27 +325,17 @@ async def execute_activity(
     user: User,
     role: str,
     used_items: list[dict],
+    generated_items: list[dict] | None = None,
     workflow_name: str | None = None,
 ) -> dict:
     """
-    Execute an activity. This is the core generic handler.
+    Execute an activity.
 
-    Steps:
-    1.  Idempotency check
-    2.  Create dossier if needed
-    3.  Authorize
-    4.  Validate workflow rules
-    5.  Process used items + auto-resolve
-    6.  Ensure agent exists
-    7.  Run custom validators
-    8.  Create activity + association
-    9.  Run handler (if present)
-    10. Create entities + used links
-    11. Determine and store status
-    12. Execute side effects (recursive)
-    13. Queue tasks
-    14. Build response
+    used_items: references to existing entities or external URIs (read-only)
+    generated_items: new entities or revisions the client is creating
     """
+    if generated_items is None:
+        generated_items = []
     now = datetime.now(timezone.utc)
 
     # 1. Idempotency check
@@ -377,18 +367,14 @@ async def execute_activity(
         if not valid:
             raise ActivityError(409, error)
 
-    # 5. Process used items + auto-resolve
-    used_refs = []  # references to existing entities
-    generated = []  # new entities being created
-    resolved_entities: dict[str, EntityRow] = {}  # type → entity for context
+    # 5. Process used items (references only) + auto-resolve
+    used_refs = []
+    resolved_entities: dict[str, EntityRow] = {}
 
     for item in used_items:
         entity_ref = item.get("entity", "")
-        content = item.get("content")
-        derived_from = item.get("derivedFrom")
 
         if is_external_uri(entity_ref):
-            # External URI — just record it
             used_refs.append({"entity": entity_ref, "external": True})
             continue
 
@@ -396,55 +382,20 @@ async def execute_activity(
         if not parsed:
             raise ActivityError(422, f"Invalid entity reference: {entity_ref}")
 
-        # The prefix IS the entity type (e.g. "oe:aanvraag")
         entity_type = parsed["prefix"]
+        existing_entity = await repo.get_entity(parsed["version"])
+        if not existing_entity:
+            raise ActivityError(422, f"Entity not found: {entity_ref}")
+        used_refs.append({"entity": entity_ref, "version_id": parsed["version"], "type": entity_type})
+        resolved_entities[entity_type] = existing_entity
 
-        if content is not None:
-            # New entity or new version — validate against Pydantic model
-            model_class = plugin.entity_models.get(entity_type)
-            if model_class:
-                try:
-                    model_class(**content)
-                except Exception as e:
-                    raise ActivityError(422, f"Content validation failed for {entity_type}: {e}")
-
-            # Check generates allows this type
-            allowed_types = activity_def.get("generates", [])
-            if entity_type not in allowed_types:
-                raise ActivityError(422, f"Activity cannot generate entity type '{entity_type}'")
-
-            generated.append({
-                "version_id": parsed["version"],
-                "entity_id": parsed["id"],
-                "type": entity_type,
-                "content": content,
-                "derived_from": UUID(derived_from.split("@")[1]) if derived_from else None,
-                "ref": entity_ref,
-            })
-
-            # Also make it available in resolved_entities for handlers
-            resolved_entities[entity_type] = _PendingEntity(
-                content=content,
-                entity_id=parsed["id"],
-                id=parsed["version"],
-                attributed_to=user.id,
-            )
-        else:
-            # Reference to existing entity
-            existing_entity = await repo.get_entity(parsed["version"])
-            if not existing_entity:
-                raise ActivityError(422, f"Entity not found: {entity_ref}")
-            used_refs.append({"entity": entity_ref, "version_id": parsed["version"], "type": entity_type})
-            resolved_entities[entity_type] = existing_entity
-
-    # Auto-resolve missing entities
+    # Auto-resolve missing used entities
     for used_def in activity_def.get("used", []):
         if used_def.get("external"):
             continue
         etype = used_def["type"]
         auto = used_def.get("auto_resolve")
         if auto == "latest" and etype not in resolved_entities:
-            # Not sent by client — auto-resolve
             entity = await repo.get_latest_entity(dossier_id, etype)
             if entity:
                 resolved_entities[etype] = entity
@@ -455,10 +406,55 @@ async def execute_activity(
                     "auto_resolved": True,
                 })
 
-    # 6. Ensure agent exists
+    # 6. Process generated items (new entities from client)
+    generated = []
+    allowed_types = activity_def.get("generates", [])
+
+    for item in generated_items:
+        entity_ref = item.get("entity", "")
+        content = item.get("content")
+        derived_from = item.get("derivedFrom")
+
+        if not content:
+            raise ActivityError(422, f"Generated item must have content: {entity_ref}")
+
+        parsed = parse_entity_ref(entity_ref)
+        if not parsed:
+            raise ActivityError(422, f"Invalid entity reference for generated item: {entity_ref}")
+
+        entity_type = parsed["prefix"]
+
+        if entity_type not in allowed_types:
+            raise ActivityError(422, f"Activity cannot generate entity type '{entity_type}'")
+
+        model_class = plugin.entity_models.get(entity_type)
+        if model_class:
+            try:
+                model_class(**content)
+            except Exception as e:
+                raise ActivityError(422, f"Content validation failed for {entity_type}: {e}")
+
+        generated.append({
+            "version_id": parsed["version"],
+            "entity_id": parsed["id"],
+            "type": entity_type,
+            "content": content,
+            "derived_from": UUID(derived_from.split("@")[1]) if derived_from else None,
+            "ref": entity_ref,
+        })
+
+        # Make available to handlers
+        resolved_entities[entity_type] = _PendingEntity(
+            content=content,
+            entity_id=parsed["id"],
+            id=parsed["version"],
+            attributed_to=user.id,
+        )
+
+    # 7. Ensure agent exists
     await repo.ensure_agent(user.id, user.type, user.name, user.properties)
 
-    # 7. Run custom validators
+    # 8. Run custom validators
     for validator_def in activity_def.get("validators", []):
         validator_name = validator_def["name"]
         validator_fn = plugin.validators.get(validator_name)
@@ -468,7 +464,7 @@ async def execute_activity(
             if result is not None and not result:
                 raise ActivityError(409, f"Validator '{validator_name}' failed")
 
-    # 8. Create activity record
+    # 9. Create activity + association
     activity_row = await repo.create_activity(
         activity_id=activity_id,
         dossier_id=dossier_id,
@@ -477,7 +473,6 @@ async def execute_activity(
         ended_at=now,
     )
 
-    # Create association
     await repo.create_association(
         association_id=uuid4(),
         activity_id=activity_id,
@@ -487,20 +482,18 @@ async def execute_activity(
         role=role,
     )
 
-    # 9. Run handler if present
+    # 10. Run handler (may produce additional generated entities)
     handler_name = activity_def.get("handler")
     handler_result = None
     if handler_name:
         handler_fn = plugin.handlers.get(handler_name)
         if handler_fn:
             ctx = ActivityContext(repo, dossier_id, resolved_entities)
-            # Pass client content if any
             client_content = generated[0]["content"] if generated else None
             handler_result = await handler_fn(ctx, client_content)
 
             if isinstance(handler_result, HandlerResult):
                 if handler_result.content and not generated:
-                    # Handler produced content for a new entity
                     generates = activity_def.get("generates", [])
                     if generates:
                         gen_type = generates[0]
@@ -513,10 +506,10 @@ async def execute_activity(
                             "ref": None,
                         })
 
-    # 10. Create entities
+    # 11. Persist generated entities (wasGeneratedBy only, NO used link)
     generated_response = []
     for gen in generated:
-        entity_row = await repo.create_entity(
+        await repo.create_entity(
             version_id=gen["version_id"],
             entity_id=gen["entity_id"],
             dossier_id=dossier_id,
@@ -526,31 +519,26 @@ async def execute_activity(
             derived_from=gen.get("derived_from"),
             attributed_to=user.id,
         )
-        # Also link as used
-        await repo.create_used(activity_id, gen["version_id"])
 
-        prefix = gen["type"]  # type IS the prefix now
         generated_response.append({
-            "entity": gen.get("ref") or f"{prefix}/{gen['entity_id']}@{gen['version_id']}",
+            "entity": gen.get("ref") or f"{gen['type']}/{gen['entity_id']}@{gen['version_id']}",
             "type": gen["type"],
             "content": gen["content"],
         })
 
-    # Link referenced entities as used
+    # 12. Create used links (references only — no overlap with generated)
     for ref in used_refs:
         if "version_id" in ref:
             await repo.create_used(activity_id, ref["version_id"])
 
-    # 11. Determine status
+    # 13. Determine and store status
     status = activity_def.get("status")
     if status is None and handler_result and isinstance(handler_result, HandlerResult):
         status = handler_result.status
     elif isinstance(status, dict):
-        # Derived from entity
         entity_type = status["from_entity"]
         field_path = status["field"]
         mapping = status["mapping"]
-        # Find in generated entities
         for gen in generated:
             if gen["type"] == entity_type:
                 value = _resolve_field(gen["content"], field_path)
@@ -558,12 +546,10 @@ async def execute_activity(
                     status = mapping[str(value)]
                     break
 
-    # Store handler-computed status on the activity row so derive_status can find it
     if isinstance(status, str):
         activity_row.computed_status = status
 
-    # 12. Execute side effects (recursive)
-    # Flush first so all entities created above are visible to side effect queries
+    # 14. Execute side effects
     await repo.session.flush()
     await _execute_side_effects(
         plugin=plugin,
@@ -573,7 +559,7 @@ async def execute_activity(
         side_effects=activity_def.get("side_effects", []),
     )
 
-    # 13. Queue tasks (simplified — just record them)
+    # 15. Queue tasks
     for task_def in activity_def.get("tasks", []):
         await repo.create_task(
             task_id=uuid4(),
@@ -583,7 +569,7 @@ async def execute_activity(
             config=task_def,
         )
 
-    # 14. Build response
+    # 16. Build response
     current_status = await derive_status(repo, dossier_id)
     allowed = await derive_allowed_activities(plugin, repo, dossier_id, user)
 
@@ -615,7 +601,6 @@ async def execute_activity(
             "allowedActivities": allowed,
         },
     }
-
 
 async def _execute_side_effects(
     plugin: Plugin,
@@ -733,7 +718,7 @@ async def _execute_side_effects(
                     derived_from=derived_from_id,
                     attributed_to="system",
                 )
-                await repo.create_used(se_activity_id, se_version_id)
+                # No used link — generated entities only have wasGeneratedBy
 
         # Recurse into this side effect's own side effects
         nested_side_effects = se_def.get("side_effects", [])
