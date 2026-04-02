@@ -48,7 +48,7 @@ poc_users:
   - id: "bbb00000-0000-0000-0000-000000000002"
     username: "benjamma"
     type: "medewerker"
-    name: "Ben Jansen"
+    name: "Matthias Benjamins"
     roles: ["behandelaar", "gemeente-toevoeger:https://data.vlaanderen.be/id/organisatie/oe"]
     properties:
       organisatie: "oe"
@@ -56,8 +56,8 @@ poc_users:
   - id: "bbb00000-0000-0000-0000-000000000003"
     username: "sophie.tekent"
     type: "medewerker"
-    name: "Sophie De Smet"
-    roles: ["beslisser", "gemeente-toevoeger:https://data.vlaanderen.be/id/organisatie/oe"]
+    name: "Sophie Marchand"
+    roles: ["beslisser", "gemeente-toevoeger:https://data.vlaanderen.be/id/organisatie/oe", "behandelaar"]
     properties:
       organisatie: "oe"
 
@@ -120,6 +120,10 @@ activities:
 
     authorization:
       access: "authenticated"
+
+    forbidden:
+      activities:
+        - "dienAanvraagIn"
 
     used:
       - type: "object"

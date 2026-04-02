@@ -1,3 +1,12 @@
+S.P.O.E.R.
+S – Status
+P – Provenance
+O – Opvolging
+E – Evidence
+R – Registratie
+
+Tagline – laat een spoor achter van elk dossier.
+
 # Dossier API — Toelatingen beschermd erfgoed
 
 PROV-based, activity-driven dossier management API built with FastAPI.

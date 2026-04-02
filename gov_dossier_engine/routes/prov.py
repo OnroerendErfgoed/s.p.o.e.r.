@@ -201,12 +201,13 @@ def register_prov_routes(app, registry: PluginRegistry, get_user):
                     }
                 prov["entity"][entity_key] = entity_data
 
-                # wasGeneratedBy
-                gen_key = f"_:gen_{entity.id}"
-                prov["wasGeneratedBy"][gen_key] = {
-                    "prov:entity": entity_key,
-                    "prov:activity": f"dossier:activiteit/{entity.generated_by}",
-                }
+                # wasGeneratedBy (skip for external entities with no generating activity)
+                if entity.generated_by:
+                    gen_key = f"_:gen_{entity.id}"
+                    prov["wasGeneratedBy"][gen_key] = {
+                        "prov:entity": entity_key,
+                        "prov:activity": f"dossier:activiteit/{entity.generated_by}",
+                    }
 
                 # wasAttributedTo
                 if entity.attributed_to:
@@ -469,8 +470,8 @@ def register_prov_routes(app, registry: PluginRegistry, get_user):
                             n["total_rows"] = ver_info.get("total_rows", 1)
                             break
 
-                # wasGeneratedBy (skip if generating activity is hidden)
-                if entity.generated_by not in skipped_activity_ids:
+                # wasGeneratedBy (skip if generating activity is hidden or entity is external)
+                if entity.generated_by and entity.generated_by not in skipped_activity_ids:
                     edges.append({
                         "source": f"act-{entity.generated_by}",
                         "target": ent_id,
