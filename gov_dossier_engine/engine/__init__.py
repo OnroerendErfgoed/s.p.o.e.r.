@@ -339,6 +339,14 @@ class HandlerResult:
         self.status = status
 
 
+class TaskResult:
+    """Result returned by a cross-dossier task function."""
+
+    def __init__(self, target_dossier_id: str, content: dict | None = None):
+        self.target_dossier_id = target_dossier_id
+        self.content = content
+
+
 async def execute_activity(
     plugin: Plugin,
     activity_def: dict,
@@ -350,6 +358,7 @@ async def execute_activity(
     used_items: list[dict],
     generated_items: list[dict] | None = None,
     workflow_name: str | None = None,
+    informed_by: str | None = None,
 ) -> dict:
     """
     Execute an activity.
@@ -508,6 +517,7 @@ async def execute_activity(
         type=activity_def["name"],
         started_at=now,
         ended_at=now,
+        informed_by=informed_by,
     )
 
     await repo.create_association(
@@ -596,17 +606,92 @@ async def execute_activity(
         side_effects=activity_def.get("side_effects", []),
     )
 
-    # 15. Queue tasks
+    # 15. Process tasks
     for task_def in activity_def.get("tasks", []):
-        await repo.create_task(
-            task_id=uuid4(),
-            dossier_id=dossier_id,
-            activity_id=activity_id,
-            type=task_def.get("type", "custom"),
-            config=task_def,
-        )
+        task_kind = task_def.get("kind", "recorded")
 
-    # 16. Build response
+        if task_kind == "fire_and_forget":
+            # Type 1: execute inline, no record
+            fn_name = task_def.get("function")
+            if fn_name:
+                fn = plugin.task_handlers.get(fn_name)
+                if fn:
+                    try:
+                        ctx = ActivityContext(repo, dossier_id, resolved_entities, plugin.entity_models)
+                        await fn(ctx)
+                    except Exception:
+                        pass  # fire and forget
+        else:
+            # Types 2, 3, 4: create system:task entity
+            from ..entities import TaskEntity
+            task_content = TaskEntity(
+                kind=task_kind,
+                function=task_def.get("function"),
+                target_activity=task_def.get("target_activity"),
+                scheduled_for=task_def.get("scheduled_for"),
+                cancel_if_activities=task_def.get("cancel_if_activities", []),
+                allow_multiple=task_def.get("allow_multiple", False),
+                result_activity_id=str(uuid4()),
+                status="scheduled",
+            )
+
+            # Check for existing scheduled tasks with same target_activity
+            if not task_content.allow_multiple and task_content.target_activity:
+                existing_tasks = await repo.get_entities_by_type(dossier_id, "system:task")
+                for existing in existing_tasks:
+                    if existing.content and \
+                       existing.content.get("target_activity") == task_content.target_activity and \
+                       existing.content.get("status") == "scheduled":
+                        # Supersede old task
+                        superseded_content = dict(existing.content)
+                        superseded_content["status"] = "superseded"
+                        await repo.create_entity(
+                            version_id=uuid4(),
+                            entity_id=existing.entity_id,
+                            dossier_id=dossier_id,
+                            type="system:task",
+                            generated_by=activity_id,
+                            content=superseded_content,
+                            derived_from=existing.id,
+                            attributed_to="system",
+                        )
+
+            # Create the task entity
+            await repo.create_entity(
+                version_id=uuid4(),
+                entity_id=uuid4(),
+                dossier_id=dossier_id,
+                type="system:task",
+                generated_by=activity_id,
+                content=task_content.model_dump(),
+                attributed_to="system",
+            )
+
+    # 16. Cancel tasks that list this activity type in cancel_if_activities
+    all_task_entities = await repo.get_entities_by_type(dossier_id, "system:task")
+    for task_entity in all_task_entities:
+        if not task_entity.content:
+            continue
+        if task_entity.content.get("status") != "scheduled":
+            continue
+        cancel_list = task_entity.content.get("cancel_if_activities", [])
+        if activity_def["name"] in cancel_list:
+            # Only cancel if task was created before this activity
+            if task_entity.created_at and task_entity.created_at < now:
+                cancelled_content = dict(task_entity.content)
+                cancelled_content["status"] = "cancelled"
+                await repo.create_entity(
+                    version_id=uuid4(),
+                    entity_id=task_entity.entity_id,
+                    dossier_id=dossier_id,
+                    type="system:task",
+                    generated_by=activity_id,
+                    content=cancelled_content,
+                    derived_from=task_entity.id,
+                    attributed_to="system",
+                )
+
+    # 17. Build response
     current_status = await derive_status(repo, dossier_id)
     allowed = await derive_allowed_activities(plugin, repo, dossier_id, user)
 
@@ -701,7 +786,7 @@ async def _execute_side_effects(
             type=se_activity_name,
             started_at=se_now,
             ended_at=se_now,
-            informed_by=trigger_activity_id,
+            informed_by=str(trigger_activity_id),
         )
 
         await repo.create_association(

@@ -60,7 +60,7 @@ class ActivityRow(Base):
     id = Column(UUID_DB(), primary_key=True)
     dossier_id = Column(UUID_DB(), ForeignKey("dossiers.id"), nullable=False)
     type = Column(Text, nullable=False)
-    informed_by = Column(UUID_DB(), ForeignKey("activities.id"), nullable=True)
+    informed_by = Column(Text, nullable=True)  # local UUID or cross-dossier URI
     computed_status = Column(Text, nullable=True)  # stored when handler computes status
     started_at = Column(DateTime(timezone=True), nullable=False)
     ended_at = Column(DateTime(timezone=True), nullable=True)
@@ -190,7 +190,7 @@ class Repository:
         type: str,
         started_at: datetime,
         ended_at: datetime | None = None,
-        informed_by: UUID | None = None,
+        informed_by: str | None = None,
         computed_status: str | None = None,
     ) -> ActivityRow:
         row = ActivityRow(

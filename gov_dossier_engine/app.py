@@ -12,29 +12,49 @@ import yaml
 from fastapi import FastAPI
 
 from .plugin import PluginRegistry
-from .auth import POCAuthMiddleware
+from .auth import POCAuthMiddleware, User
 from .db import init_db, create_tables, get_session_factory
 from .routes import register_routes
 from .routes.prov import register_prov_routes
 
 
-def create_app(config_path: str = "config.yaml") -> FastAPI:
+# System user used by the worker and side effects
+SYSTEM_USER = User(
+    id="system",
+    type="systeem",
+    name="Systeem",
+    roles=["systeemgebruiker"],
+    properties={},
+)
+
+
+def load_config_and_registry(config_path: str = "config.yaml") -> tuple[dict, PluginRegistry]:
+    """Load config and build plugin registry. Shared by app and worker."""
     with open(config_path) as f:
         config = yaml.safe_load(f)
+
+    registry = PluginRegistry()
+
+    from .entities import TaskEntity, COMPLETE_TASK_ACTIVITY_DEF
+
+    for plugin_module_name in config.get("plugins", []):
+        module = importlib.import_module(plugin_module_name)
+        plugin = module.create_plugin()
+        plugin.entity_models["system:task"] = TaskEntity
+        plugin.workflow.setdefault("activities", []).append(COMPLETE_TASK_ACTIVITY_DEF)
+        registry.register(plugin)
+
+    return config, registry
+
+
+def create_app(config_path: str = "config.yaml") -> FastAPI:
+    config, registry = load_config_and_registry(config_path)
 
     app = FastAPI(
         title="Dossier API",
         description="PROV-gebaseerde dossierafhandeling",
         version="0.1.0",
     )
-
-    registry = PluginRegistry()
-
-    # Load plugins
-    for plugin_module_name in config.get("plugins", []):
-        module = importlib.import_module(plugin_module_name)
-        plugin = module.create_plugin()
-        registry.register(plugin)
 
     # Collect all POC users from all plugins
     all_poc_users = []
@@ -43,12 +63,12 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
 
     # Add system user
     all_poc_users.append({
-        "id": "system",
+        "id": SYSTEM_USER.id,
         "username": "system",
-        "type": "systeem",
-        "name": "Systeem",
-        "roles": ["systeemgebruiker"],
-        "properties": {},
+        "type": SYSTEM_USER.type,
+        "name": SYSTEM_USER.name,
+        "roles": SYSTEM_USER.roles,
+        "properties": SYSTEM_USER.properties,
     })
 
     auth_middleware = POCAuthMiddleware(all_poc_users)
