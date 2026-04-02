@@ -40,6 +40,7 @@ class ActivityRequest(BaseModel):
     type: Optional[str] = None     # set from URL on typed endpoints
     workflow: Optional[str] = None  # only needed for first activity
     role: Optional[str] = None     # defaults to activity's default_role
+    informed_by: Optional[str] = None  # local UUID or cross-dossier URI
     used: list[UsedItem] = []
     generated: list[GeneratedItem] = []
 
@@ -49,6 +50,7 @@ class BatchActivityItem(BaseModel):
     activity_id: str               # client-generated UUID
     type: str
     role: Optional[str] = None
+    informed_by: Optional[str] = None
     used: list[UsedItem] = []
     generated: list[GeneratedItem] = []
 
@@ -166,6 +168,7 @@ def register_routes(app: FastAPI, registry: PluginRegistry, get_user):
                         used_items=[item.model_dump() for item in request.used],
                         generated_items=[item.model_dump() for item in request.generated],
                         workflow_name=request.workflow,
+                        informed_by=request.informed_by,
                     )
                 except ActivityError as e:
                     raise HTTPException(e.status_code, detail=e.detail)
@@ -225,6 +228,7 @@ def register_routes(app: FastAPI, registry: PluginRegistry, get_user):
                             used_items=[u.model_dump() for u in item.used],
                             generated_items=[g.model_dump() for g in item.generated],
                             workflow_name=request.workflow,
+                            informed_by=item.informed_by,
                         )
                     except ActivityError as e:
                         raise HTTPException(
@@ -601,6 +605,7 @@ def _register_typed_route(
                         used_items=[item.model_dump() for item in request.used],
                         generated_items=[item.model_dump() for item in request.generated],
                         workflow_name=request.workflow,
+                        informed_by=request.informed_by,
                     )
                 except ActivityError as e:
                     raise HTTPException(e.status_code, detail=e.detail)
