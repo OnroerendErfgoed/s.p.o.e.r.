@@ -49,6 +49,21 @@ class GeneratedItem(BaseModel):
     derivedFrom: Optional[str] = None
 
 
+class RelationItem(BaseModel):
+    """Generic activity→entity relation under a named type.
+
+    Example for the `oe:neemtAkteVan` pattern — acknowledging newer versions
+    of an entity the activity chose not to act on:
+        {"entity": "oe:aanvraag/X@v3", "type": "oe:neemtAkteVan"}
+
+    The `type` string is validated against the activity's YAML declaration
+    of allowed relation types. Plugins register validators per type to
+    enforce semantics (e.g. neemtAkteVan must cover every version between
+    the declared used version and the current latest)."""
+    entity: str
+    type: str
+
+
 class ActivityRequest(BaseModel):
     type: Optional[str] = None     # set from URL on typed endpoints
     workflow: Optional[str] = None  # only needed for first activity
@@ -56,6 +71,7 @@ class ActivityRequest(BaseModel):
     informed_by: Optional[str] = None  # local UUID or cross-dossier URI
     used: list[UsedItem] = []
     generated: list[GeneratedItem] = []
+    relations: list[RelationItem] = []
 
 
 class BatchActivityItem(BaseModel):
@@ -66,6 +82,7 @@ class BatchActivityItem(BaseModel):
     informed_by: Optional[str] = None
     used: list[UsedItem] = []
     generated: list[GeneratedItem] = []
+    relations: list[RelationItem] = []
 
 
 class BatchActivityRequest(BaseModel):
@@ -105,10 +122,16 @@ class DossierResponse(BaseModel):
     allowedActivities: list[dict[str, str]] = []
 
 
+class RelationResponse(BaseModel):
+    entity: str
+    type: str
+
+
 class FullResponse(BaseModel):
     activity: ActivityResponse
     used: list[UsedResponse] = []
     generated: list[GeneratedResponse] = []
+    relations: list[RelationResponse] = []
     dossier: DossierResponse
 
 
@@ -180,6 +203,7 @@ def register_routes(app: FastAPI, registry: PluginRegistry, get_user, global_acc
                         role=request.role,
                         used_items=[item.model_dump() for item in request.used],
                         generated_items=[item.model_dump() for item in request.generated],
+                        relation_items=[item.model_dump() for item in request.relations],
                         workflow_name=request.workflow,
                         informed_by=request.informed_by,
                     )
@@ -240,6 +264,7 @@ def register_routes(app: FastAPI, registry: PluginRegistry, get_user, global_acc
                             role=item.role,
                             used_items=[u.model_dump() for u in item.used],
                             generated_items=[g.model_dump() for g in item.generated],
+                            relation_items=[r.model_dump() for r in item.relations],
                             workflow_name=request.workflow,
                             informed_by=item.informed_by,
                         )
@@ -699,6 +724,7 @@ def _register_typed_route(
                         role=request.role,
                         used_items=[item.model_dump() for item in request.used],
                         generated_items=[item.model_dump() for item in request.generated],
+                        relation_items=[item.model_dump() for item in request.relations],
                         workflow_name=request.workflow,
                         informed_by=request.informed_by,
                     )

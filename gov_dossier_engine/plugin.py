@@ -29,6 +29,19 @@ class Plugin:
     validators: dict[str, Callable] = field(default_factory=dict)  # validator_name → async function
     task_handlers: dict[str, Callable] = field(default_factory=dict)  # task_name → async function
 
+    # Validators for custom PROV-extension relations (e.g. oe:neemtAkteVan).
+    # Keyed by relation type string. Each validator is called after used/
+    # generated processing with access to the full request context and may
+    # raise ActivityError to reject, return a set of "stale used entries
+    # this relation covers" to satisfy the stale-used-reference check, or
+    # return None if the relation is pure annotation with no semantic
+    # effect. Signature:
+    #   async def validator(plugin, repo, dossier_id, activity_def,
+    #                       relation_entries, stale_used) -> set[UUID]
+    # Returns the set of entity_logical_ids whose staleness is satisfied
+    # by this relation.
+    relation_validators: dict[str, Callable] = field(default_factory=dict)
+
     # Called after each activity completes (inside the transaction).
     # Signature: async def hook(repo, dossier_id, activity_type, status, entities) -> None
     # Use to update Elasticsearch indices.
