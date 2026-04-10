@@ -595,3 +595,211 @@ curl -s "$BASE_URL/dossiers/d4000000-0000-0000-0000-000000000001" \
 echo ""
 
 echo "D4 Graph: $BASE_URL/dossiers/d4000000-0000-0000-0000-000000000001/prov/graph"
+echo ""
+echo ""
+
+# ============================================================================
+# DOSSIER 5: derivation rules — negative tests
+# ============================================================================
+# These cases deliberately trip the derivation validator added to the engine.
+# Uses bewerkAanvraag for the revision step because it only requires
+# klaar_voor_behandeling status, which is what we end up in after an initial
+# dienAanvraagIn.
+# ============================================================================
+
+echo "============================================"
+echo "DOSSIER 5: derivation rules — negative tests"
+echo "============================================"
+echo ""
+
+D5_AANVRAAG_FID=$(upload_file "jan.aanvrager" "initiele aanvraag bijlage" "d5-initieel.pdf")
+
+echo "--- D5 Step 1: dienAanvraagIn (baseline v1) ---"
+curl -s -X PUT "$BASE_URL/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000001/dienAanvraagIn" \
+  -H "Content-Type: application/json" \
+  -H "X-POC-User: jan.aanvrager" \
+  -d "{
+    \"workflow\": \"toelatingen\",
+    \"used\": [{\"entity\": \"https://id.erfgoed.net/erfgoedobjecten/50001\"}],
+    \"generated\": [
+      {
+        \"entity\": \"oe:aanvraag/e5000000-0000-0000-0000-000000000001@f5000000-0000-0000-0000-000000000001\",
+        \"content\": {
+          \"onderwerp\": \"Derivation test baseline\",
+          \"handeling\": \"renovatie\",
+          \"aanvrager\": { \"rrn\": \"85010100123\" },
+          \"gemeente\": \"Brugge\",
+          \"object\": \"https://id.erfgoed.net/erfgoedobjecten/50001\",
+          \"bijlagen\": [{ \"file_id\": \"$D5_AANVRAAG_FID\", \"filename\": \"d5-initieel.pdf\" }]
+        }
+      }
+    ]
+  }" > /dev/null
+echo "  baseline aanvraag v1 created"
+echo ""
+
+echo "--- D5 Step 2: bewerkAanvraag v2 (happy path — correct derivedFrom from v1) ---"
+curl -s -X PUT "$BASE_URL/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000002/bewerkAanvraag" \
+  -H "Content-Type: application/json" \
+  -H "X-POC-User: marie.brugge" \
+  -d '{
+    "used": [{ "entity": "https://id.erfgoed.net/erfgoedobjecten/50001" }],
+    "generated": [
+      {
+        "entity": "oe:aanvraag/e5000000-0000-0000-0000-000000000001@f5000000-0000-0000-0000-000000000002",
+        "derivedFrom": "oe:aanvraag/e5000000-0000-0000-0000-000000000001@f5000000-0000-0000-0000-000000000001",
+        "content": {
+          "onderwerp": "Derivation test baseline - bewerkt v2",
+          "handeling": "renovatie",
+          "aanvrager": { "rrn": "85010100123" },
+          "gemeente": "Brugge",
+          "object": "https://id.erfgoed.net/erfgoedobjecten/50001"
+        }
+      }
+    ]
+  }' | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+if 'detail' in d:
+    print(f'  FAIL: got error: {d[\"detail\"]}')
+    sys.exit(1)
+print('  OK: happy-path derivation v1->v2 accepted')
+"
+echo ""
+
+echo "--- D5 Step 3: NEGATIVE — missing derivedFrom on existing entity (expect 409 missing_derivation) ---"
+RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000003/bewerkAanvraag" \
+  -H "Content-Type: application/json" \
+  -H "X-POC-User: marie.brugge" \
+  -d '{
+    "used": [{ "entity": "https://id.erfgoed.net/erfgoedobjecten/50001" }],
+    "generated": [
+      {
+        "entity": "oe:aanvraag/e5000000-0000-0000-0000-000000000001@f5000000-0000-0000-0000-000000000003",
+        "content": {
+          "onderwerp": "missing derivedFrom",
+          "handeling": "renovatie",
+          "aanvrager": { "rrn": "85010100123" },
+          "gemeente": "Brugge",
+          "object": "https://id.erfgoed.net/erfgoedobjecten/50001"
+        }
+      }
+    ]
+  }')
+echo "$RESP" | python3 -c "
+import sys, json
+lines = sys.stdin.read().strip().split('\n')
+code = lines[-1]
+body = json.loads('\n'.join(lines[:-1]))
+inner = body.get('detail', {})
+assert code == '409', f'expected 409, got {code}: {body}'
+assert isinstance(inner, dict), f'expected dict detail, got {type(inner).__name__}: {inner}'
+assert inner.get('error') == 'missing_derivation', f'expected error=missing_derivation, got {inner.get(\"error\")}'
+assert 'latest_version' in inner, f'expected latest_version in payload'
+lv = inner['latest_version']
+assert lv['versionId'] == 'f5000000-0000-0000-0000-000000000002', f'wrong latest: {lv[\"versionId\"]}'
+print(f'  OK: 409 missing_derivation; latest_version.versionId={lv[\"versionId\"][:8]}...')
+"
+echo ""
+
+echo "--- D5 Step 4: NEGATIVE — stale derivedFrom (v1, but latest is v2) (expect 409 stale_derivation) ---"
+RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000004/bewerkAanvraag" \
+  -H "Content-Type: application/json" \
+  -H "X-POC-User: marie.brugge" \
+  -d '{
+    "used": [{ "entity": "https://id.erfgoed.net/erfgoedobjecten/50001" }],
+    "generated": [
+      {
+        "entity": "oe:aanvraag/e5000000-0000-0000-0000-000000000001@f5000000-0000-0000-0000-000000000004",
+        "derivedFrom": "oe:aanvraag/e5000000-0000-0000-0000-000000000001@f5000000-0000-0000-0000-000000000001",
+        "content": {
+          "onderwerp": "stale derivation",
+          "handeling": "renovatie",
+          "aanvrager": { "rrn": "85010100123" },
+          "gemeente": "Brugge",
+          "object": "https://id.erfgoed.net/erfgoedobjecten/50001"
+        }
+      }
+    ]
+  }')
+echo "$RESP" | python3 -c "
+import sys, json
+lines = sys.stdin.read().strip().split('\n')
+code = lines[-1]
+body = json.loads('\n'.join(lines[:-1]))
+inner = body.get('detail', {})
+assert code == '409', f'expected 409, got {code}: {body}'
+assert inner.get('error') == 'stale_derivation', f'expected error=stale_derivation, got {inner.get(\"error\")}'
+assert inner.get('declared_parent') == 'f5000000-0000-0000-0000-000000000001'
+assert inner.get('latest_parent') == 'f5000000-0000-0000-0000-000000000002'
+assert 'latest_version' in inner
+print(f'  OK: 409 stale_derivation; declared=v1, latest=v2, latest_version.content returned')
+"
+echo ""
+
+echo "--- D5 Step 5: NEGATIVE — unknown parent version (expect 422 unknown_parent) ---"
+RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000005/bewerkAanvraag" \
+  -H "Content-Type: application/json" \
+  -H "X-POC-User: marie.brugge" \
+  -d '{
+    "used": [{ "entity": "https://id.erfgoed.net/erfgoedobjecten/50001" }],
+    "generated": [
+      {
+        "entity": "oe:aanvraag/e5000000-0000-0000-0000-000000000001@f5000000-0000-0000-0000-000000000006",
+        "derivedFrom": "oe:aanvraag/e5000000-0000-0000-0000-000000000001@ffffffff-ffff-ffff-ffff-ffffffffffff",
+        "content": {
+          "onderwerp": "unknown parent",
+          "handeling": "renovatie",
+          "aanvrager": { "rrn": "85010100123" },
+          "gemeente": "Brugge",
+          "object": "https://id.erfgoed.net/erfgoedobjecten/50001"
+        }
+      }
+    ]
+  }')
+echo "$RESP" | python3 -c "
+import sys, json
+lines = sys.stdin.read().strip().split('\n')
+code = lines[-1]
+body = json.loads('\n'.join(lines[:-1]))
+inner = body.get('detail', {})
+assert code == '422', f'expected 422, got {code}: {body}'
+assert inner.get('error') == 'unknown_parent', f'expected error=unknown_parent, got {inner.get(\"error\")}'
+print(f'  OK: 422 unknown_parent')
+"
+echo ""
+
+echo "--- D5 Step 6: NEGATIVE — cross-entity derivation (expect 422 cross_entity_derivation) ---"
+# NEW entity_id (e5...99) trying to derive from the existing e5...01 chain
+RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000006/bewerkAanvraag" \
+  -H "Content-Type: application/json" \
+  -H "X-POC-User: marie.brugge" \
+  -d '{
+    "used": [{ "entity": "https://id.erfgoed.net/erfgoedobjecten/50001" }],
+    "generated": [
+      {
+        "entity": "oe:aanvraag/e5000000-0000-0000-0000-000000000099@f5000000-0000-0000-0000-000000000099",
+        "derivedFrom": "oe:aanvraag/e5000000-0000-0000-0000-000000000001@f5000000-0000-0000-0000-000000000002",
+        "content": {
+          "onderwerp": "cross-entity derivation",
+          "handeling": "renovatie",
+          "aanvrager": { "rrn": "85010100123" },
+          "gemeente": "Brugge",
+          "object": "https://id.erfgoed.net/erfgoedobjecten/50001"
+        }
+      }
+    ]
+  }')
+echo "$RESP" | python3 -c "
+import sys, json
+lines = sys.stdin.read().strip().split('\n')
+code = lines[-1]
+body = json.loads('\n'.join(lines[:-1]))
+inner = body.get('detail', {})
+assert code == '422', f'expected 422, got {code}: {body}'
+assert inner.get('error') == 'cross_entity_derivation', f'expected error=cross_entity_derivation, got {inner.get(\"error\")}'
+print(f'  OK: 422 cross_entity_derivation')
+"
+echo ""
+
+echo "D5 summary: all 5 derivation rule checks passed"

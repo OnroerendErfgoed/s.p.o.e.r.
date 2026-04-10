@@ -38,6 +38,33 @@ class Plugin:
     # register workflow-specific search endpoints like /dossiers/{workflow_name}/...
     search_route_factory: Callable | None = None
 
+    # Defaults for engine-provided types. system:task and system:note are
+    # multi-cardinality (many per dossier); oe:dossier_access is a singleton.
+    # These are overlaid by plugin workflow declarations if present.
+    _ENGINE_CARDINALITIES: dict = field(
+        default_factory=lambda: {
+            "system:task": "multiple",
+            "system:note": "multiple",
+            "oe:dossier_access": "single",
+            "external": "multiple",
+        },
+        repr=False,
+    )
+
+    def cardinality_of(self, entity_type: str) -> str:
+        """Return the declared cardinality of an entity type: 'single' or
+        'multiple'. Checks the workflow's `entity_types` block first, then
+        falls back to engine defaults for system/external types, then
+        defaults to 'single' for anything unknown."""
+        for et in self.workflow.get("entity_types", []):
+            if et.get("type") == entity_type:
+                c = et.get("cardinality", "single")
+                return c if c in ("single", "multiple") else "single"
+        return self._ENGINE_CARDINALITIES.get(entity_type, "single")
+
+    def is_singleton(self, entity_type: str) -> bool:
+        return self.cardinality_of(entity_type) == "single"
+
 
 class PluginRegistry:
     """Registry of all loaded plugins."""

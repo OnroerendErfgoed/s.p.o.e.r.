@@ -44,6 +44,47 @@ def is_external_uri(ref: str) -> bool:
 
 
 # =====================================================================
+# Cardinality-aware entity lookups
+# =====================================================================
+
+class CardinalityError(Exception):
+    """Raised when code tries to look up a singleton entity of a type that
+    the plugin has declared as `multiple`. Indicates a bug in engine or
+    handler code — the caller should be iterating entities by type, not
+    assuming a unique one."""
+    pass
+
+
+async def lookup_singleton(
+    plugin: Plugin,
+    repo: Repository,
+    dossier_id: UUID,
+    entity_type: str,
+) -> EntityRow | None:
+    """Look up the singleton entity of `entity_type` in the dossier.
+
+    Enforces the cardinality invariant: raises `CardinalityError` if the
+    plugin declares this type as `multiple`. Callers that legitimately need
+    the "most recent of a multi-cardinality type" should use
+    `repo.get_latest_entity_by_id` with a specific entity_id, or
+    `repo.get_entities_by_type_latest` to iterate all instances.
+
+    This is the only place code outside `ActivityContext` should look up
+    a singleton entity. Direct calls to `repo.get_singleton_entity` bypass
+    the cardinality check and are only acceptable for the engine-internal
+    `oe:dossier_access` path in routes/access.py.
+    """
+    if not plugin.is_singleton(entity_type):
+        raise CardinalityError(
+            f"lookup_singleton called on non-singleton type "
+            f"'{entity_type}' (cardinality={plugin.cardinality_of(entity_type)}). "
+            f"Use repo.get_entities_by_type_latest or "
+            f"repo.get_latest_entity_by_id instead."
+        )
+    return await repo.get_singleton_entity(dossier_id, entity_type)
+
+
+# =====================================================================
 # Authorization
 # =====================================================================
 
@@ -87,7 +128,7 @@ async def authorize_activity(
                         try:
                             entity_type = scope["from_entity"]
                             field_path = scope["field"]
-                            entity = await repo.get_latest_entity(dossier_id, entity_type)
+                            entity = await lookup_singleton(plugin, repo, dossier_id, entity_type)
                             if not entity:
                                 errors.append(f"{base_role} — entity '{entity_type}' not found")
                                 continue
@@ -115,7 +156,7 @@ async def authorize_activity(
                     try:
                         entity_type = role_entry["from_entity"]
                         field_path = role_entry["field"]
-                        entity = await repo.get_latest_entity(dossier_id, entity_type)
+                        entity = await lookup_singleton(plugin, repo, dossier_id, entity_type)
                         if not entity:
                             errors.append(f"Entity '{entity_type}' not found")
                             continue
@@ -329,14 +370,26 @@ class _PendingEntity:
 class ActivityContext:
     """Context passed to handlers and validators."""
 
-    def __init__(self, repo: Repository, dossier_id: UUID, used_entities: dict[str, EntityRow],
-                 entity_models: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        repo: Repository,
+        dossier_id: UUID,
+        used_entities: dict[str, EntityRow],
+        entity_models: dict[str, Any] | None = None,
+        plugin: Plugin | None = None,
+    ):
         self.repo = repo
         self.dossier_id = dossier_id
         self._used_entities = used_entities
         self._entity_models = entity_models or {}
+        self._plugin = plugin
 
     def get_used_entity(self, entity_type: str) -> EntityRow | None:
+        return self._used_entities.get(entity_type)
+
+    def get_used_row(self, entity_type: str) -> EntityRow | None:
+        """Return the EntityRow for a used entity of this type. Useful for
+        handlers that need the version id to seed a lineage walk."""
         return self._used_entities.get(entity_type)
 
     def get_typed(self, entity_type: str) -> Any | None:
@@ -350,9 +403,19 @@ class ActivityContext:
             return model_class(**entity.content)
         return None
 
-    async def get_latest_typed(self, entity_type: str) -> Any | None:
-        """Get the latest entity's content as a validated Pydantic model instance."""
-        entity = await self.repo.get_latest_entity(self.dossier_id, entity_type)
+    def _require_singleton(self, entity_type: str) -> None:
+        if self._plugin and not self._plugin.is_singleton(entity_type):
+            raise CardinalityError(
+                f"ActivityContext singleton lookup called on non-singleton "
+                f"type '{entity_type}'. Use get_entities_latest(entity_type) "
+                f"to iterate instead."
+            )
+
+    async def get_singleton_typed(self, entity_type: str) -> Any | None:
+        """Get the singleton entity's content as a validated Pydantic model
+        instance. Raises CardinalityError if called on a non-singleton type."""
+        self._require_singleton(entity_type)
+        entity = await self.repo.get_singleton_entity(self.dossier_id, entity_type)
         if not entity or not entity.content:
             return None
         model_class = self._entity_models.get(entity_type)
@@ -360,12 +423,28 @@ class ActivityContext:
             return model_class(**entity.content)
         return None
 
+    # Legacy alias — will be removed once all handlers migrate.
+    get_latest_typed = get_singleton_typed
+
     async def has_activity(self, activity_type: str) -> bool:
         activities = await self.repo.get_activities_for_dossier(self.dossier_id)
         return any(a.type == activity_type for a in activities)
 
-    async def get_latest_entity(self, entity_type: str) -> EntityRow | None:
-        return await self.repo.get_latest_entity(self.dossier_id, entity_type)
+    async def get_singleton_entity(self, entity_type: str) -> EntityRow | None:
+        """Return the singleton entity row for this type in the dossier.
+        Raises CardinalityError if called on a non-singleton type."""
+        self._require_singleton(entity_type)
+        return await self.repo.get_singleton_entity(self.dossier_id, entity_type)
+
+    # Legacy alias — will be removed once all handlers migrate.
+    get_latest_entity = get_singleton_entity
+
+    async def get_entities_latest(self, entity_type: str) -> list[EntityRow]:
+        """Return the latest version of each logical entity of this type.
+        Works for both singleton and multi-cardinality types — for singletons
+        the list has zero or one elements. For multi-cardinality types, one
+        element per distinct entity_id."""
+        return await self.repo.get_entities_by_type_latest(self.dossier_id, entity_type)
 
 
 class HandlerResult:
@@ -498,7 +577,7 @@ async def execute_activity(
         etype = used_def["type"]
         auto = used_def.get("auto_resolve")
         if auto == "latest" and etype not in resolved_entities:
-            entity = await repo.get_latest_entity(dossier_id, etype)
+            entity = await lookup_singleton(plugin, repo, dossier_id, etype)
             if entity:
                 resolved_entities[etype] = entity
                 used_refs.append({
@@ -531,9 +610,96 @@ async def execute_activity(
             raise ActivityError(422, f"Invalid entity reference for generated item: {entity_ref}")
 
         entity_type = parsed["prefix"]
+        entity_logical_id = parsed["id"]
 
         if allowed_types and entity_type not in allowed_types:
             raise ActivityError(422, f"Activity cannot generate entity type '{entity_type}'")
+
+        # --- Derivation validation ---------------------------------------
+        # A generated entity must correctly declare its derivation chain:
+        #   * if no prior version of this entity_id exists, `derivedFrom`
+        #     must be absent (nothing to derive from)
+        #   * if a prior version exists, `derivedFrom` must be present and
+        #     must point at the CURRENT LATEST version — stale derivations
+        #     are rejected with 409 and the latest version is returned
+        #   * `derivedFrom` must refer to an existing version
+        #   * `derivedFrom` must refer to the SAME logical entity_id (no
+        #     cross-entity derivation)
+        latest_existing = await repo.get_latest_entity_by_id(dossier_id, entity_logical_id)
+
+        declared_parent_version: UUID | None = None
+        if derived_from:
+            try:
+                declared_parent_version = UUID(derived_from.split("@")[1])
+            except (IndexError, ValueError):
+                raise ActivityError(
+                    422,
+                    f"Malformed derivedFrom reference: {derived_from}",
+                )
+
+            parent_row = await repo.get_entity(declared_parent_version)
+            if parent_row is None or parent_row.dossier_id != dossier_id:
+                raise ActivityError(
+                    422,
+                    f"derivedFrom refers to unknown version: {derived_from}",
+                    payload={"error": "unknown_parent", "derivedFrom": derived_from},
+                )
+            if parent_row.entity_id != entity_logical_id:
+                raise ActivityError(
+                    422,
+                    f"derivedFrom must reference the same entity_id "
+                    f"(parent is {parent_row.entity_id}, generated is {entity_logical_id})",
+                    payload={
+                        "error": "cross_entity_derivation",
+                        "derivedFrom": derived_from,
+                        "generated": entity_ref,
+                    },
+                )
+
+        if latest_existing is not None:
+            # A prior version exists — derivedFrom is mandatory and must
+            # point at the latest.
+            if declared_parent_version is None:
+                raise ActivityError(
+                    409,
+                    f"Entity '{entity_type}/{entity_logical_id}' already has "
+                    f"version {latest_existing.id}; generated entity must "
+                    f"declare derivedFrom pointing at the latest version",
+                    payload={
+                        "error": "missing_derivation",
+                        "entity_ref": entity_ref,
+                        "latest_version": {
+                            "entity": f"{entity_type}/{entity_logical_id}@{latest_existing.id}",
+                            "versionId": str(latest_existing.id),
+                            "content": latest_existing.content,
+                        },
+                    },
+                )
+            if declared_parent_version != latest_existing.id:
+                raise ActivityError(
+                    409,
+                    f"Stale derivation: generated entity derives from "
+                    f"{declared_parent_version} but latest is {latest_existing.id}",
+                    payload={
+                        "error": "stale_derivation",
+                        "entity_ref": entity_ref,
+                        "declared_parent": str(declared_parent_version),
+                        "latest_parent": str(latest_existing.id),
+                        "latest_version": {
+                            "entity": f"{entity_type}/{entity_logical_id}@{latest_existing.id}",
+                            "versionId": str(latest_existing.id),
+                            "content": latest_existing.content,
+                        },
+                    },
+                )
+        else:
+            # No prior version. A declared derivedFrom that survived the
+            # earlier checks would mean the client is deriving from a version
+            # of a DIFFERENT entity_id — already rejected above. Nothing else
+            # to check here.
+            pass
+
+        # -----------------------------------------------------------------
 
         model_class = plugin.entity_models.get(entity_type)
         if model_class:
@@ -567,7 +733,7 @@ async def execute_activity(
         validator_name = validator_def["name"]
         validator_fn = plugin.validators.get(validator_name)
         if validator_fn:
-            ctx = ActivityContext(repo, dossier_id, resolved_entities, plugin.entity_models)
+            ctx = ActivityContext(repo, dossier_id, resolved_entities, plugin.entity_models, plugin=plugin)
             result = await validator_fn(ctx)
             if result is not None and not result:
                 raise ActivityError(409, f"Validator '{validator_name}' failed")
@@ -597,7 +763,7 @@ async def execute_activity(
     if handler_name:
         handler_fn = plugin.handlers.get(handler_name)
         if handler_fn:
-            ctx = ActivityContext(repo, dossier_id, resolved_entities, plugin.entity_models)
+            ctx = ActivityContext(repo, dossier_id, resolved_entities, plugin.entity_models, plugin=plugin)
             client_content = generated[0]["content"] if generated else None
             handler_result = await handler_fn(ctx, client_content)
 
@@ -613,14 +779,24 @@ async def execute_activity(
                         if gen_type is None and allowed_types:
                             gen_type = allowed_types[0]
                         if gen_type and gen_content:
-                            # Check if this is a revision of an existing entity
-                            existing = await repo.get_latest_entity(dossier_id, gen_type)
+                            # Check if this is a revision of an existing entity.
+                            # Singleton types auto-revise; multi-cardinality types
+                            # create a fresh entity every time (handlers that want
+                            # to revise a specific instance must do so explicitly
+                            # — phase 3 will formalize this).
+                            if plugin.is_singleton(gen_type):
+                                existing = await lookup_singleton(plugin, repo, dossier_id, gen_type)
+                                entity_id_val = existing.entity_id if existing else uuid4()
+                                derived_from_id = existing.id if existing else None
+                            else:
+                                entity_id_val = uuid4()
+                                derived_from_id = None
                             generated.append({
                                 "version_id": uuid4(),
-                                "entity_id": existing.entity_id if existing else uuid4(),
+                                "entity_id": entity_id_val,
                                 "type": gen_type,
                                 "content": gen_content,
-                                "derived_from": existing.id if existing else None,
+                                "derived_from": derived_from_id,
                                 "ref": None,
                             })
 
@@ -712,7 +888,7 @@ async def execute_activity(
                 fn = plugin.task_handlers.get(fn_name)
                 if fn:
                     try:
-                        ctx = ActivityContext(repo, dossier_id, resolved_entities, plugin.entity_models)
+                        ctx = ActivityContext(repo, dossier_id, resolved_entities, plugin.entity_models, plugin=plugin)
                         await fn(ctx)
                     except Exception:
                         pass  # fire and forget
@@ -891,7 +1067,7 @@ async def _execute_side_effects(
             cond_entity_type = condition.get("entity_type")
             cond_field = condition.get("field")
             cond_expected = condition.get("value")
-            cond_entity = await repo.get_latest_entity(dossier_id, cond_entity_type)
+            cond_entity = await lookup_singleton(plugin, repo, dossier_id, cond_entity_type)
             if not cond_entity or _resolve_field(cond_entity.content, cond_field) != cond_expected:
                 continue
 
@@ -937,14 +1113,14 @@ async def _execute_side_effects(
                 continue
             se_type = se_used_def["type"]
             if se_used_def.get("auto_resolve") == "latest":
-                se_entity = await repo.get_latest_entity(dossier_id, se_type)
+                se_entity = await lookup_singleton(plugin, repo, dossier_id, se_type)
                 if se_entity:
                     se_resolved[se_type] = se_entity
                     await repo.create_used(se_activity_id, se_entity.id)
 
 
         # Run handler
-        se_ctx = ActivityContext(repo, dossier_id, se_resolved, plugin.entity_models)
+        se_ctx = ActivityContext(repo, dossier_id, se_resolved, plugin.entity_models, plugin=plugin)
         se_result = await se_handler_fn(se_ctx, None)
 
         # Store handler-computed status
@@ -958,9 +1134,17 @@ async def _execute_side_effects(
                     gen_type = se_generates[0]
                 if gen_type and gen_content:
                     se_version_id = uuid4()
-                    existing = await repo.get_latest_entity(dossier_id, gen_type)
-                    derived_from_id = existing.id if existing else None
-                    entity_id_val = existing.entity_id if existing else uuid4()
+                    # Singleton types auto-revise the existing one (if any).
+                    # Multi-cardinality types create a fresh entity every time —
+                    # handlers that want to revise a specific instance of a
+                    # multi-cardinality type must do so explicitly (phase 3).
+                    if plugin.is_singleton(gen_type):
+                        existing = await lookup_singleton(plugin, repo, dossier_id, gen_type)
+                        derived_from_id = existing.id if existing else None
+                        entity_id_val = existing.entity_id if existing else uuid4()
+                    else:
+                        derived_from_id = None
+                        entity_id_val = uuid4()
 
                     await repo.create_entity(
                         version_id=se_version_id,
@@ -1025,6 +1209,7 @@ def _find_activity_def(plugin: Plugin, activity_type: str) -> dict | None:
 
 
 class ActivityError(Exception):
-    def __init__(self, status_code: int, detail: str):
+    def __init__(self, status_code: int, detail: Any, payload: dict | None = None):
         self.status_code = status_code
         self.detail = detail
+        self.payload = payload

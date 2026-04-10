@@ -24,6 +24,15 @@ from ..engine import (
 from ..file_refs import inject_download_urls
 
 
+def _activity_error_to_http(e: ActivityError) -> HTTPException:
+    """Forward an ActivityError to an HTTPException, merging any structured
+    payload so the client gets a single JSON body."""
+    if e.payload:
+        body = {"detail": e.detail, **e.payload}
+        return HTTPException(e.status_code, detail=body)
+    return HTTPException(e.status_code, detail=e.detail)
+
+
 # =====================================================================
 # Request / Response Models
 # =====================================================================
@@ -175,7 +184,7 @@ def register_routes(app: FastAPI, registry: PluginRegistry, get_user, global_acc
                         informed_by=request.informed_by,
                     )
                 except ActivityError as e:
-                    raise HTTPException(e.status_code, detail=e.detail)
+                    raise _activity_error_to_http(e)
 
                 return response
 
@@ -235,9 +244,15 @@ def register_routes(app: FastAPI, registry: PluginRegistry, get_user, global_acc
                             informed_by=item.informed_by,
                         )
                     except ActivityError as e:
+                        # Preserve the batch position in the error detail but
+                        # still forward any structured payload.
+                        prefix = f"Activity '{item.type}' (#{len(results)+1}) failed: "
+                        if e.payload:
+                            body = {"detail": f"{prefix}{e.detail}", **e.payload}
+                            raise HTTPException(e.status_code, detail=body)
                         raise HTTPException(
                             e.status_code,
-                            detail=f"Activity '{item.type}' (#{len(results)+1}) failed: {e.detail}",
+                            detail=f"{prefix}{e.detail}",
                         )
 
                     # Flush so next activity can see entities from this one
@@ -688,7 +703,7 @@ def _register_typed_route(
                         informed_by=request.informed_by,
                     )
                 except ActivityError as e:
-                    raise HTTPException(e.status_code, detail=e.detail)
+                    raise _activity_error_to_http(e)
 
                 return response
 

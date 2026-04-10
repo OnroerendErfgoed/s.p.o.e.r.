@@ -212,7 +212,7 @@ async def process_task(task: EntityRow, registry, config):
                         # Resolve all latest entities for context
                         all_latest = await repo.get_all_latest_entities(dossier_id)
                         resolved = {e.type: e for e in all_latest}
-                        ctx = ActivityContext(repo, dossier_id, resolved, plugin.entity_models)
+                        ctx = ActivityContext(repo, dossier_id, resolved, plugin.entity_models, plugin=plugin)
                         await fn(ctx)
                     else:
                         logger.warning(f"Task {task.id}: function '{fn_name}' not found")
@@ -256,7 +256,7 @@ async def process_task(task: EntityRow, registry, config):
                     if not fn:
                         raise ValueError(f"Task function not found: {fn_name}")
 
-                    ctx = ActivityContext(repo, dossier_id, {}, plugin.entity_models)
+                    ctx = ActivityContext(repo, dossier_id, {}, plugin.entity_models, plugin=plugin)
                     task_result = await fn(ctx)
 
                     # task_result should have target_dossier_id and optionally content
