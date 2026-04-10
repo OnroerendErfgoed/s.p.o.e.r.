@@ -30,16 +30,14 @@ class Plugin:
     task_handlers: dict[str, Callable] = field(default_factory=dict)  # task_name → async function
 
     # Validators for custom PROV-extension relations (e.g. oe:neemtAkteVan).
-    # Keyed by relation type string. Each validator is called after used/
-    # generated processing with access to the full request context and may
-    # raise ActivityError to reject, return a set of "stale used entries
-    # this relation covers" to satisfy the stale-used-reference check, or
-    # return None if the relation is pure annotation with no semantic
-    # effect. Signature:
-    #   async def validator(plugin, repo, dossier_id, activity_def,
-    #                       relation_entries, stale_used) -> set[UUID]
-    # Returns the set of entity_logical_ids whose staleness is satisfied
-    # by this relation.
+    # Keyed by relation type string. Each validator receives the full
+    # activity context (resolved used rows, pending generated items, the
+    # relation entries of its type) and raises ActivityError to reject the
+    # request. Returning normally means "accepted". The engine imposes no
+    # semantics on the return value — validators own their own failure
+    # conditions and payload shapes. Signature:
+    #   async def validator(*, plugin, repo, dossier_id, activity_def,
+    #                       entries, used_rows_by_ref, generated_items) -> None
     relation_validators: dict[str, Callable] = field(default_factory=dict)
 
     # Called after each activity completes (inside the transaction).

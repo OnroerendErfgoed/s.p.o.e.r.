@@ -8,7 +8,6 @@ No business logic — everything is driven by the workflow YAML + plugin handler
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID, uuid4
@@ -56,33 +55,16 @@ class CardinalityError(Exception):
     pass
 
 
-@dataclass
-class StaleUsedReference:
-    """A used-entity reference the client declared that is not the current
-    latest version of that entity. Collected during the used-items loop and
-    resolved (either satisfied by an oe:neemtAkteVan-style relation or
-    raised as a 409) after relations are processed."""
-    entity_ref: str
-    entity_type: str
-    entity_logical_id: UUID
-    declared_version: UUID
-    latest_version: UUID
-    intervening_version_ids: list[UUID]  # versions strictly newer than declared, oldest-first
-
-
 def _allowed_relation_types_for_activity(plugin: Plugin, activity_def: dict) -> set[str]:
     """Return the set of relation types this activity may carry.
 
-    Per-activity `relations:` declarations override the workflow-wide
-    defaults. Each declaration entry is `{type: "oe:neemtAkteVan", ...}`.
-    If an activity has its own block, only types in that block are allowed.
-    If not, the workflow-level `relations:` block (plugin.workflow['relations'])
-    provides the defaults. If neither is defined, NO relations are allowed."""
-    act_block = activity_def.get("relations")
-    if act_block is not None:
-        return {entry.get("type") for entry in act_block if entry.get("type")}
-    wf_block = plugin.workflow.get("relations", [])
-    return {entry.get("type") for entry in wf_block if entry.get("type")}
+    The workflow-level `relations:` block and the activity-level `relations:`
+    block are unioned — both contribute allowed types. Validators registered
+    for any of these types will always be invoked when this activity runs,
+    regardless of whether the client actually sent entries for them."""
+    workflow = {e.get("type") for e in plugin.workflow.get("relations", []) if e.get("type")}
+    activity = {e.get("type") for e in activity_def.get("relations", []) if e.get("type")}
+    return workflow | activity
 
 
 async def lookup_singleton(
@@ -582,17 +564,23 @@ async def execute_activity(
         if not valid:
             raise ActivityError(409, error)
 
-    # 5. Process used items (references only) + auto-resolve
+    # 5. Process used items (references only) + auto-resolve.
+    #
+    # This block does infrastructure only: resolve each ref into a real
+    # EntityRow, check dossier ownership, persist external URIs, and
+    # auto-resolve missing used entries. Workflow-level interpretation of
+    # "is this the right version" is left to plugin relation validators
+    # (see step 6b).
     used_refs = []
     resolved_entities: dict[str, EntityRow] = {}
-    stale_used: list[StaleUsedReference] = []
+    # Map ref string -> EntityRow for passing to relation validators.
+    used_rows_by_ref: dict[str, EntityRow] = {}
 
     for item in used_items:
         entity_ref = item.get("entity", "")
 
         if is_external_uri(entity_ref):
-            # Persist as external entity (idempotent). External entities
-            # have only one "version" so staleness doesn't apply.
+            # External URIs have only one "version" so no versioning concerns.
             ext_entity = await repo.ensure_external_entity(dossier_id, entity_ref)
             used_refs.append({"entity": entity_ref, "external": True, "version_id": ext_entity.id})
             continue
@@ -609,26 +597,7 @@ async def execute_activity(
             raise ActivityError(422, f"Entity belongs to a different dossier: {entity_ref}")
         used_refs.append({"entity": entity_ref, "version_id": parsed["version"], "type": entity_type})
         resolved_entities[entity_type] = existing_entity
-
-        # Staleness check: is this the current latest version of its
-        # entity_id? If not, collect the gap. We don't raise yet — a plugin
-        # relation validator (e.g. oe:neemtAkteVan) may cover it.
-        latest = await repo.get_latest_entity_by_id(dossier_id, existing_entity.entity_id)
-        if latest is not None and latest.id != existing_entity.id:
-            # Find every version strictly newer than the declared one.
-            all_versions = await repo.get_entity_versions(dossier_id, existing_entity.entity_id)
-            intervening = [
-                v.id for v in all_versions
-                if v.created_at > existing_entity.created_at
-            ]
-            stale_used.append(StaleUsedReference(
-                entity_ref=entity_ref,
-                entity_type=entity_type,
-                entity_logical_id=existing_entity.entity_id,
-                declared_version=existing_entity.id,
-                latest_version=latest.id,
-                intervening_version_ids=intervening,
-            ))
+        used_rows_by_ref[entity_ref] = existing_entity
 
     # Auto-resolve missing used entities
     for used_def in activity_def.get("used", []):
@@ -789,13 +758,18 @@ async def execute_activity(
     #
     # Each item is {entity: ref, type: relation_type}. The activity's YAML
     # declares which relation types it allows; the workflow's top-level
-    # `relations:` block provides workflow-wide defaults. Plugins register
-    # per-type validators — each validator may satisfy a subset of the
-    # staleness "gap" (stale_used) if its relation type is semantically
-    # equivalent to acknowledgement (e.g. oe:neemtAkteVan).
-    validated_relations: list[dict] = []  # {version_id, relation_type}
+    # `relations:` block provides workflow-wide defaults.
+    #
+    # After parsing and resolving, per-type validators registered by the
+    # plugin are invoked with the full activity context (resolved used rows,
+    # generated items, relation entries of their type). Validators are the
+    # sole arbiters of workflow-level rules — e.g. "this used reference is
+    # stale and the client hasn't acknowledged newer versions." The engine
+    # does not know or care about staleness, acknowledgement, approval
+    # chains, or any other workflow semantic; that all lives in validators.
+    # A validator signals rejection by raising `ActivityError`.
+    validated_relations: list[dict] = []
     allowed_relation_types = _allowed_relation_types_for_activity(plugin, activity_def)
-    satisfied_stale_ids: set[UUID] = set()
 
     # Group incoming relations by type so validators see them all at once.
     relations_by_type: dict[str, list[dict]] = {}
@@ -835,55 +809,22 @@ async def execute_activity(
             "ref": rel_ref,
         })
 
-    # Run per-type validators. Each returns the set of stale_used logical
-    # entity_ids whose staleness it covers (or None for pure-annotation
-    # relation types with no staleness semantics).
-    for rel_type, entries in relations_by_type.items():
+    # Per-type validator dispatch. Every allowed relation type that has a
+    # registered validator runs, regardless of whether the client sent any
+    # entries for it. The declaration is the gate; the validator is the brain.
+    for rel_type in allowed_relation_types:
         validator = plugin.relation_validators.get(rel_type)
         if validator is None:
-            # Pure annotation — the engine stores it but imposes no semantics.
-            continue
-        covered = await validator(
+            continue  # pure annotation — no validator, just stored
+        entries = relations_by_type.get(rel_type, [])
+        await validator(
             plugin=plugin,
             repo=repo,
             dossier_id=dossier_id,
             activity_def=activity_def,
             entries=entries,
-            stale_used=stale_used,
-        )
-        if covered:
-            satisfied_stale_ids.update(covered)
-
-    # 6c. Resolve staleness: any stale_used entry not covered by a relation
-    # validator is a hard error.
-    unsatisfied = [s for s in stale_used if s.entity_logical_id not in satisfied_stale_ids]
-    if unsatisfied:
-        first = unsatisfied[0]
-        latest_row = await repo.get_entity(first.latest_version)
-        raise ActivityError(
-            409,
-            f"Used reference {first.entity_ref} is stale: latest version of "
-            f"{first.entity_type}/{first.entity_logical_id} is {first.latest_version}. "
-            f"To proceed with an older version, acknowledge the newer versions "
-            f"via a relation such as 'oe:neemtAkteVan'.",
-            payload={
-                "error": "stale_used_reference",
-                "stale": [
-                    {
-                        "entity_ref": s.entity_ref,
-                        "entity_type": s.entity_type,
-                        "declared_version": str(s.declared_version),
-                        "latest_version": str(s.latest_version),
-                        "intervening_versions": [str(v) for v in s.intervening_version_ids],
-                    }
-                    for s in unsatisfied
-                ],
-                "latest_version": {
-                    "entity": f"{first.entity_type}/{first.entity_logical_id}@{first.latest_version}",
-                    "versionId": str(first.latest_version),
-                    "content": latest_row.content if latest_row else None,
-                },
-            },
+            used_rows_by_ref=used_rows_by_ref,
+            generated_items=generated,
         )
 
     # 7. Ensure agent exists
