@@ -1,61 +1,76 @@
 """
-File reference annotation and download_url injection.
+File reference type and download_url injection.
 
-A `FileId` is a `str` at runtime, but carries metadata that tells the GET
-response layer to inject a signed `download_url` sibling next to it.
+A `FileId` is a `str` subclass. Fields declared as `FileId` (or `Optional[FileId]`)
+on an entity model trigger automatic injection of a signed `download_url`
+sibling key in GET responses.
+
+Naming rule for the sibling key:
+- if the field name ends in `_id`, replace `_id` with `_download_url`
+- otherwise, append `_download_url`
+
+Examples:
+    file_id        -> file_download_url
+    brief          -> brief_download_url
+    signed_pdf_id  -> signed_pdf_download_url
 
 Usage in plugin entity models:
 
-    from gov_dossier_engine.file_refs import FileId, file_id
+    from gov_dossier_engine.file_refs import FileId
 
     class Bijlage(BaseModel):
-        # Default: sibling key will be "<field_name>_download_url".
-        file_id: FileId = file_id(url_field="download_url")  # backwards-compat
+        file_id: FileId
         filename: str
 
     class Beslissing(BaseModel):
-        brief: FileId  # sibling will be "brief_download_url"
+        brief: FileId           # signed decision letter PDF
 
-The route layer hydrates raw entity content through the registered Pydantic
-model and walks the resulting tree, finding fields annotated with FileId and
-calling a sign function to produce the download URL.
+The route layer calls `inject_download_urls(model_class, content_dict, sign_fn)`
+to walk the stored dict and emit a new dict with sibling URLs added.
 
-Why a class-level marker rather than a recursive scan for the literal key
-`"file_id"`: discoverability. Open the entity model file and the file
-references are right there in the type annotations, with no field-name
-collision risk and no limit to one file per model.
+Why this design (vs an Annotated metadata marker):
+- `__get_pydantic_core_schema__` is the documented public extension point
+  for custom types in Pydantic v2. No reliance on `field.metadata` or other
+  internals that have shifted between v2.x releases.
+- `isinstance(value, FileId)` semantics work everywhere: dict validation,
+  JSON round-trips, Optional, nested lists.
+- The walker uses `Model.model_fields` and `field.annotation` (both public,
+  documented v2 API) plus `typing.get_args` / `typing.get_origin` from the
+  stdlib. Nothing else.
+- The walker copies values from the original dict rather than re-validating.
+  This preserves extra/legacy fields and tolerates schema drift on read,
+  matching the behavior of the previous (recursive) injector.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Annotated, Any, Callable, Optional, Union, get_args, get_origin
+from typing import Any, Callable, Optional, get_args, get_origin
 
-from pydantic import BaseModel
+from pydantic import BaseModel, GetCoreSchemaHandler
+from pydantic_core import core_schema
 
 
-@dataclass(frozen=True)
-class _FileIdMarker:
-    """Marker carried inside a `FileId` annotation.
+# --------------------------------------------------------------------------
+# FileId type
+# --------------------------------------------------------------------------
 
-    `url_field`, when set, overrides the default sibling key name. Default
-    behavior: if the field name ends in ``_id`` it is replaced with
-    ``_download_url``; otherwise ``_download_url`` is appended.
+class FileId(str):
+    """A string subclass that marks a field as holding a file id.
+
+    Validates as a plain string but is wrapped in this subclass on the way
+    out so `isinstance(x, FileId)` is True throughout. JSON round-trips and
+    `model_validate`/`model_dump` both preserve the type.
     """
-    url_field: Optional[str] = None
 
-
-def file_id(*, url_field: Optional[str] = None) -> Any:
-    """Pydantic field default helper. Use only if you need to override the
-    sibling key name; in most cases just annotate as ``FileId``."""
-    # Returns the marker itself; the field declaration uses Annotated for
-    # type-side metadata, and this helper exists purely for symmetry / docs.
-    return _FileIdMarker(url_field=url_field)
-
-
-# The public type. A FileId is a str carrying a _FileIdMarker in its
-# annotation metadata.
-FileId = Annotated[str, _FileIdMarker()]
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, source_type: Any, handler: GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        # Validate input as str, then wrap in FileId via the after-validator.
+        return core_schema.no_info_after_validator_function(
+            cls,
+            core_schema.str_schema(),
+        )
 
 
 # --------------------------------------------------------------------------
@@ -72,108 +87,82 @@ def _default_url_field_name(field_name: str) -> str:
     return field_name + "_download_url"
 
 
-def _extract_file_marker_from_metadata(metadata: list) -> Optional[_FileIdMarker]:
-    """Pydantic FieldInfo exposes Annotated metadata via .metadata for the
-    top-level case (`field: FileId`). For wrapped cases like
-    `field: Optional[FileId]`, the metadata stays inside the annotation
-    object and we have to dig it out."""
-    for meta in metadata or []:
-        if isinstance(meta, _FileIdMarker):
-            return meta
-    return None
+def _annotation_contains_file_id(annotation: Any) -> bool:
+    """True if `annotation` declares a FileId, including inside Optional/Union."""
+    if annotation is FileId:
+        return True
+    for arg in get_args(annotation):
+        if arg is FileId:
+            return True
+    return False
 
 
-def _extract_file_marker_from_annotation(annotation: Any) -> Optional[_FileIdMarker]:
-    """Recursively look inside an annotation for a _FileIdMarker. Handles
-    Annotated[...], Optional[...], Union[...], and combinations thereof."""
-    # Annotated[X, ...] case
-    args = get_args(annotation)
+def _basemodel_inside(annotation: Any) -> Optional[type[BaseModel]]:
+    """If `annotation` declares a BaseModel subclass — directly, inside
+    list[...], or inside Optional[...] — return that subclass. Otherwise None."""
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
     origin = get_origin(annotation)
-
-    # typing.Annotated exposes its metadata via __metadata__ as well
-    metadata = getattr(annotation, "__metadata__", None)
-    if metadata:
-        for meta in metadata:
-            if isinstance(meta, _FileIdMarker):
-                return meta
-
-    # Recurse into Union/Optional
-    if origin is Union:
-        for arg in args:
+    if origin in (list, tuple):
+        args = get_args(annotation)
+        if args and isinstance(args[0], type) and issubclass(args[0], BaseModel):
+            return args[0]
+    if origin is not None:
+        for arg in get_args(annotation):
             if arg is type(None):
                 continue
-            found = _extract_file_marker_from_annotation(arg)
-            if found is not None:
-                return found
+            if isinstance(arg, type) and issubclass(arg, BaseModel):
+                return arg
     return None
 
 
-def _unwrap_optional(annotation: Any) -> Any:
-    """Unwrap Optional[X] / Union[X, None] to X. Leaves other unions alone."""
-    origin = get_origin(annotation)
-    if origin is Union:
-        args = [a for a in get_args(annotation) if a is not type(None)]
-        if len(args) == 1:
-            return args[0]
-    return annotation
+def _is_list_field(annotation: Any) -> bool:
+    return get_origin(annotation) in (list, tuple)
 
 
-def _is_basemodel(tp: Any) -> bool:
-    return isinstance(tp, type) and issubclass(tp, BaseModel)
-
-
-def _walk(value: Any, annotation: Any, sign: SignFn) -> Any:
-    """Walk a value alongside its declared type, returning a JSON-ready dict
-    or list with download_url siblings injected."""
-    annotation = _unwrap_optional(annotation)
-    origin = get_origin(annotation)
-
-    # list[X]
-    if origin in (list, tuple):
-        item_type = get_args(annotation)[0] if get_args(annotation) else Any
-        if isinstance(value, list):
-            return [_walk(item, item_type, sign) for item in value]
-        return value
-
-    # Nested BaseModel
-    if _is_basemodel(annotation):
-        if isinstance(value, dict):
-            return _walk_model(annotation, value, sign)
-        return value
-
-    # Plain value (including FileId, which is just str at runtime). FileId
-    # is detected at the field level in _walk_model, not here.
-    return value
-
-
-def _walk_model(model_class: type[BaseModel], data: dict, sign: SignFn) -> dict:
-    """Walk a dict expected to match `model_class`. Inject download_url
-    siblings for FileId-annotated fields. Returns a new dict; does not mutate."""
-    if not isinstance(data, dict):
-        return data
-
-    out: dict = {}
+def _walk_dict(
+    model_class: type[BaseModel],
+    data: dict,
+    sign: SignFn,
+) -> dict:
+    """Walk `data` using `model_class` to learn which fields are FileIds and
+    which are nested models. Does NOT validate `data` — values are copied
+    through unchanged so extra/legacy keys survive."""
     fields = model_class.model_fields
+    out: dict = {}
 
     for key, value in data.items():
         field = fields.get(key)
         if field is None:
-            # Field not declared on the model — pass through unchanged.
+            # Unknown field — pass through unchanged.
             out[key] = value
             continue
 
         annotation = field.annotation
-        marker = (
-            _extract_file_marker_from_metadata(field.metadata)
-            or _extract_file_marker_from_annotation(annotation)
-        )
 
-        if marker is not None and isinstance(value, str):
+        if _annotation_contains_file_id(annotation):
             out[key] = value
-            sibling = marker.url_field or _default_url_field_name(key)
-            out[sibling] = sign(value)
-        else:
-            out[key] = _walk(value, annotation, sign)
+            if isinstance(value, str):
+                sibling = _default_url_field_name(key)
+                out[sibling] = sign(value)
+            # If the value is None (Optional[FileId]) we leave the field as
+            # None and emit no sibling.
+            continue
+
+        nested = _basemodel_inside(annotation)
+        if nested is not None:
+            if _is_list_field(annotation) and isinstance(value, list):
+                out[key] = [
+                    _walk_dict(nested, item, sign) if isinstance(item, dict) else item
+                    for item in value
+                ]
+            elif isinstance(value, dict):
+                out[key] = _walk_dict(nested, value, sign)
+            else:
+                out[key] = value
+            continue
+
+        out[key] = value
 
     return out
 
@@ -183,13 +172,13 @@ def inject_download_urls(
     content: Any,
     sign: SignFn,
 ) -> Any:
-    """Hydrate-walk `content` through `model_class` and inject download URLs.
+    """Walk `content` and inject download_url siblings for any FileId fields.
 
-    If `model_class` is None (no registered model for this entity type),
-    returns content unchanged.
+    If `model_class` is None (no model registered for this entity type) or
+    `content` is not a dict, returns the content unchanged.
     """
     if model_class is None or content is None:
         return content
     if not isinstance(content, dict):
         return content
-    return _walk_model(model_class, content, sign)
+    return _walk_dict(model_class, content, sign)

@@ -8,20 +8,18 @@ Generated from the JSON Schema definitions in the workflow template.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Annotated, Optional
+from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-from gov_dossier_engine.file_refs import FileId, file_id
+from gov_dossier_engine.file_refs import FileId
 
 
 # --- Bijlage (file attachment) ---
 
 class Bijlage(BaseModel):
-    # Annotated override keeps the sibling key as `download_url` for
-    # backwards compatibility with existing API consumers. Without the
-    # override the default would be `file_download_url`.
-    file_id: Annotated[str, file_id(url_field="download_url")]
+    # `file_id` is a FileId — GET responses include `file_download_url` next to it.
+    file_id: FileId
     filename: str
     content_type: str = "application/octet-stream"
     size: int = 0
@@ -71,7 +69,7 @@ class Beslissing(BaseModel):
     beslissing: BeslissingUitkomst
     datum: str  # datetime string
     object: str  # URI
-    # `brief` is a file reference: the signed decision letter PDF.
+    # `brief` is a FileId — the signed decision letter PDF.
     # GET responses will include `brief_download_url` next to it.
     brief: FileId
 
@@ -101,4 +99,5 @@ class Behandelaar(BaseModel):
 class SystemFields(BaseModel):
     datum: str  # datetime string
     aanmaker: str  # URI
+
 

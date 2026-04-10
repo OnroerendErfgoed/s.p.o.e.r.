@@ -84,9 +84,9 @@ curl -s -X PUT "$BASE_URL/dossiers/d1000000-0000-0000-0000-000000000001/activiti
   }" | python3 -m json.tool
 echo ""
 
-echo "--- D1 Verify download_url injection ---"
+echo "--- D1 Verify file_download_url injection ---"
 curl -s "$BASE_URL/dossiers/d1000000-0000-0000-0000-000000000001" \
-  -H "X-POC-User: marie.brugge" | python3 -c "
+  -H "X-POC-User: claeyswo" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 found = False
@@ -95,13 +95,12 @@ for e in d.get('currentEntities', []):
         bs = e['content'].get('bijlagen', [])
         assert bs, f'aanvraag has no bijlagen: {e[\"content\"]}'
         for b in bs:
-            assert 'download_url' in b, f'missing download_url on bijlage: {b}'
-            assert 'file_download_url' not in b, f'override failed, got file_download_url too: {b}'
-            print(f\"  bijlage file_id={b['file_id'][:8]}... download_url={b['download_url'][:70]}...\")
+            assert 'file_download_url' in b, f'missing file_download_url on bijlage: {b}'
+            print(f\"  bijlage file_id={b['file_id'][:8]}... file_download_url={b['file_download_url'][:70]}...\")
             found = True
         break
 assert found, 'no oe:aanvraag entity found in currentEntities'
-print('  OK: download_url was injected on Bijlage.file_id (override worked)')
+print('  OK: file_download_url was injected on Bijlage.file_id')
 "
 echo ""
 
