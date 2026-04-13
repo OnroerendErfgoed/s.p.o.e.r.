@@ -441,6 +441,30 @@ class Repository:
         )
         return {row[0] for row in result.all()}
 
+    async def get_entities_generated_by_activity(
+        self, activity_id: UUID
+    ) -> list[EntityRow]:
+        """Return all entities whose `generated_by` points at this activity."""
+        from sqlalchemy import select
+        result = await self.session.execute(
+            select(EntityRow)
+            .where(EntityRow.generated_by == activity_id)
+            .order_by(EntityRow.created_at)
+        )
+        return list(result.scalars().all())
+
+    async def get_used_entities_for_activity(
+        self, activity_id: UUID
+    ) -> list[EntityRow]:
+        """Return the full EntityRow objects used by an activity."""
+        from sqlalchemy import select
+        result = await self.session.execute(
+            select(EntityRow)
+            .join(UsedRow, UsedRow.entity_id == EntityRow.id)
+            .where(UsedRow.activity_id == activity_id)
+        )
+        return list(result.scalars().all())
+
     # --- Relations (generic activity→entity edges beyond used/generated) ---
 
     async def create_relation(

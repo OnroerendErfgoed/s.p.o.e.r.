@@ -96,6 +96,58 @@ async def lookup_singleton(
     return await repo.get_singleton_entity(dossier_id, entity_type)
 
 
+async def resolve_from_trigger(
+    repo: Repository,
+    trigger_activity_id: UUID,
+    dossier_id: UUID,
+    entity_type: str,
+) -> EntityRow | None:
+    """Resolve an entity of `entity_type` from the scope of a triggering
+    activity. Used for side-effect auto-resolve and task anchor auto-fill.
+
+    Resolution order:
+    1. Entities **generated** by the trigger. These represent the state
+       AFTER the trigger ran, so they take precedence.
+    2. Entities **used** by the trigger. These are the inputs the trigger
+       acted on.
+
+    At each level, only entities matching `entity_type` are considered.
+    If exactly one candidate is found, return it. If zero, fall through
+    to the next level. If multiple distinct entity_ids of the same type
+    are found at any level, return None — the caller must disambiguate
+    (typically by raising an error).
+
+    Returns the EntityRow or None if no unambiguous match is found."""
+    # Check generated first (post-trigger state wins).
+    generated = await repo.get_entities_generated_by_activity(trigger_activity_id)
+    gen_of_type = [e for e in generated if e.type == entity_type]
+    if gen_of_type:
+        # Distinct entity_ids? If multiple, ambiguous.
+        entity_ids = {e.entity_id for e in gen_of_type}
+        if len(entity_ids) == 1:
+            # Return the newest version (last in created_at order).
+            return gen_of_type[-1]
+        return None  # ambiguous: multiple entity_ids of the same type
+
+    # Check used (pre-trigger inputs).
+    used = await repo.get_used_entities_for_activity(trigger_activity_id)
+    used_of_type = [e for e in used if e.type == entity_type]
+    if used_of_type:
+        entity_ids = {e.entity_id for e in used_of_type}
+        if len(entity_ids) == 1:
+            # The trigger used one specific entity of this type. But the
+            # trigger may have generated a newer version of it — in which
+            # case the generated check above would have caught it. Since
+            # we're here, the trigger didn't revise this entity. Return
+            # the latest version of this entity_id in the dossier (there
+            # may have been revisions by OTHER activities in the same
+            # transaction, e.g. batch).
+            return await repo.get_latest_entity_by_id(dossier_id, used_of_type[0].entity_id)
+        return None  # ambiguous
+
+    return None  # type not in trigger's scope at all
+
+
 # =====================================================================
 # Authorization
 # =====================================================================
@@ -624,14 +676,48 @@ async def execute_activity(
     # Auto-resolve missing used entities. Only allowed for system callers
     # (worker, side effects). Client callers must supply all used references
     # explicitly so there is no ambiguity about which version they acted on.
+    #
+    # For system callers with an `informed_by` chain (scheduled tasks and
+    # side effects), resolution first checks the informing activity's scope
+    # (what it generated/used) via `resolve_from_trigger`. This handles
+    # multi-cardinality types correctly by finding the specific entity
+    # instance the informing activity worked on.
+    #
+    # Falls back to dossier-wide singleton lookup for types not in the
+    # informing activity's scope. Multi-cardinality types that aren't in
+    # scope and aren't resolvable from the trigger fail silently (the
+    # activity runs without that entity in its used context).
     if caller == "system":
+        # Parse informed_by to a UUID if it's a local activity reference.
+        trigger_id: UUID | None = None
+        if informed_by:
+            try:
+                trigger_id = UUID(informed_by)
+            except (ValueError, AttributeError):
+                pass  # cross-dossier URI or other non-UUID reference
+
         for used_def in activity_def.get("used", []):
             if used_def.get("external"):
                 continue
             etype = used_def["type"]
             auto = used_def.get("auto_resolve")
             if auto == "latest" and etype not in resolved_entities:
-                entity = await lookup_singleton(plugin, repo, dossier_id, etype)
+                entity = None
+
+                # Try trigger scope first (works for both singletons and
+                # multi-cardinality types).
+                if trigger_id is not None:
+                    entity = await resolve_from_trigger(
+                        repo, trigger_id, dossier_id, etype,
+                    )
+
+                # Fallback: dossier-wide singleton lookup for types not
+                # in the trigger's scope.
+                if entity is None and plugin.is_singleton(etype):
+                    entity = await lookup_singleton(
+                        plugin, repo, dossier_id, etype,
+                    )
+
                 if entity:
                     resolved_entities[etype] = entity
                     used_refs.append({
@@ -1255,14 +1341,29 @@ async def _execute_side_effects(
             role="systeem",
         )
 
-        # Auto-resolve used entities
+        # Auto-resolve used entities. For side effects, resolution is scoped
+        # to the triggering activity: first check what it generated, then
+        # what it used. Falls back to dossier-wide singleton lookup only if
+        # the trigger didn't touch the requested type at all (and the type
+        # is singleton-cardinality). This ensures multi-cardinality types
+        # resolve to the specific entity the trigger worked on, not an
+        # arbitrary "latest of type."
         se_resolved = {}
         for se_used_def in se_def.get("used", []):
             if se_used_def.get("external"):
                 continue
             se_type = se_used_def["type"]
             if se_used_def.get("auto_resolve") == "latest":
-                se_entity = await lookup_singleton(plugin, repo, dossier_id, se_type)
+                # Try trigger scope first.
+                se_entity = await resolve_from_trigger(
+                    repo, trigger_activity_id, dossier_id, se_type,
+                )
+                if se_entity is None and plugin.is_singleton(se_type):
+                    # Fallback: dossier-wide singleton (e.g. a system entity
+                    # not directly touched by the trigger).
+                    se_entity = await lookup_singleton(
+                        plugin, repo, dossier_id, se_type,
+                    )
                 if se_entity:
                     se_resolved[se_type] = se_entity
                     await repo.create_used(se_activity_id, se_entity.id)
