@@ -3,39 +3,36 @@ Database models and repository.
 
 All activity/entity tables are append-only. No UPDATEs, no DELETEs.
 Status is stored as computed_status on each activity row.
-Content is stored as JSON, validated by Pydantic on write.
+Content is stored as JSONB, validated by Pydantic on write.
+
+Database: PostgreSQL 16+ is required. The code uses native `UUID`
+columns (via `sqlalchemy.dialects.postgresql.UUID`) and `JSONB` for
+`content` fields so queries can use expression indexes on individual
+JSON fields. The earlier POC's SQLite support was removed during the
+worker production-readiness pass — see the commit history for rationale.
 """
 
 from __future__ import annotations
 
-import uuid as uuid_mod
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
 from sqlalchemy import (
-    Column, DateTime, ForeignKey, Index, JSON, Text,
+    Column, DateTime, ForeignKey, Index, Text,
     distinct, func, select, update,
 )
-from sqlalchemy.types import TypeDecorator, CHAR
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PGUUID
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
-class UUID_DB(TypeDecorator):
-    """Platform-independent UUID type. Uses CHAR(36) on SQLite, works on PostgreSQL too."""
-    impl = CHAR(36)
-    cache_ok = True
-
-    def process_bind_param(self, value, dialect):
-        if value is not None:
-            return str(value)
-        return value
-
-    def process_result_value(self, value, dialect):
-        if value is not None:
-            return uuid_mod.UUID(str(value))
-        return value
+# Column type aliases. `UUID_DB` is kept as the name for minimum churn
+# in the existing Column definitions below — it's now a thin shim over
+# Postgres's native UUID type. `JSON_DB` is a similar shim over JSONB.
+UUID_DB = lambda: PGUUID(as_uuid=True)
+JSON_DB = JSONB
 
 Base = declarative_base()
 
@@ -108,7 +105,7 @@ class EntityRow(Base):
     generated_by = Column(UUID_DB(), ForeignKey("activities.id"), nullable=True)
     derived_from = Column(UUID_DB(), ForeignKey("entities.id"), nullable=True)
     attributed_to = Column(Text, nullable=True)
-    content = Column(JSON, nullable=True)
+    content = Column(JSON_DB, nullable=True)
     schema_version = Column(Text, nullable=True)  # e.g. "v1", "v2"; NULL = unversioned/legacy
     tombstoned_by = Column(UUID_DB(), ForeignKey("activities.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -163,7 +160,7 @@ class AgentRow(Base):
     id = Column(Text, primary_key=True)
     type = Column(Text, nullable=False)
     name = Column(Text, nullable=True)
-    properties = Column(JSON, nullable=True)
+    properties = Column(JSON_DB, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
@@ -229,6 +226,40 @@ class Repository:
         rows = list(result.scalars().all())
         self._activities_cache[dossier_id] = rows
         return rows
+
+    async def has_cancelling_activity_after(
+        self,
+        dossier_id: UUID,
+        types: list[str],
+        after: datetime,
+    ) -> bool:
+        """Return True if any activity in `dossier_id` with a type in
+        `types` was created strictly after `after`.
+
+        Used by the worker's `check_cancelled` to decide whether a due
+        task should be marked cancelled instead of executed. Backed by
+        the `ix_activities_dossier_type` composite index so Postgres
+        can satisfy this with a small index range scan regardless of
+        the dossier's total activity count. The old implementation
+        loaded every activity in the dossier into Python and looped
+        over it, which was O(n) per task check.
+
+        `types` may be empty, in which case this returns False
+        (no types means no cancellation condition). `after` must be
+        an aware datetime — callers pass `task.created_at` which is
+        always aware because the column is TIMESTAMPTZ.
+        """
+        if not types:
+            return False
+        stmt = (
+            select(ActivityRow.id)
+            .where(ActivityRow.dossier_id == dossier_id)
+            .where(ActivityRow.type.in_(types))
+            .where(ActivityRow.created_at > after)
+            .limit(1)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none() is not None
 
     async def create_activity(
         self,
@@ -423,7 +454,7 @@ class Repository:
     async def ensure_external_entity(self, dossier_id: UUID, uri: str) -> EntityRow:
         """Ensure an external entity exists for this URI in this dossier. Idempotent."""
         # Deterministic UUID from URI + dossier_id so the same URI doesn't create duplicates
-        entity_id = uuid_mod.uuid5(uuid_mod.NAMESPACE_URL, f"{dossier_id}:{uri}")
+        entity_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{dossier_id}:{uri}")
         version_id = entity_id  # external entities have one "version"
         result = await self.session.execute(
             select(EntityRow)

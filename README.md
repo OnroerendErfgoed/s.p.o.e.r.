@@ -4,13 +4,38 @@ A W3C PROV-based, activity-driven dossier management API built with FastAPI. Eve
 
 ## Quick Start
 
+### Prerequisites
+
+PostgreSQL 16 or newer running on `127.0.0.1:5432`. The app uses native `UUID` and `JSONB` columns, so SQLite is not supported. To set up a local Postgres for development:
+
+```bash
+# Install (Debian/Ubuntu)
+apt install postgresql postgresql-contrib
+pg_ctlcluster 16 main start
+
+# Create the dossier role and database (as the postgres OS user)
+su -c "psql -c \"CREATE USER dossier WITH PASSWORD 'dossier';\"" postgres
+su -c "psql -c \"CREATE DATABASE dossiers OWNER dossier;\"" postgres
+su -c "psql -d dossiers -c \"GRANT ALL ON SCHEMA public TO dossier;\"" postgres
+
+# For dev convenience, set host auth on 127.0.0.1 to trust so the
+# app doesn't need a password in the connection string. Edit
+# /etc/postgresql/16/main/pg_hba.conf and change the `host all all
+# 127.0.0.1/32` and `::1/128` lines to use `trust` instead of
+# `scram-sha-256`, then `pg_ctlcluster 16 main reload`. In
+# production, use a real password or client certificates instead.
+```
+
+### Install and run
+
 ```bash
 # Install all five projects in editable mode (one-time setup)
 pip install -e dossier_common/ -e file_service/ -e dossier_engine/ \
             -e dossier_toelatingen/ -e dossier_app/
 
-# Run the dossier API (launch cwd does not matter — config paths
-# resolve against the config file's own directory)
+# Run the dossier API (launch cwd does not matter — the engine's
+# only filesystem path, file_service.storage_root, resolves against
+# the config file's own directory)
 uvicorn dossier_app.main:app --reload --port 8000
 
 # Run the file service (separate process, separate port)
@@ -198,10 +223,77 @@ Tasks can be defined statically in YAML or appended conditionally by handlers at
 ### Worker
 
 ```bash
-python -m dossier_engine.worker --once          # process all due tasks and exit
-python -m dossier_engine.worker                  # continuous polling (10s)
-python -m dossier_engine.worker --interval 5     # custom interval
+python -m dossier_engine.worker --once          # drain all due tasks and exit
+python -m dossier_engine.worker                 # continuous polling (10s default)
+python -m dossier_engine.worker --interval 5    # custom poll interval
+python -m dossier_engine.worker --help          # full options
 ```
+
+The worker is production-ready and safe to deploy redundantly. Every significant piece of its behavior went through a dedicated hardening pass — see `dossier_engine/dossier_engine/worker.py` for source.
+
+**Concurrency model.** Multiple workers can run against the same database. The poll query is `SELECT ... LIMIT 5 FOR UPDATE OF entities SKIP LOCKED` — each worker tries to claim up to 5 candidate tasks, Postgres locks them for the duration of the claiming transaction, and any other worker's concurrent claim attempts skip over locked rows entirely. The lock persists from the claim through the task execution to the commit, so no two workers ever execute the same task version. When one worker commits (success, cancellation, retry, or dead-letter), the lock releases and the next worker's next claim sees the updated status. No leader election, no leases, no external coordination — Postgres handles it.
+
+**Claim-lock-execute loop.** The worker has two nested loops: an inner drain loop that claims one task, executes it, and commits in a single transaction, repeating until the claim query returns nothing; and an outer sleep loop that waits for the next poll interval (or a SIGTERM). `--once` mode runs one inner drain and exits.
+
+**Retry policy.** When a task execution raises an exception, the failure is caught and routed through `_record_failure`, which writes a new task version in a fresh transaction with updated retry bookkeeping:
+
+- `attempt_count` is incremented.
+- If `attempt_count >= max_attempts` (default 3), the new version has `status = "dead_letter"` — terminal, never picked up by the worker again.
+- Otherwise, the new version stays in `status = "scheduled"` but gains a `next_attempt_at` field set to `now + base_delay_seconds * 2**(attempt_count - 1) * (1 + jitter)` where jitter is uniform in `[-0.1, 0.1]`. The default `base_delay_seconds` is 60, so failures retry at roughly 60s, 120s, 240s for attempts 1, 2, 3. The jitter prevents thundering-herd retries.
+- `last_error` carries the exception's type and message. `last_attempt_at` carries an ISO timestamp of the failed attempt.
+
+Tasks can override `max_attempts` and `base_delay_seconds` in their content to opt into a different retry shape — e.g. a cross-dossier task that calls a flaky external service might use `max_attempts=5, base_delay_seconds=30` for faster, more aggressive retry. All retry state goes through the same `complete_task → execute_activity → systemAction` pathway as happy-path completions, so every write is validated, every post-activity hook fires, and the full PROV graph is preserved.
+
+**Dead-letter handling.** Dead-lettered tasks stay in the database with `status = "dead_letter"` and their full error history (`attempt_count`, `last_error`, `last_attempt_at`). They're invisible to the poll query (which filters on `status = 'scheduled'`) and require operator intervention. To requeue a dead-lettered task manually, write a new task version with `status = "scheduled"` and `attempt_count = 0` via a `systemAction` activity. To investigate, query by `content ->> 'status' = 'dead_letter'` and read `last_error`.
+
+**Graceful shutdown.** `SIGTERM` and `SIGINT` set an `asyncio.Event`. The outer sleep loop uses `asyncio.wait_for(shutdown.wait(), timeout=poll_interval)` as its "sleep", so the signal unblocks the sleep immediately. The inner drain loop checks the event at the top of each iteration, so a signal mid-drain finishes the in-flight task cleanly (its transaction runs to completion — we never interrupt a task mid-transaction) and then exits before starting the next one. Container orchestrators that send SIGTERM and wait a few seconds before killing the process will see the worker exit cleanly with `Worker stopped` in the log.
+
+**Observability log lines** (all under logger `dossier.worker`):
+
+| Line | Level | When |
+|---|---|---|
+| `Worker started. Poll interval: Ns. Once: True/False` | INFO | startup |
+| `Task X: processing kind=Y function=Z` | INFO | beginning of each task execution |
+| `Task X: recorded task 'Y' completed` | INFO | successful recorded task |
+| `Task X: scheduled activity Y executed` | INFO | successful scheduled_activity |
+| `Task X: cross-dossier activity Y in Z` | INFO | successful cross_dossier |
+| `Task X: cancelled by activity` | INFO | `cancel_if_activities` fired |
+| `Drain cycle: processed N tasks` | INFO | end of each drain pass, only when N > 0 |
+| `Task X: attempt K/M failed, retry at T: E` | WARNING | transient failure with retry scheduled |
+| `Task X: attempt K/M failed, moving to dead_letter: E` | ERROR | failure with retries exhausted |
+| `Task X execution failed: E` | ERROR | raw exception trace before retry decision |
+| `Worker received signal N, shutting down gracefully` | INFO | SIGTERM/SIGINT arrived |
+| `Worker stopped` | INFO | clean exit |
+
+A simple prometheus-style scrape can be built on top of these by counting `recorded task '*' completed` lines for throughput and `moving to dead_letter` lines for failure-budget alerts. Real metrics (gauge for queue depth, histogram for task duration) are a separate Level 2 concern and not yet implemented — see the production-readiness arc inventory for the unbuilt Level 2 items.
+
+**Inspecting the queue from psql**:
+
+```sql
+-- Backlog depth by status
+SELECT content->>'status' AS status, COUNT(*)
+FROM entities
+WHERE type = 'system:task'
+GROUP BY 1;
+
+-- Dead-lettered tasks with their errors
+SELECT entity_id, content->>'function', content->>'last_error',
+       content->>'attempt_count', content->>'last_attempt_at'
+FROM entities
+WHERE type = 'system:task' AND content->>'status' = 'dead_letter';
+
+-- Tasks waiting on retry delay
+SELECT entity_id, content->>'function',
+       content->>'attempt_count', content->>'next_attempt_at'
+FROM entities
+WHERE type = 'system:task'
+  AND content->>'status' = 'scheduled'
+  AND content ? 'next_attempt_at';
+```
+
+Note that these queries scan the full history including superseded task versions. To see only latest-version-per-task, add a `MAX(created_at)` subquery join — the worker's `find_due_tasks` in `worker.py` shows the shape.
+
+**Running multiple workers.** On Postgres with `FOR UPDATE OF entities SKIP LOCKED`, concurrent workers are safe by construction. Run as many as your task throughput requires. A sensible starting point is one worker per CPU core for CPU-bound task functions, or a few workers per core for IO-bound ones. All workers connect to the same Postgres instance; no other coordination is needed.
 
 ## Test Flows
 
@@ -236,16 +328,16 @@ Both the dossier API (port 8000) and the file service (port 8001) must be up, an
 pkill -9 -f uvicorn
 sleep 1
 
-# 2. Wipe the database and file storage. Both live next to the
-#    config file inside the dossier_app package, not at the repo
-#    root — that's where the engine's config-relative path resolver
-#    anchors them.
-rm -f  /home/claude/toelatingen/dossier_app/dossier_app/dossiers.db*
+# 2. Wipe the database (Postgres schema) and the file storage. The
+#    file storage lives next to the config file inside the dossier_app
+#    package — that's where the engine's config-relative path resolver
+#    anchors it.
+psql -h 127.0.0.1 -U dossier dossiers \
+  -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO dossier;"
 rm -rf /home/claude/toelatingen/dossier_app/dossier_app/file_storage
 
 # 3. Launch both services. Launch cwd doesn't matter because every
-#    project is pip-installed (editable) and config paths resolve
-#    against the config file's own directory. /tmp is a convenient
+#    project is pip-installed (editable). /tmp is a convenient
 #    neutral cwd that avoids the repo-root namespace-package
 #    collision (see TROUBLESHOOTING.md).
 cd /tmp
@@ -290,16 +382,6 @@ Environment troubleshooting notes (deleted-inode gotchas, process-group kills in
 - **Search delegated to Elasticsearch** — plugin provides `post_activity_hook` and search routes.
 - **External entities persisted** — external URIs stored as entities with type `"external"`, full PROV trail.
 - **Pipeline phases are small and documented** — every phase function in `engine/pipeline/` declares its Reads/Writes contract, which makes individual phases unit-testable against fixture `ActivityState` objects without needing the full HTTP stack.
-
-## Switching to PostgreSQL
-
-1. Install asyncpg: `pip install asyncpg`
-2. Update `dossier_app/config.yaml`:
-   ```yaml
-   database:
-     url: "postgresql+asyncpg://user:pass@localhost:5432/dossiers"
-   ```
-3. Restart the API
 
 ## Adding a New Workflow
 

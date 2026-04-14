@@ -21,27 +21,64 @@ class DossierAccess(BaseModel):
 
 
 class TaskEntity(BaseModel):
-    """Content model for system:task entities."""
+    """Content model for system:task entities.
+
+    Tasks go through this lifecycle:
+        scheduled → completed           (success, first attempt)
+        scheduled → scheduled → ...     (transient failure, retry with backoff)
+        scheduled → dead_letter         (exhausted max_attempts, terminal)
+        scheduled → cancelled           (cancel_if_activities triggered)
+        scheduled → superseded          (replaced by another task with same anchor)
+
+    Retry semantics. On execution failure, the worker increments
+    `attempt_count`, records the error in `last_error`, and either:
+
+    * Sets `status = "dead_letter"` if `attempt_count >= max_attempts`.
+      Dead-lettered tasks are terminal and never picked up by the poll
+      loop again — they need operator intervention (requeue via an
+      admin activity, or investigate and drop).
+    * Sets `next_attempt_at` to now + exponential backoff
+      (`base_delay_seconds * 2**(attempt_count - 1)` ± 10% jitter)
+      and leaves `status = "scheduled"` so the poll loop picks it up
+      once the delay elapses. The original `scheduled_for` is
+      preserved as a historical record of when the task was first
+      queued; the poll filter checks both `scheduled_for <= now`
+      and `next_attempt_at <= now` (when set).
+
+    `max_attempts` and `base_delay_seconds` can be overridden per
+    task when it's scheduled; absent defaults come from the worker's
+    config. `attempt_count` starts at 0 and is only touched by the
+    worker on failure.
+    """
     kind: str                           # "fire_and_forget", "recorded", "scheduled_activity", "cross_dossier_activity"
     function: Optional[str] = None      # plugin task function name
     target_activity: Optional[str] = None   # for kinds 3, 4
     target_dossier: Optional[str] = None    # for kind 4 (set by worker after function call)
     result_activity_id: Optional[str] = None  # pre-generated UUID for the scheduled activity
-    scheduled_for: Optional[str] = None     # ISO datetime
+    scheduled_for: Optional[str] = None     # ISO datetime — original schedule, immutable
     cancel_if_activities: list[str] = []
     allow_multiple: bool = False
-    status: str = "scheduled"           # "scheduled", "completed", "cancelled", "superseded", "failed"
+    status: str = "scheduled"           # scheduled, completed, cancelled, superseded, dead_letter
     result: Optional[str] = None        # URI or result data after completion
-    error: Optional[str] = None         # error message if failed
+    error: Optional[str] = None         # most recent error on transient failure (legacy field)
 
     # Anchor: the specific entity this task is scoped to, used for cancel,
     # supersede, and allow_multiple matching. Stored as strings so the Pydantic
-    # model is JSON-round-trippable through SQLite. `anchor_type` records the
-    # entity type the anchor is bound to, so worker-executed scheduled tasks
+    # model is JSON-round-trippable through the database. `anchor_type` records
+    # the entity type the anchor is bound to, so worker-executed scheduled tasks
     # can use it as an auto-resolve fallback for multi-cardinality used types
     # that match the anchor's type.
     anchor_entity_id: Optional[str] = None
     anchor_type: Optional[str] = None
+
+    # Retry policy state. All optional with sensible defaults so existing
+    # tasks in the database continue to deserialize without migration.
+    attempt_count: int = 0
+    max_attempts: int = 3
+    base_delay_seconds: int = 60
+    last_error: Optional[str] = None
+    last_attempt_at: Optional[str] = None   # ISO datetime, most recent attempt
+    next_attempt_at: Optional[str] = None   # ISO datetime, when to try again
 
 
 # systemAction — generic system activity for migrations, task completions, corrections, etc.

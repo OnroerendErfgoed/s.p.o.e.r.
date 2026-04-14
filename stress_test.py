@@ -430,7 +430,9 @@ async def seed_dossiers(count: int, config_path: str):
     from dossier_engine.engine import execute_activity
 
     config, registry = load_config_and_registry(config_path)
-    db_url = config.get("database", {}).get("url", "sqlite+aiosqlite:///./dossiers.db")
+    db_url = config.get("database", {}).get("url")
+    if not db_url:
+        raise RuntimeError("database.url is required in config")
     await init_db(db_url)
     await create_tables()
 

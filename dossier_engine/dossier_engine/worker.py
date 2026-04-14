@@ -15,69 +15,306 @@ All operations within a single DB transaction. If anything fails, everything rol
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import json
 import logging
-import sys
-from datetime import datetime, timezone
+import random
+import signal
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from .app import load_config_and_registry, SYSTEM_USER
 from .db import init_db, create_tables, get_session_factory
 from .db.models import EntityRow, Repository
-from .engine import execute_activity, ActivityContext, HandlerResult, Caller
+from .engine import (
+    ActivityContext,
+    Caller,
+    compute_eligible_activities,
+    derive_status,
+    execute_activity,
+)
 
 logger = logging.getLogger("dossier.worker")
 
 
-async def find_due_tasks(session) -> list[tuple[EntityRow, str]]:
-    """Find all scheduled task entities that are due.
-    
-    Returns list of (task_entity, dossier_id) tuples.
-    Only returns the latest version of each logical task entity.
+def _parse_scheduled_for(value: str | None) -> datetime | None:
+    """Parse a `scheduled_for` value into an aware datetime.
+
+    The engine writes `scheduled_for` as an ISO 8601 string. Depending
+    on who produced it, the string can look like `2026-05-01T00:00:00Z`
+    (Python-ish with trailing Z), `2026-05-01T00:00:00+00:00` (also
+    Python-ish, datetime.isoformat with UTC tz), or `2026-05-01T00:00:00`
+    (naive, which we treat as UTC). Comparing these as strings is
+    wrong — `"Z" > "+"` lexically, so a "+00:00"-formatted now can
+    compare greater than a "Z"-formatted scheduled_for even when
+    they're the same instant.
+
+    Returns None for None or for strings that don't parse.
     """
-    now = datetime.now(timezone.utc).isoformat()
-    result = await session.execute(
-        select(EntityRow)
+    if not value:
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+async def _build_scheduled_task_query(for_update: bool = False):
+    """Shared SQLAlchemy query builder for due-task selection.
+
+    Filters at the SQL layer to: `type = 'system:task'`, latest version
+    per logical entity_id (via a `MAX(created_at)` subquery), and
+    `status = 'scheduled'` (via JSONB field extraction that translates
+    to `content ->> 'status' = 'scheduled'` on Postgres).
+
+    The `scheduled_for` and `next_attempt_at` fields live in JSONB but
+    are compared in Python after hydration because ISO 8601 lexical
+    comparison is incorrect (`"Z"` > `"+"` is wrong but string-true).
+    `_parse_scheduled_for` handles the parsing.
+
+    When `for_update=True`, adds `FOR UPDATE OF entities SKIP LOCKED`
+    so the worker's poll transaction locks the candidate rows and
+    concurrent workers skip over them. The `OF entities` clause is
+    required because Postgres rejects `FOR UPDATE` on a query whose
+    set includes an aggregated subquery — `OF` tells Postgres to lock
+    only the outer `entities` table, leaving the subquery's aggregate
+    rows alone.
+    """
+    latest_per_entity = (
+        select(
+            EntityRow.entity_id.label("eid"),
+            func.max(EntityRow.created_at).label("latest_at"),
+        )
         .where(EntityRow.type == "system:task")
-        .order_by(EntityRow.created_at)
+        .group_by(EntityRow.entity_id)
+        .subquery()
     )
-    all_tasks = list(result.scalars().all())
+    stmt = (
+        select(EntityRow)
+        .join(
+            latest_per_entity,
+            (EntityRow.entity_id == latest_per_entity.c.eid)
+            & (EntityRow.created_at == latest_per_entity.c.latest_at),
+        )
+        .where(EntityRow.type == "system:task")
+        .where(EntityRow.content["status"].as_string() == "scheduled")
+    )
+    if for_update:
+        stmt = stmt.with_for_update(skip_locked=True, of=EntityRow)
+    return stmt
 
-    # Group by logical entity, keep latest version
-    latest_by_entity: dict[UUID, EntityRow] = {}
-    for task in all_tasks:
-        existing = latest_by_entity.get(task.entity_id)
-        if not existing or (task.created_at and existing.created_at and task.created_at > existing.created_at):
-            latest_by_entity[task.entity_id] = task
 
-    due = []
-    for task in latest_by_entity.values():
-        if not task.content:
-            continue
-        if task.content.get("status") != "scheduled":
-            continue
-        scheduled_for = task.content.get("scheduled_for")
-        if scheduled_for and scheduled_for > now:
-            continue  # not yet due
-        due.append(task)
+def _is_task_due(task: EntityRow, now: datetime) -> tuple[bool, datetime]:
+    """Return (is_due, sort_key) for a task row.
 
-    return due
+    A task is due when:
+    * It has no `scheduled_for` (treated as immediately due), AND
+    * It has no `next_attempt_at` (first-attempt, no retry delay), OR
+    * Both `scheduled_for <= now` and `next_attempt_at <= now` when
+      either is present.
+
+    `sort_key` is used to order the due set so the oldest overdue
+    task drains first. Priority (earliest first):
+    1. `next_attempt_at` if set (retry delay has priority — we want to
+       drain retries as soon as they're ready so they don't pile up).
+    2. `scheduled_for` if set.
+    3. `datetime.min` otherwise (unscheduled = treat as ancient).
+    """
+    if not task.content:
+        return False, datetime.min.replace(tzinfo=timezone.utc)
+    scheduled_for = _parse_scheduled_for(task.content.get("scheduled_for"))
+    next_attempt_at = _parse_scheduled_for(task.content.get("next_attempt_at"))
+
+    if scheduled_for is not None and scheduled_for > now:
+        return False, scheduled_for
+    if next_attempt_at is not None and next_attempt_at > now:
+        return False, next_attempt_at
+
+    sort_key = (
+        next_attempt_at
+        or scheduled_for
+        or datetime.min.replace(tzinfo=timezone.utc)
+    )
+    return True, sort_key
+
+
+async def find_due_tasks(session) -> list[EntityRow]:
+    """Find all scheduled task entities that are due — read-only,
+    non-locking. Used by `--once` drain mode and by observability
+    tooling that wants to inspect the backlog without interfering
+    with running workers.
+
+    Returns a list sorted by "most overdue first" — see
+    `_is_task_due` for the sort-key rule.
+    """
+    now = datetime.now(timezone.utc)
+    stmt = await _build_scheduled_task_query(for_update=False)
+    result = await session.execute(stmt)
+    candidates = list(result.scalars().all())
+
+    due: list[tuple[datetime, EntityRow]] = []
+    for task in candidates:
+        is_due, sort_key = _is_task_due(task, now)
+        if is_due:
+            due.append((sort_key, task))
+
+    due.sort(key=lambda pair: pair[0])
+    return [task for _, task in due]
+
+
+async def _claim_one_due_task(session) -> EntityRow | None:
+    """Select and lock one due task row inside the caller's
+    transaction.
+
+    Strategy: `SELECT ... FOR UPDATE OF entities SKIP LOCKED LIMIT 5`
+    to pull a small batch of candidate rows from the SQL layer, then
+    Python-filter through `_is_task_due` and return the first
+    actually-due row. Rows that don't pass the Python filter stay
+    locked until the transaction commits or rolls back, but the
+    bounded `LIMIT 5` caps the over-lock blast radius to 5 rows per
+    worker per cycle. Acceptable for a system with many more due
+    tasks than concurrent workers.
+
+    Returns None if the query returned nothing or if no candidate
+    passes the `scheduled_for` / `next_attempt_at` time filters.
+    `None` signals the poll loop "nothing claimable this cycle" — it
+    may mean the backlog is empty or it may mean everything that
+    was SKIP-LOCKED skippable was genuinely locked; either way the
+    loop moves on to the next poll interval.
+    """
+    now = datetime.now(timezone.utc)
+    stmt = (await _build_scheduled_task_query(for_update=True)).limit(5)
+    result = await session.execute(stmt)
+    candidates = list(result.scalars().all())
+
+    for task in candidates:
+        is_due, _ = _is_task_due(task, now)
+        if is_due:
+            return task
+    return None
+
+
+def _compute_next_attempt_at(
+    attempt_count: int,
+    base_delay_seconds: int,
+    now: datetime,
+) -> datetime:
+    """Compute the next retry time for a task that just failed its
+    `attempt_count`'th attempt.
+
+    Uses exponential backoff with ±10% jitter:
+        delay = base * 2**(attempt_count - 1) * (1 + random(-0.1, 0.1))
+
+    `attempt_count` is the count AFTER the failure — so a task that
+    just failed its first attempt passes `attempt_count=1` and gets
+    a delay of ~base, a second failure (attempt_count=2) gets ~2×base,
+    a third gets ~4×base, and so on. The jitter prevents the thundering
+    herd effect where many tasks that failed at the same time all
+    retry at the same moment.
+    """
+    exponent = max(0, attempt_count - 1)
+    base_delay = base_delay_seconds * (2 ** exponent)
+    jitter = random.uniform(-0.1, 0.1)
+    delay = base_delay * (1 + jitter)
+    return now + timedelta(seconds=delay)
+
+
+async def _record_failure(
+    repo: Repository,
+    plugin,
+    dossier_id: UUID,
+    task: EntityRow,
+    error: Exception,
+) -> None:
+    """Record a task execution failure by writing a new task version
+    through the engine's `systemAction` pathway.
+
+    Increments `attempt_count`. If the new count has reached the
+    task's `max_attempts` budget, the new task version is written
+    with `status = "dead_letter"` — the task is terminal and won't
+    be picked up by the poll loop again. Otherwise, the new version
+    stays in `status = "scheduled"` but gains a `next_attempt_at`
+    field set by `_compute_next_attempt_at`, so the poll loop skips
+    it until the retry delay elapses.
+
+    Either way, `last_error` and `last_attempt_at` are recorded for
+    observability, and the write goes through `complete_task` (which
+    itself goes through `execute_activity` — see sub-step 5), so the
+    failure write path inherits all the engine's invariants.
+    """
+    now = datetime.now(timezone.utc)
+    current_count = task.content.get("attempt_count")
+    attempt_count = (current_count if current_count is not None else 0) + 1
+    max_attempts_val = task.content.get("max_attempts")
+    max_attempts = max_attempts_val if max_attempts_val is not None else 3
+    base_delay_val = task.content.get("base_delay_seconds")
+    base_delay = base_delay_val if base_delay_val is not None else 60
+    error_text = f"{type(error).__name__}: {error}"
+
+    extra_content = {
+        "attempt_count": attempt_count,
+        "last_error": error_text,
+        "last_attempt_at": now.isoformat(),
+    }
+
+    if attempt_count >= max_attempts:
+        logger.error(
+            f"Task {task.id}: attempt {attempt_count}/{max_attempts} failed, "
+            f"moving to dead_letter: {error_text}"
+        )
+        await complete_task(
+            repo, plugin, dossier_id, task,
+            status="dead_letter",
+            error=error_text,
+            extra_content=extra_content,
+        )
+    else:
+        next_attempt_at = _compute_next_attempt_at(
+            attempt_count, base_delay, now,
+        )
+        extra_content["next_attempt_at"] = next_attempt_at.isoformat()
+        logger.warning(
+            f"Task {task.id}: attempt {attempt_count}/{max_attempts} failed, "
+            f"retry at {next_attempt_at.isoformat()}: {error_text}"
+        )
+        await complete_task(
+            repo, plugin, dossier_id, task,
+            status="scheduled",  # back to scheduled for retry
+            error=error_text,
+            extra_content=extra_content,
+        )
 
 
 async def check_cancelled(repo: Repository, task: EntityRow) -> bool:
-    """Check if any cancel_if_activities have occurred after this task was created."""
-    cancel_list = task.content.get("cancel_if_activities", [])
-    if not cancel_list:
-        return False
+    """Return True if any `cancel_if_activities` activity has landed
+    after this task was scheduled.
 
-    activities = await repo.get_activities_for_dossier(task.dossier_id)
-    for act in activities:
-        if act.type in cancel_list:
-            if act.created_at and task.created_at and act.created_at > task.created_at:
-                return True
-    return False
+    The task's own `cancel_if_activities` list enumerates activity
+    types that, if they occur after the task is scheduled, should
+    cancel the task instead of executing it. This is how the workflow
+    says "if the user changes their mind before the scheduled action
+    fires, don't do the scheduled action." The comparison uses
+    `task.created_at` as the "scheduled at" time because task entities
+    are immutable once created (subsequent versions overwrite the
+    status and that's all), so the first version's `created_at` is
+    when the task entered the queue.
+    """
+    cancel_list = task.content.get("cancel_if_activities", [])
+    if not cancel_list or not task.created_at:
+        return False
+    return await repo.has_cancelling_activity_after(
+        task.dossier_id, cancel_list, task.created_at,
+    )
 
 
 async def complete_task(
@@ -89,290 +326,524 @@ async def complete_task(
     result_uri: str | None = None,
     error: str | None = None,
     informed_by: str | None = None,
+    extra_content: dict | None = None,
 ):
-    """Create a systemAction activity that generates a new version of the task entity + a note."""
+    """Record task completion by running a `systemAction` activity
+    through the engine's full pipeline.
+
+    Previously this function hand-wrote the activity row, association,
+    task entity revision, and note entity directly via `Repository`
+    calls, and then manually recomputed `cached_status` and
+    `eligible_activities` on the dossier row. That was a second write
+    path in parallel with the engine, which meant the post-activity
+    hook didn't fire, the schema-versioning and disjoint-invariant
+    checks were skipped, and any new engine invariant that gets added
+    in the future would silently not apply to task completions.
+
+    Now every write goes through `execute_activity` with the built-in
+    `SYSTEM_ACTION_DEF`. The engine's pipeline runs normally: the task
+    revision is validated against the TaskEntity Pydantic model, the
+    note is validated against SystemNote, derivation chains are
+    checked, the post-activity hook runs, and the finalization phase
+    updates the cached status and eligible activities automatically.
+    The worker no longer has a special-case write path — it's just
+    another `execute_activity` caller.
+
+    `extra_content` is a dict of additional fields to merge into the
+    new task version's content. The retry policy uses this to carry
+    `attempt_count`, `next_attempt_at`, `last_error`, and
+    `last_attempt_at` through the completion path.
+    """
+    # Build the new task content with the status transition (and
+    # optional result / error fields). This is just a Python dict
+    # mutation on a copy of the existing content; the engine will
+    # validate the dict against TaskEntity when resolve_generated
+    # runs.
     new_content = dict(task.content)
     new_content["status"] = status
     if result_uri:
         new_content["result"] = result_uri
     if error:
         new_content["error"] = error
+    if extra_content:
+        new_content.update(extra_content)
 
-    activity_id = uuid4()
-    now = datetime.now(timezone.utc)
+    # Generate a fresh version UUID for the new task entity version.
+    # The logical entity_id stays the same — we're creating a
+    # revision, not a new logical task.
+    new_task_version_id = uuid4()
+    prev_task_ref = f"system:task/{task.entity_id}@{task.id}"
+    new_task_ref = f"system:task/{task.entity_id}@{new_task_version_id}"
 
-    await repo.ensure_agent("system", "systeem", "Systeem", {})
-
-    activity_row = await repo.create_activity(
-        activity_id=activity_id,
-        dossier_id=dossier_id,
-        type="systemAction",
-        started_at=now,
-        ended_at=now,
-        informed_by=informed_by,
-    )
-
-    await repo.create_association(
-        association_id=uuid4(),
-        activity_id=activity_id,
-        agent_id="system",
-        agent_name="Systeem",
-        agent_type="systeem",
-        role="systeem",
-    )
-
-    # Create new version of task entity
-    await repo.create_entity(
-        version_id=uuid4(),
-        entity_id=task.entity_id,
-        dossier_id=dossier_id,
-        type="system:task",
-        generated_by=activity_id,
-        content=new_content,
-        derived_from=task.id,
-        attributed_to="system",
-    )
-
-    # Create a note explaining the action
+    # Build the explanatory note. It's a new logical entity, not a
+    # revision of anything, so both the entity_id and version_id are
+    # fresh UUIDs and there's no derivedFrom link.
     fn_name = task.content.get("function", "") if task.content else ""
     note_text = f"Task {status}: {fn_name}" if fn_name else f"Task {status}"
-    await repo.create_entity(
-        version_id=uuid4(),
-        entity_id=uuid4(),
+    new_note_entity_id = uuid4()
+    new_note_version_id = uuid4()
+    note_ref = f"system:note/{new_note_entity_id}@{new_note_version_id}"
+
+    systemaction_def = plugin.find_activity_def("systemAction")
+    if not systemaction_def:
+        raise RuntimeError(
+            "systemAction activity definition not found in plugin — "
+            "the engine should have registered it at startup"
+        )
+
+    await execute_activity(
+        plugin=plugin,
+        activity_def=systemaction_def,
+        repo=repo,
         dossier_id=dossier_id,
-        type="system:note",
-        generated_by=activity_id,
-        content={"text": note_text},
-        attributed_to="system",
+        activity_id=uuid4(),
+        user=SYSTEM_USER,
+        role="systeem",
+        used_items=[],
+        generated_items=[
+            {
+                "entity": new_task_ref,
+                "content": new_content,
+                "derivedFrom": prev_task_ref,
+            },
+            {
+                "entity": note_ref,
+                "content": {"text": note_text},
+            },
+        ],
+        informed_by=informed_by,
+        caller=Caller.SYSTEM,
     )
-
-    # Update cached status and eligible activities on dossier row
-    from .engine import derive_status, compute_eligible_activities
-    import json as _json
-    current_status = await derive_status(repo, dossier_id)
-    eligible = await compute_eligible_activities(plugin, repo, dossier_id)
-    dossier = await repo.get_dossier(dossier_id)
-    if dossier:
-        dossier.cached_status = current_status
-        dossier.eligible_activities = _json.dumps(eligible)
-
-    return activity_id
 
 
 async def process_task(task: EntityRow, registry, config):
-    """Process a single due task within one transaction."""
+    """Legacy entry point — opens its own session and calls the
+    session-aware inner function. Kept for callers and tests that
+    want to process a task without owning the transaction themselves.
+    The production worker loop uses `_execute_claimed_task` directly
+    so the claim-lock-execute dance all happens in one transaction.
+    """
     session_factory = get_session_factory()
-    dossier_id = task.dossier_id
-    task_content = task.content
-    kind = task_content.get("kind")
-
-    # Find the plugin for this dossier
     async with session_factory() as session:
         async with session.begin():
-            repo = Repository(session)
+            await _execute_claimed_task(session, task, registry)
 
-            dossier = await repo.get_dossier(dossier_id)
-            if not dossier:
-                logger.error(f"Task {task.id}: dossier {dossier_id} not found")
-                return
 
-            plugin = registry.get(dossier.workflow)
-            if not plugin:
-                logger.error(f"Task {task.id}: plugin not found for workflow {dossier.workflow}")
-                return
+async def _execute_claimed_task(session, task: EntityRow, registry) -> None:
+    """Execute a task within an already-open transaction.
 
-            # Re-fetch the task to get latest version within this transaction
-            latest_tasks = await repo.get_entities_by_type(dossier_id, "system:task")
-            current_task = None
-            for t in latest_tasks:
-                if t.entity_id == task.entity_id:
-                    current_task = t
-            if not current_task or not current_task.content:
-                logger.warning(f"Task {task.id}: not found in re-fetch")
-                return
-            if current_task.content.get("status") != "scheduled":
-                logger.info(f"Task {task.id}: already {current_task.content.get('status')}, skipping")
-                return
+    The caller is responsible for the `async with session.begin()`
+    block. This lets the worker loop hold the row-level lock acquired
+    by `_claim_one_due_task` through the entire execution — if the
+    caller opened a new transaction per task, the lock would be
+    released between claim and execute and two workers could race.
 
-            logger.info(f"Task {task.id}: processing kind={kind} function={task_content.get('function')}")
+    Responsibilities inside this function:
+    * Resolve the dossier and plugin.
+    * Re-fetch the task for latest version (guards against the tiny
+      window where another worker updated the same task entity
+      between the claim and our first read of its content inside
+      this transaction — `SKIP LOCKED` alone doesn't protect against
+      content changes that committed in a transaction that finished
+      just before ours started).
+    * Check cancellation via `check_cancelled` and short-circuit to
+      a `cancelled` complete_task if so.
+    * Dispatch on `kind` to the appropriate `_process_*` handler.
 
-            # Check if cancelled by a recent activity
-            if await check_cancelled(repo, current_task):
-                logger.info(f"Task {task.id}: cancelled by activity")
-                await complete_task(repo, plugin, dossier_id, current_task, status="cancelled")
-                return
+    Raises on execution failure. The caller's error handler in the
+    worker loop catches the exception and routes it through
+    `_record_failure`, which decides retry-vs-dead-letter and writes
+    the new task version via `complete_task → execute_activity`.
+    """
+    repo = Repository(session)
+    dossier_id = task.dossier_id
 
-            try:
-                if kind == "recorded":
-                    # Type 2: call function, store result
-                    fn_name = task_content.get("function")
-                    fn = plugin.task_handlers.get(fn_name) if fn_name else None
-                    if fn:
-                        # Resolve all latest entities for context
-                        all_latest = await repo.get_all_latest_entities(dossier_id)
-                        resolved = {e.type: e for e in all_latest}
-                        ctx = ActivityContext(repo, dossier_id, resolved, plugin.entity_models, plugin=plugin)
-                        await fn(ctx)
-                    else:
-                        logger.warning(f"Task {task.id}: function '{fn_name}' not found")
-                    await complete_task(repo, plugin, dossier_id, current_task, status="completed")
-                    logger.info(f"Task {task.id}: recorded task '{fn_name}' completed")
+    dossier = await repo.get_dossier(dossier_id)
+    if not dossier:
+        logger.error(f"Task {task.id}: dossier {dossier_id} not found")
+        return
 
-                elif kind == "scheduled_activity":
-                    # Type 3: execute activity in same dossier, then completeTask
-                    target_activity_type = task_content.get("target_activity")
-                    result_activity_id = UUID(task_content["result_activity_id"])
+    plugin = registry.get(dossier.workflow)
+    if not plugin:
+        logger.error(
+            f"Task {task.id}: plugin not found for "
+            f"workflow {dossier.workflow}"
+        )
+        return
 
-                    act_def = plugin.find_activity_def(target_activity_type)
-                    if not act_def:
-                        raise ValueError(f"Activity definition not found: {target_activity_type}")
+    current_task = await _refetch_task(repo, dossier_id, task.entity_id)
+    if current_task is None:
+        logger.warning(f"Task {task.id}: not found in re-fetch")
+        return
+    if current_task.content.get("status") != "scheduled":
+        logger.info(
+            f"Task {task.id}: already "
+            f"{current_task.content.get('status')}, skipping"
+        )
+        return
 
-                    # Extract anchor from task content so the engine's
-                    # auto-resolve can fall back to it when the informing
-                    # activity's scope doesn't cover all needed types.
-                    task_anchor_id_str = task_content.get("anchor_entity_id")
-                    task_anchor_type = task_content.get("anchor_type")
-                    task_anchor_id = UUID(task_anchor_id_str) if task_anchor_id_str else None
+    kind = current_task.content.get("kind")
+    logger.info(
+        f"Task {task.id}: processing kind={kind} "
+        f"function={current_task.content.get('function')}"
+    )
 
-                    await execute_activity(
-                        plugin=plugin,
-                        activity_def=act_def,
-                        repo=repo,
-                        dossier_id=dossier_id,
-                        activity_id=result_activity_id,
-                        user=SYSTEM_USER,
-                        role="systeem",
-                        used_items=[],
-                        generated_items=[],
-                        informed_by=str(current_task.generated_by) if current_task.generated_by else None,
-                        caller=Caller.SYSTEM,
-                        anchor_entity_id=task_anchor_id,
-                        anchor_type=task_anchor_type,
-                    )
-                    await repo.session.flush()
+    if await check_cancelled(repo, current_task):
+        logger.info(f"Task {task.id}: cancelled by activity")
+        await complete_task(
+            repo, plugin, dossier_id, current_task, status="cancelled",
+        )
+        return
 
-                    await complete_task(
-                        repo, plugin, dossier_id, current_task,
-                        status="completed",
-                        informed_by=str(result_activity_id),
-                    )
-                    logger.info(f"Task {task.id}: scheduled activity {target_activity_type} executed")
+    if kind == "recorded":
+        await _process_recorded(repo, plugin, dossier_id, current_task)
+    elif kind == "scheduled_activity":
+        await _process_scheduled_activity(
+            repo, plugin, dossier_id, current_task,
+        )
+    elif kind == "cross_dossier_activity":
+        await _process_cross_dossier(
+            repo, plugin, registry, dossier_id, current_task,
+        )
+    else:
+        logger.warning(f"Task {task.id}: unknown kind '{kind}'")
 
-                elif kind == "cross_dossier_activity":
-                    # Type 4: call function for target, execute in target dossier, completeTask in source
-                    fn_name = task_content.get("function")
-                    fn = plugin.task_handlers.get(fn_name) if fn_name else None
-                    if not fn:
-                        raise ValueError(f"Task function not found: {fn_name}")
 
-                    ctx = ActivityContext(repo, dossier_id, {}, plugin.entity_models, plugin=plugin)
-                    task_result = await fn(ctx)
+async def _refetch_task(
+    repo: Repository,
+    dossier_id: UUID,
+    task_entity_id: UUID,
+) -> EntityRow | None:
+    """Pull the latest version of one logical task entity inside the
+    current transaction. Returns None if the task doesn't exist or
+    has no content."""
+    latest_tasks = await repo.get_entities_by_type(dossier_id, "system:task")
+    for t in latest_tasks:
+        if t.entity_id == task_entity_id and t.content:
+            return t
+    return None
 
-                    # task_result should have target_dossier_id and optionally content
-                    target_dossier_id = UUID(task_result.target_dossier_id)
-                    target_activity_type = task_content.get("target_activity")
-                    result_activity_id = UUID(task_content["result_activity_id"])
 
-                    # Find target dossier's plugin
-                    target_dossier = await repo.get_dossier(target_dossier_id)
-                    target_plugin = registry.get(target_dossier.workflow) if target_dossier else plugin
+async def _process_recorded(
+    repo: Repository,
+    plugin,
+    dossier_id: UUID,
+    task: EntityRow,
+) -> None:
+    """Type 2 — recorded task: call a plugin function and record
+    completion. The function may do anything (side effects, external
+    calls, reading entities through the ActivityContext) but its
+    return value is ignored — completion is recorded as a status
+    transition on the task entity, not as a separate result row.
+    """
+    fn_name = task.content.get("function")
+    fn = plugin.task_handlers.get(fn_name) if fn_name else None
+    if fn:
+        all_latest = await repo.get_all_latest_entities(dossier_id)
+        resolved = {e.type: e for e in all_latest}
+        ctx = ActivityContext(
+            repo, dossier_id, resolved, plugin.entity_models, plugin=plugin,
+        )
+        await fn(ctx)
+    else:
+        logger.warning(f"Task {task.id}: function '{fn_name}' not found")
 
-                    target_act_def = target_plugin.find_activity_def(target_activity_type)
-                    if not target_act_def:
-                        raise ValueError(f"Target activity not found: {target_activity_type}")
+    await complete_task(repo, plugin, dossier_id, task, status="completed")
+    logger.info(f"Task {task.id}: recorded task '{fn_name}' completed")
 
-                    # Build used block with reference to source dossier
-                    source_uri = f"urn:dossier:{dossier_id}"
-                    informed_by_uri = f"urn:dossier:{dossier_id}/activity/{current_task.generated_by}" if current_task.generated_by else None
 
-                    # Build generated items from task_result if provided
-                    generated_items = []
-                    if hasattr(task_result, 'content') and task_result.content:
-                        generates = target_act_def.get("generates", [])
-                        if generates:
-                            generated_items = [{
-                                "entity": f"{generates[0]}/{uuid4()}@{uuid4()}",
-                                "content": task_result.content,
-                            }]
+async def _process_scheduled_activity(
+    repo: Repository,
+    plugin,
+    dossier_id: UUID,
+    task: EntityRow,
+) -> None:
+    """Type 3 — scheduled activity: execute an activity in the same
+    dossier at the scheduled time, then record completion.
 
-                    await execute_activity(
-                        plugin=target_plugin,
-                        activity_def=target_act_def,
-                        repo=repo,
-                        dossier_id=target_dossier_id,
-                        activity_id=result_activity_id,
-                        user=SYSTEM_USER,
-                        role="systeem",
-                        used_items=[{"entity": source_uri}],
-                        generated_items=generated_items,
-                        informed_by=informed_by_uri,
-                        caller=Caller.SYSTEM,
-                    )
-                    await repo.session.flush()
+    The target activity runs with the task's anchor (if any) passed
+    through so the engine's auto-resolve can locate the anchored
+    entity even when the informing activity's scope didn't cover
+    every needed type.
+    """
+    target_activity_type = task.content.get("target_activity")
+    result_activity_id = UUID(task.content["result_activity_id"])
 
-                    # completeTask in source dossier, informed by the activity in target dossier
-                    result_uri = f"urn:dossier:{target_dossier_id}/activity/{result_activity_id}"
-                    await complete_task(
-                        repo, plugin, dossier_id, current_task,
-                        status="completed",
-                        result_uri=result_uri,
-                        informed_by=result_uri,
-                    )
-                    logger.info(f"Task {task.id}: cross-dossier activity {target_activity_type} in {target_dossier_id}")
+    act_def = plugin.find_activity_def(target_activity_type)
+    if not act_def:
+        raise ValueError(
+            f"Activity definition not found: {target_activity_type}"
+        )
 
-                else:
-                    logger.warning(f"Task {task.id}: unknown kind '{kind}'")
+    task_anchor_id_str = task.content.get("anchor_entity_id")
+    task_anchor_type = task.content.get("anchor_type")
+    task_anchor_id = UUID(task_anchor_id_str) if task_anchor_id_str else None
 
-            except Exception as e:
-                logger.error(f"Task {task.id} failed: {e}", exc_info=True)
-                raise
+    await execute_activity(
+        plugin=plugin,
+        activity_def=act_def,
+        repo=repo,
+        dossier_id=dossier_id,
+        activity_id=result_activity_id,
+        user=SYSTEM_USER,
+        role="systeem",
+        used_items=[],
+        generated_items=[],
+        informed_by=str(task.generated_by) if task.generated_by else None,
+        caller=Caller.SYSTEM,
+        anchor_entity_id=task_anchor_id,
+        anchor_type=task_anchor_type,
+    )
+    await repo.session.flush()
+
+    await complete_task(
+        repo, plugin, dossier_id, task,
+        status="completed",
+        informed_by=str(result_activity_id),
+    )
+    logger.info(
+        f"Task {task.id}: scheduled activity "
+        f"{target_activity_type} executed"
+    )
+
+
+async def _process_cross_dossier(
+    repo: Repository,
+    plugin,
+    registry,
+    dossier_id: UUID,
+    task: EntityRow,
+) -> None:
+    """Type 4 — cross-dossier activity: call a plugin function to
+    determine the target dossier, execute the target activity there,
+    then record completion in the source dossier.
+
+    PROV links the source and target via URIs: the target activity's
+    `used` block carries a `urn:dossier:{source_id}` reference, and
+    its `informed_by` points at the source activity URI. The source
+    dossier's completeTask in turn points at the target activity URI
+    so the graph closes both ways.
+    """
+    fn_name = task.content.get("function")
+    fn = plugin.task_handlers.get(fn_name) if fn_name else None
+    if not fn:
+        raise ValueError(f"Task function not found: {fn_name}")
+
+    ctx = ActivityContext(
+        repo, dossier_id, {}, plugin.entity_models, plugin=plugin,
+    )
+    task_result = await fn(ctx)
+
+    target_dossier_id = UUID(task_result.target_dossier_id)
+    target_activity_type = task.content.get("target_activity")
+    result_activity_id = UUID(task.content["result_activity_id"])
+
+    target_dossier = await repo.get_dossier(target_dossier_id)
+    target_plugin = registry.get(target_dossier.workflow) if target_dossier else plugin
+
+    target_act_def = target_plugin.find_activity_def(target_activity_type)
+    if not target_act_def:
+        raise ValueError(f"Target activity not found: {target_activity_type}")
+
+    source_uri = f"urn:dossier:{dossier_id}"
+    informed_by_uri = (
+        f"urn:dossier:{dossier_id}/activity/{task.generated_by}"
+        if task.generated_by else None
+    )
+
+    generated_items: list[dict] = []
+    if hasattr(task_result, "content") and task_result.content:
+        generates = target_act_def.get("generates", [])
+        if generates:
+            generated_items = [{
+                "entity": f"{generates[0]}/{uuid4()}@{uuid4()}",
+                "content": task_result.content,
+            }]
+
+    await execute_activity(
+        plugin=target_plugin,
+        activity_def=target_act_def,
+        repo=repo,
+        dossier_id=target_dossier_id,
+        activity_id=result_activity_id,
+        user=SYSTEM_USER,
+        role="systeem",
+        used_items=[{"entity": source_uri}],
+        generated_items=generated_items,
+        informed_by=informed_by_uri,
+        caller=Caller.SYSTEM,
+    )
+    await repo.session.flush()
+
+    result_uri = f"urn:dossier:{target_dossier_id}/activity/{result_activity_id}"
+    await complete_task(
+        repo, plugin, dossier_id, task,
+        status="completed",
+        result_uri=result_uri,
+        informed_by=result_uri,
+    )
+    logger.info(
+        f"Task {task.id}: cross-dossier activity "
+        f"{target_activity_type} in {target_dossier_id}"
+    )
 
 
 async def worker_loop(config_path: str = "config.yaml", poll_interval: int = 10, once: bool = False):
-    """Main worker loop."""
+    """Main worker loop.
+
+    Two nested loops:
+
+    * **Outer loop** — controls the poll cadence. Sleeps `poll_interval`
+      seconds between drain passes, or until SIGTERM arrives. Exits
+      on SIGTERM or after a single pass in `--once` mode.
+
+    * **Inner drain loop** — repeatedly claims one task at a time
+      via `_claim_one_due_task`, executes it inside the same
+      transaction that holds the row lock, and commits. Breaks when
+      `_claim_one_due_task` returns None (nothing claimable this
+      cycle — either backlog drained or everything remaining is
+      locked by other workers).
+
+    The claim-lock-execute pattern gives us concurrency safety for
+    multi-worker deployments: `SELECT ... FOR UPDATE OF entities
+    SKIP LOCKED` means worker A's locked row is invisible to worker
+    B's next claim attempt. When A commits (success) or rolls back
+    (failure), the lock releases and B's subsequent claim either sees
+    the new `completed` / `dead_letter` status (and skips the row)
+    or sees `scheduled` with updated `next_attempt_at` (and respects
+    the retry delay). No two workers ever execute the same task
+    version concurrently.
+
+    Signal handling: SIGTERM and SIGINT set an `asyncio.Event`. The
+    outer loop's interruptible sleep (`asyncio.wait_for` on the
+    event) returns immediately when the signal arrives. The inner
+    drain loop also checks the event at the top of each iteration,
+    so a SIGTERM mid-drain finishes the in-flight task cleanly (its
+    transaction runs to completion) and then exits without starting
+    the next one. We never interrupt a task mid-transaction —
+    doing so would leak locks and potentially leave the dossier
+    state in a half-written form.
+
+    Failure handling: if `_execute_claimed_task` raises, the error
+    is routed through `_record_failure` in a *fresh* transaction.
+    The original transaction is rolled back (so the locked row's
+    content state isn't touched), and the fresh transaction writes
+    a new task version with the retry decision (retry with backoff,
+    or dead_letter). The new task version goes through
+    `complete_task → execute_activity` so it gets validated and the
+    post-activity hook fires.
+    """
     config, registry = load_config_and_registry(config_path)
 
-    db_url = config.get("database", {}).get("url", "sqlite+aiosqlite:///./dossiers.db")
+    db_url = config.get("database", {}).get("url")
+    if not db_url:
+        raise RuntimeError(
+            "database.url is required in config (Postgres connection string)"
+        )
     await init_db(db_url)
     await create_tables()
 
+    shutdown = asyncio.Event()
+
+    def _on_signal(signum, _frame):
+        logger.info(f"Worker received signal {signum}, shutting down gracefully")
+        shutdown.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _on_signal)
+
     logger.info(f"Worker started. Poll interval: {poll_interval}s. Once: {once}")
 
-    while True:
-        session_factory = get_session_factory()
+    session_factory = get_session_factory()
 
-        # Find due tasks (read-only scan)
-        async with session_factory() as session:
-            due_tasks = await find_due_tasks(session)
+    while not shutdown.is_set():
+        # Inner drain loop — keep claiming and executing one task at
+        # a time until _claim_one_due_task returns None (nothing
+        # claimable this cycle). Each iteration is its own session
+        # and its own transaction; the lock held by the SELECT FOR
+        # UPDATE persists for the lifetime of that transaction and
+        # is released on commit or rollback.
+        processed_this_cycle = 0
+        while not shutdown.is_set():
+            task_for_failure_path: EntityRow | None = None
+            failure: Exception | None = None
 
-        if due_tasks:
-            logger.info(f"Found {len(due_tasks)} due tasks")
+            async with session_factory() as session:
+                async with session.begin():
+                    task = await _claim_one_due_task(session)
+                    if task is None:
+                        break  # nothing claimable — leave the drain loop
 
-        for task in due_tasks:
-            try:
-                await process_task(task, registry, config)
-            except Exception as e:
-                logger.error(f"Task {task.id} processing failed: {e}")
-                # Mark as failed in a clean transaction
+                    try:
+                        await _execute_claimed_task(session, task, registry)
+                        processed_this_cycle += 1
+                    except Exception as e:
+                        # Capture the exception so we can handle it in a
+                        # fresh transaction below. The `async with
+                        # session.begin()` will roll back this transaction
+                        # on the way out because we're re-raising — no,
+                        # wait, we don't want to re-raise, we want the
+                        # transaction to roll back cleanly and then handle
+                        # failure separately. Do that by catching here
+                        # and remembering the task + exception, then
+                        # exiting the inner `begin()` block by falling
+                        # through to the end of the `with`. That commits
+                        # the (empty) transaction, which is fine because
+                        # _claim_one_due_task only did a SELECT.
+                        logger.error(
+                            f"Task {task.id} execution failed: {e}",
+                            exc_info=True,
+                        )
+                        task_for_failure_path = task
+                        failure = e
+
+            # If execution failed, record the failure in a fresh
+            # transaction. The original session/transaction from the
+            # claim is already closed — its SELECT-only work committed
+            # cleanly — and the failure write path needs its own
+            # transaction to land the new task version through
+            # execute_activity.
+            if task_for_failure_path is not None and failure is not None:
                 try:
-                    async with session_factory() as session:
-                        async with session.begin():
-                            repo = Repository(session)
-                            dossier = await repo.get_dossier(task.dossier_id)
-                            plugin = registry.get(dossier.workflow) if dossier else None
-                            if plugin:
-                                await complete_task(
-                                    repo, plugin, task.dossier_id, task,
-                                    status="failed",
-                                    error=str(e),
+                    async with session_factory() as fail_session:
+                        async with fail_session.begin():
+                            fail_repo = Repository(fail_session)
+                            fail_dossier = await fail_repo.get_dossier(
+                                task_for_failure_path.dossier_id,
+                            )
+                            fail_plugin = (
+                                registry.get(fail_dossier.workflow)
+                                if fail_dossier else None
+                            )
+                            if fail_plugin:
+                                await _record_failure(
+                                    fail_repo,
+                                    fail_plugin,
+                                    task_for_failure_path.dossier_id,
+                                    task_for_failure_path,
+                                    failure,
                                 )
                 except Exception as e2:
-                    logger.error(f"Failed to mark task {task.id} as failed: {e2}")
+                    logger.error(
+                        f"Task {task_for_failure_path.id}: failed to record "
+                        f"failure (will be retried by next poll): {e2}",
+                        exc_info=True,
+                    )
+                processed_this_cycle += 1  # count as drained to avoid spinning
+
+        if processed_this_cycle:
+            logger.info(f"Drain cycle: processed {processed_this_cycle} tasks")
 
         if once:
             break
 
-        await asyncio.sleep(poll_interval)
+        # Interruptible sleep between poll cycles.
+        try:
+            await asyncio.wait_for(shutdown.wait(), timeout=poll_interval)
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Worker stopped")
 
 
 def main():
@@ -382,19 +853,51 @@ def main():
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
-    once = "--once" in sys.argv
-    config_path = "config.yaml"
+    parser = argparse.ArgumentParser(
+        prog="python -m dossier_engine.worker",
+        description=(
+            "Dossier task worker. Polls for due system:task entities and "
+            "executes them (recorded functions, scheduled activities, "
+            "cross-dossier activities). Runs against the same database as "
+            "the dossier API."
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Path to the deployment's config.yaml. If omitted, resolves "
+            "the path via the installed dossier_app package."
+        ),
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=10,
+        help="Poll interval in seconds between scans for due tasks (default: 10).",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Drain all currently-due tasks and exit instead of polling forever.",
+    )
+    args = parser.parse_args()
 
-    for i, arg in enumerate(sys.argv[1:], 1):
-        if arg == "--config" and i + 1 < len(sys.argv):
-            config_path = sys.argv[i + 1]
+    # Default config path via installed dossier_app package, same
+    # pattern file_service uses. Lets the worker launch from any cwd.
+    config_path = args.config
+    if config_path is None:
+        try:
+            import dossier_app
+            config_path = str(Path(dossier_app.__file__).parent / "config.yaml")
+        except ImportError:
+            config_path = "config.yaml"
 
-    poll_interval = 10
-    for i, arg in enumerate(sys.argv[1:], 1):
-        if arg == "--interval" and i + 1 < len(sys.argv):
-            poll_interval = int(sys.argv[i + 1])
-
-    asyncio.run(worker_loop(config_path=config_path, poll_interval=poll_interval, once=once))
+    asyncio.run(worker_loop(
+        config_path=config_path,
+        poll_interval=args.interval,
+        once=args.once,
+    ))
 
 
 if __name__ == "__main__":

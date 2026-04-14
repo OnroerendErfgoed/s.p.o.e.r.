@@ -34,22 +34,16 @@ SYSTEM_USER = User(
 def load_config_and_registry(config_path: str = "config.yaml") -> tuple[dict, PluginRegistry]:
     """Load config and build plugin registry. Shared by app and worker.
 
-    Relative filesystem paths inside the config (database sqlite file,
-    file service storage root) are resolved against the config file's
-    parent directory, not the process cwd. This lets the same config
-    work regardless of where uvicorn is launched from.
+    The `file_service.storage_root` path is resolved against the
+    config file's parent directory (not process cwd), so the same
+    config works regardless of where uvicorn is launched from. The
+    `database.url` is taken verbatim — Postgres URLs are
+    location-independent.
     """
     config_path_obj = Path(config_path).resolve()
     config_dir = config_path_obj.parent
     with open(config_path_obj) as f:
         config = yaml.safe_load(f)
-
-    # Resolve relative paths in the config against config_dir.
-    db_url = config.get("database", {}).get("url", "")
-    if db_url.startswith("sqlite+aiosqlite:///./") or db_url.startswith("sqlite:///./"):
-        scheme, rel = db_url.split(":///./", 1)
-        abs_path = (config_dir / rel).resolve()
-        config.setdefault("database", {})["url"] = f"{scheme}:///{abs_path}"
 
     storage_root = config.get("file_service", {}).get("storage_root", "")
     if storage_root.startswith("./"):
@@ -116,7 +110,11 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
 
     @app.on_event("startup")
     async def startup():
-        db_url = config.get("database", {}).get("url", "sqlite+aiosqlite:///./dossiers.db")
+        db_url = config.get("database", {}).get("url")
+        if not db_url:
+            raise RuntimeError(
+                "database.url is required in config (Postgres connection string)"
+            )
         await init_db(db_url)
         await create_tables()
 

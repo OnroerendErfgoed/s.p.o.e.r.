@@ -1,7 +1,5 @@
 database:
-  url: "sqlite+aiosqlite:///./dossiers.db"
-  # For PostgreSQL:
-  # url: "postgresql+asyncpg://user:pass@localhost:5432/dossiers"
+  url: "postgresql+asyncpg://dossier:dossier@127.0.0.1:5432/dossiers"
 
 plugins:
   - dossier_toelatingen
