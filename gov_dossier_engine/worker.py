@@ -212,7 +212,7 @@ async def process_task(task: EntityRow, registry, config):
                         # Resolve all latest entities for context
                         all_latest = await repo.get_all_latest_entities(dossier_id)
                         resolved = {e.type: e for e in all_latest}
-                        ctx = ActivityContext(repo, dossier_id, resolved, plugin.entity_models)
+                        ctx = ActivityContext(repo, dossier_id, resolved, plugin.entity_models, plugin=plugin)
                         await fn(ctx)
                     else:
                         logger.warning(f"Task {task.id}: function '{fn_name}' not found")
@@ -228,6 +228,13 @@ async def process_task(task: EntityRow, registry, config):
                     if not act_def:
                         raise ValueError(f"Activity definition not found: {target_activity_type}")
 
+                    # Extract anchor from task content so the engine's
+                    # auto-resolve can fall back to it when the informing
+                    # activity's scope doesn't cover all needed types.
+                    task_anchor_id_str = task_content.get("anchor_entity_id")
+                    task_anchor_type = task_content.get("anchor_type")
+                    task_anchor_id = UUID(task_anchor_id_str) if task_anchor_id_str else None
+
                     await execute_activity(
                         plugin=plugin,
                         activity_def=act_def,
@@ -239,6 +246,9 @@ async def process_task(task: EntityRow, registry, config):
                         used_items=[],
                         generated_items=[],
                         informed_by=str(current_task.generated_by) if current_task.generated_by else None,
+                        caller="system",
+                        anchor_entity_id=task_anchor_id,
+                        anchor_type=task_anchor_type,
                     )
                     await repo.session.flush()
 
@@ -256,7 +266,7 @@ async def process_task(task: EntityRow, registry, config):
                     if not fn:
                         raise ValueError(f"Task function not found: {fn_name}")
 
-                    ctx = ActivityContext(repo, dossier_id, {}, plugin.entity_models)
+                    ctx = ActivityContext(repo, dossier_id, {}, plugin.entity_models, plugin=plugin)
                     task_result = await fn(ctx)
 
                     # task_result should have target_dossier_id and optionally content
@@ -297,7 +307,7 @@ async def process_task(task: EntityRow, registry, config):
                         used_items=[{"entity": source_uri}],
                         generated_items=generated_items,
                         informed_by=informed_by_uri,
-                    )
+                    caller="system",)
                     await repo.session.flush()
 
                     # completeTask in source dossier, informed by the activity in target dossier
