@@ -111,6 +111,13 @@ authorization:
   create_dossier:
     access: "authenticated"
 
+# Built-in tombstone activity authorization. The engine registers a
+# `tombstone` activity for every workflow at boot; this block declares
+# which user roles can call it. Absent or empty = no one can tombstone
+# in this workflow (deny by default).
+tombstone:
+  allowed_roles: ["beheerder"]
+
 # Workflow-wide PROV-extension relations. Any activity in this workflow may
 # emit these on its request body unless it overrides the list with its own
 # `relations:` block. Each entry declares a relation type and the plugin
@@ -202,6 +209,9 @@ activities:
       - activity: "duidVerantwoordelijkeOrganisatieAan"
       - activity: "setSystemFields"
 
+    relations:
+      - type: "oe:neemtAkteVan"
+
     tasks:
       - kind: "recorded"
         function: "move_bijlagen_to_permanent"
@@ -247,6 +257,9 @@ activities:
       - activity: "duidVerantwoordelijkeOrganisatieAan"
       - activity: "setSystemFields"
 
+    relations:
+      - type: "oe:neemtAkteVan"
+
     tasks:
       - kind: "recorded"
         function: "move_bijlagen_to_permanent"
@@ -283,6 +296,8 @@ activities:
 
     validators: []
     side_effects: []
+    relations:
+      - type: "oe:neemtAkteVan"
     tasks: []
 
   - name: "tekenBeslissing"
@@ -319,6 +334,8 @@ activities:
 
     validators: []
     side_effects: []
+    relations:
+      - type: "oe:neemtAkteVan"
     tasks: []
 
   - name: "neemBeslissing"
@@ -359,6 +376,8 @@ activities:
 
     validators: []
     side_effects: []
+    relations:
+      - type: "oe:neemtAkteVan"
     tasks:
       - kind: "recorded"
         function: "log_beslissing_genomen"
