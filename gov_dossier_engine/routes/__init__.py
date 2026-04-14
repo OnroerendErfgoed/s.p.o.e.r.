@@ -8,9 +8,11 @@ All routes call the same generic engine.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import FastAPI, Depends, HTTPException
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from typing import Any, Optional
 
@@ -31,6 +33,55 @@ def _activity_error_to_http(e: ActivityError) -> HTTPException:
         body = {"detail": e.detail, **e.payload}
         return HTTPException(e.status_code, detail=body)
     return HTTPException(e.status_code, detail=e.detail)
+
+
+def _entity_version_dict(
+    e,
+    dossier_id,
+    entity_type: str,
+    siblings: list,
+    include_entity_id: bool = True,
+) -> dict:
+    """Render an EntityRow as a dict for the bulk version-listing endpoints.
+
+    For tombstoned versions (option Y from the design): keep the row in
+    the response with `content: null`, add `tombstonedBy` (the activity
+    UUID that performed the redaction) and `redirectTo` (a relative URL
+    pointing at the live replacement). The replacement is whichever
+    sibling has the same entity_id and is not itself tombstoned and has
+    the latest created_at — or simply the latest sibling if everything
+    is tombstoned, since re-tombstoning is allowed.
+    """
+    out = {
+        "versionId": str(e.id),
+        "content": e.content,
+        "generatedBy": str(e.generated_by) if e.generated_by else None,
+        "derivedFrom": str(e.derived_from) if e.derived_from else None,
+        "attributedTo": e.attributed_to,
+        "createdAt": e.created_at.isoformat() if e.created_at else None,
+    }
+    if include_entity_id:
+        out["entityId"] = str(e.entity_id)
+    if e.schema_version is not None:
+        out["schemaVersion"] = e.schema_version
+
+    if e.tombstoned_by is not None:
+        out["tombstonedBy"] = str(e.tombstoned_by)
+        # Find the live replacement: latest sibling with same entity_id
+        # that isn't this row.
+        candidates = [s for s in siblings if s.entity_id == e.entity_id and s.id != e.id]
+        live = [c for c in candidates if c.tombstoned_by is None]
+        target_pool = live if live else candidates
+        if target_pool:
+            replacement = max(
+                target_pool,
+                key=lambda r: r.created_at or datetime.min.replace(tzinfo=timezone.utc),
+            )
+            out["redirectTo"] = (
+                f"/dossiers/{dossier_id}/entities/{entity_type}/"
+                f"{replacement.entity_id}/{replacement.id}"
+            )
+    return out
 
 
 # =====================================================================
@@ -513,15 +564,7 @@ def register_routes(app: FastAPI, registry: PluginRegistry, get_user, global_acc
                 "dossier_id": str(dossier_id),
                 "entity_type": entity_type,
                 "versions": [
-                    {
-                        "versionId": str(e.id),
-                        "entityId": str(e.entity_id),
-                        "content": e.content,
-                        "generatedBy": str(e.generated_by),
-                        "derivedFrom": str(e.derived_from) if e.derived_from else None,
-                        "attributedTo": e.attributed_to,
-                        "createdAt": e.created_at.isoformat() if e.created_at else None,
-                    }
+                    _entity_version_dict(e, dossier_id, entity_type, entities)
                     for e in entities
                 ],
             }
@@ -563,14 +606,7 @@ def register_routes(app: FastAPI, registry: PluginRegistry, get_user, global_acc
                 "entity_type": entity_type,
                 "entity_id": str(entity_id),
                 "versions": [
-                    {
-                        "versionId": str(e.id),
-                        "content": e.content,
-                        "generatedBy": str(e.generated_by),
-                        "derivedFrom": str(e.derived_from) if e.derived_from else None,
-                        "attributedTo": e.attributed_to,
-                        "createdAt": e.created_at.isoformat() if e.created_at else None,
-                    }
+                    _entity_version_dict(e, dossier_id, entity_type, versions, include_entity_id=False)
                     for e in versions
                 ],
             }
@@ -605,6 +641,24 @@ def register_routes(app: FastAPI, registry: PluginRegistry, get_user, global_acc
             entity = await repo.get_entity(version_id)
             if not entity or entity.dossier_id != dossier_id or entity.type != entity_type:
                 raise HTTPException(404, detail="Entity version not found")
+
+            # Tombstone redirect. If this version has been redacted, look
+            # up the latest version of the same logical entity (which by
+            # construction is the tombstone replacement, since tombstones
+            # generate a new revision) and 301 to its URL. Per the
+            # deletion-scope decision the row itself survives, so the
+            # initial fetch and FK-walk are still cheap.
+            if entity.tombstoned_by is not None:
+                latest = await repo.get_latest_entity_by_id(dossier_id, entity.entity_id)
+                if latest is not None and latest.id != entity.id:
+                    target = (
+                        f"/dossiers/{dossier_id}/entities/{entity_type}/"
+                        f"{entity.entity_id}/{latest.id}"
+                    )
+                    return RedirectResponse(url=target, status_code=301)
+                # No replacement found (shouldn't happen under normal
+                # tombstone flow, but guard anyway): return 410 Gone.
+                raise HTTPException(410, detail="Entity version was tombstoned and has no replacement")
 
             return {
                 "dossier_id": str(dossier_id),

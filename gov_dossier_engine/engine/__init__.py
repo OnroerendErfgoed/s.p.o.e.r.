@@ -56,12 +56,18 @@ class CardinalityError(Exception):
 
 
 def _allowed_relation_types_for_activity(plugin: Plugin, activity_def: dict) -> set[str]:
-    """Return the set of relation types this activity may carry.
+    """Return the set of relation types this activity may carry on its
+    request body (the permission gate / "what may be sent").
 
     The workflow-level `relations:` block and the activity-level `relations:`
-    block are unioned — both contribute allowed types. Validators registered
-    for any of these types will always be invoked when this activity runs,
-    regardless of whether the client actually sent entries for them."""
+    block are unioned — both contribute permitted types.
+
+    Note that this is distinct from validator-firing. Under the activity-
+    level opt-in dispatch contract, a relation validator runs only for
+    types listed in the activity's OWN `relations:` block, not for types
+    inherited from the workflow-wide allowed-set. Workflow-level
+    declarations permit a type to be sent system-wide; activity-level
+    declarations enable validator enforcement for that specific activity."""
     workflow = {e.get("type") for e in plugin.workflow.get("relations", []) if e.get("type")}
     activity = {e.get("type") for e in activity_def.get("relations", []) if e.get("type")}
     return workflow | activity
@@ -670,6 +676,136 @@ def _resolve_schema_version_for_generated(
     return stored  # sticky — revisions inherit parent's version
 
 
+def _validate_tombstone_activity(
+    used_rows: dict[str, "EntityRow"],
+    used_refs: list[dict],
+    generated: list[dict],
+) -> tuple[list["UUID"], dict]:
+    """Validate a tombstone activity's shape and return:
+      - the list of version_ids to tombstone (from `used`)
+      - the generated replacement dict (the non-system:note generated item)
+
+    Tombstone shape rules:
+      1. `used` is non-empty and every entry refers to the same logical
+         entity_id and the same entity_type (one tombstone, one entity).
+      2. None of the used versions are already tombstoned.
+      3. `generated` contains exactly one entity revision matching the
+         tombstoned entity (same entity_id, same type) — the replacement.
+      4. `generated` contains at least one `system:note` (the reason).
+      5. No other generated items (no surprise extras).
+
+    Raises ActivityError(422) with structured payloads on every failure
+    so the operator gets actionable diagnostics.
+    """
+    from uuid import UUID as _UUID
+
+    if not used_rows or not used_refs:
+        raise ActivityError(
+            422,
+            "Tombstone activity must list at least one version in the used block",
+            payload={"error": "tombstone_no_used"},
+        )
+
+    # Collect all used rows that are real entity versions (skip externals).
+    used_entity_rows = []
+    for ref_dict in used_refs:
+        if "version_id" not in ref_dict:
+            continue
+        # Find the corresponding row from used_rows_by_ref
+        ref = ref_dict.get("ref") or ref_dict.get("entity")
+        row = used_rows.get(ref)
+        if row is None:
+            # Look up via version_id as fallback
+            for r in used_rows.values():
+                if r.id == ref_dict["version_id"]:
+                    row = r
+                    break
+        if row is not None:
+            used_entity_rows.append(row)
+
+    if not used_entity_rows:
+        raise ActivityError(
+            422,
+            "Tombstone activity must reference real entity versions in used (no externals)",
+            payload={"error": "tombstone_no_used_entities"},
+        )
+
+    # Rule 1: all used rows must share entity_id and type.
+    target_entity_ids = {row.entity_id for row in used_entity_rows}
+    target_types = {row.type for row in used_entity_rows}
+    if len(target_entity_ids) != 1 or len(target_types) != 1:
+        raise ActivityError(
+            422,
+            f"Tombstone may only target a single logical entity; got "
+            f"entity_ids={sorted(str(e) for e in target_entity_ids)}, "
+            f"types={sorted(target_types)}",
+            payload={
+                "error": "tombstone_multi_entity",
+                "entity_ids": sorted(str(e) for e in target_entity_ids),
+                "types": sorted(target_types),
+            },
+        )
+    target_entity_id = next(iter(target_entity_ids))
+    target_type = next(iter(target_types))
+
+    # Rule 2 (intentional non-rule): re-tombstoning IS allowed. Human
+    # error during a first redaction may leave residual content in the
+    # replacement that itself needs to be redacted, so the operator must
+    # be able to run another tombstone over a previously-tombstoned
+    # entity. The new tombstone simply nulls the rows again (no-op for
+    # already-NULL content) and overwrites `tombstoned_by` with the new
+    # activity id, which becomes the most recent auditable record of who
+    # killed this entity last.
+
+    # Rule 3 + 4 + 5: generated shape.
+    replacements = [
+        g for g in generated
+        if g["type"] == target_type and g["entity_id"] == target_entity_id
+    ]
+    notes = [g for g in generated if g["type"] == "system:note"]
+    others = [
+        g for g in generated
+        if g["type"] != "system:note"
+        and not (g["type"] == target_type and g["entity_id"] == target_entity_id)
+    ]
+
+    if len(replacements) != 1:
+        raise ActivityError(
+            422,
+            f"Tombstone must generate exactly one replacement of "
+            f"{target_type}/{target_entity_id}; got {len(replacements)}",
+            payload={
+                "error": "tombstone_replacement_count",
+                "expected": 1,
+                "got": len(replacements),
+                "target_type": target_type,
+                "target_entity_id": str(target_entity_id),
+            },
+        )
+    if len(notes) < 1:
+        raise ActivityError(
+            422,
+            "Tombstone must generate at least one system:note carrying the redaction reason",
+            payload={"error": "tombstone_missing_reason_note"},
+        )
+    if others:
+        raise ActivityError(
+            422,
+            f"Tombstone activity may only generate the replacement entity "
+            f"and system:note(s); unexpected entries: "
+            f"{[g['type'] for g in others]}",
+            payload={
+                "error": "tombstone_unexpected_generated",
+                "unexpected_types": [g["type"] for g in others],
+            },
+        )
+
+    # All used rows are eligible for deletion. Return their version ids
+    # and the replacement dict.
+    version_ids_to_kill = [row.id for row in used_entity_rows]
+    return version_ids_to_kill, replacements[0]
+
+
 async def execute_activity(
     plugin: Plugin,
     activity_def: dict,
@@ -1063,10 +1199,46 @@ async def execute_activity(
             "ref": rel_ref,
         })
 
-    # Per-type validator dispatch. Every allowed relation type that has a
-    # registered validator runs, regardless of whether the client sent any
-    # entries for it. The declaration is the gate; the validator is the brain.
-    for rel_type in allowed_relation_types:
+    # Per-type validator dispatch.
+    #
+    # Workflow-level `relations:` declares which relation types are
+    # PERMITTED in this workflow (the allowed-set / "what may be sent").
+    # Activity-level `relations:` declares which relation types this
+    # specific activity OPTS IN to (the validator-firing set / "what
+    # discipline applies here"). A relation validator runs only for
+    # types listed in the activity's own `relations:` block — not for
+    # types it merely inherits from the workflow-wide allowed-set.
+    #
+    # This means: a workflow can permit `oe:neemtAkteVan` system-wide,
+    # but only the activities that actually depend on staleness checking
+    # (e.g. `bewerkAanvraag`, `tekenBeslissing`) need to enable it. System
+    # activities, side effects, and one-off built-ins like `tombstone` are
+    # untouched by default.
+    activity_level_relation_types: set[str] = set()
+    for r in activity_def.get("relations", []) or []:
+        if isinstance(r, dict):
+            t = r.get("type")
+        else:
+            t = r
+        if t:
+            activity_level_relation_types.add(t)
+
+    for rel_type in activity_level_relation_types:
+        if rel_type not in allowed_relation_types:
+            # Activity opted into a type that isn't permitted workflow-wide.
+            # Treat as misconfiguration — fail loudly at request time so
+            # the operator notices.
+            raise ActivityError(
+                500,
+                f"Activity {activity_def.get('name')!r} opts into relation "
+                f"type {rel_type!r} which is not in the workflow's allowed "
+                f"relation set {sorted(allowed_relation_types)}",
+                payload={
+                    "error": "relation_type_not_permitted",
+                    "activity": activity_def.get("name"),
+                    "relation_type": rel_type,
+                },
+            )
         validator = plugin.relation_validators.get(rel_type)
         if validator is None:
             continue  # pure annotation — no validator, just stored
@@ -1093,6 +1265,18 @@ async def execute_activity(
             result = await validator_fn(ctx)
             if result is not None and not result:
                 raise ActivityError(409, f"Validator '{validator_name}' failed")
+
+    # 8b. Built-in tombstone shape validation. Runs only for the engine's
+    # built-in `tombstone` activity type. Captures the version_ids that
+    # will be tombstoned after persistence (step 11c below) so we don't
+    # walk the used rows twice.
+    tombstone_version_ids: list[UUID] = []
+    if activity_def.get("name") == "tombstone":
+        tombstone_version_ids, _ = _validate_tombstone_activity(
+            used_rows=used_rows_by_ref,
+            used_refs=used_refs,
+            generated=generated,
+        )
 
     # 9. Create activity + association
     activity_row = await repo.create_activity(
@@ -1208,6 +1392,17 @@ async def execute_activity(
             "type": "external",
             "content": {"uri": ext_uri},
         })
+
+    # 11c. Tombstone deletion. Runs after the replacement entity has been
+    # persisted (step 11) so the new revision is in place before we null
+    # the originals. Per the deletion-scope decision, we only NULL the
+    # `content` blob and stamp `tombstoned_by`; the rows, derivation
+    # edges, schema_version, and used links survive. The replacement and
+    # any system:note entities generated by this same activity are NOT in
+    # `tombstone_version_ids` (they're new rows from this activity, not
+    # used rows) so they're untouched.
+    if tombstone_version_ids:
+        await repo.tombstone_entity_versions(tombstone_version_ids, activity_id)
 
     # 12. Create used links (references only — no overlap with generated)
     for ref in used_refs:
