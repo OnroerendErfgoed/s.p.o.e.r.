@@ -890,6 +890,100 @@ Environment troubleshooting notes (deleted-inode gotchas, process-group kills in
 | `benjamma` | Matthias Benjamins | behandelaar, gemeente OE |
 | `sophie.tekent` | Sophie Marchand | beslisser, behandelaar, gemeente OE |
 
+## Frontend
+
+A small Vue 3 frontend (`dossier_frontend/`) showcases the activity workflow end-to-end against a running backend. It's a POC, not production — no real authentication, no i18n framework, no file upload — but it covers the main user flows and demonstrates how to consume the engine's API.
+
+### What it demonstrates
+
+1. **Role-aware access control.** Switch between four POC profiles (beheerder, two kinds of aanvrager, behandelaar) from the top-right badge. The dashboard, the list of "next actions" on a dossier, and the availability of the archive-export button all change with the active profile. The backend enforces access regardless; the frontend just reads what the backend returns.
+2. **Activity-driven workflow.** The dossier detail view presents the current dossier state (status pill, content entities, chronological activity timeline) alongside a panel of activities the active user can execute next. Clicking one opens its form inline — no separate edit pages — reinforcing the "everything is an activity" design.
+3. **The main flows in the toelatingen workflow.** `dienAanvraagIn` (new-application form for aanvragers), `bewerkAanvraag` (behandelaar edits, producing a new entity version with `derivedFrom`), `vervolledigAanvraag` (aanvrager completes after an "onvolledig" beslissing — same shape as bewerk, different role and required status), `neemBeslissing` (generates `oe:beslissing` + `oe:handtekening` atomically). The archive export as a PDF/A download is available on the detail view for beheerders.
+
+### Design direction
+
+Restrained, institutional, editorial. Source Serif 4 display paired with IBM Plex Sans for UI; single warm-ochre accent (evoking heritage metalwork rather than startup purple); rectangular corners and hairline 1px rules throughout; subtle SVG paper-noise background for depth. The palette, typography, and component density were chosen to match civil-service document handling rather than generic SaaS aesthetics.
+
+### Run it locally
+
+Backend first (both services):
+
+```bash
+# Terminal 1: file service
+cd file_service_repo && python3 -m uvicorn file_service.app:app --port 8001
+
+# Terminal 2: dossier app
+cd toelatingen && python3 -m uvicorn dossier_app.main:app --port 8000
+```
+
+Then frontend:
+
+```bash
+cd dossier_frontend
+npm install
+npm run dev
+```
+
+Vite serves on `http://localhost:5173` and proxies `/api/*` to `http://localhost:8000` (see `vite.config.js`) so the frontend can make same-origin calls without CORS configuration. For a production build:
+
+```bash
+npm run build      # output in dist/
+npm run preview    # serve the build locally
+```
+
+### Known limitations
+
+- **No file upload.** The `dienAanvraagIn` form submits with an empty `bijlagen` array. The `neemBeslissing` form generates a placeholder `file_id` for the required `brief` field, which passes backend validation (the `FileId` type is a tagged string; the engine doesn't check the file's existence against file_service), but the `brief_download_url` that the engine injects into the GET response will 404 because no actual PDF was uploaded. Real file handling would require implementing the signed-upload-URL dance from `routes/files.py`.
+- **No PROV timeline visualization.** The engine already exposes an interactive provenance graph at `GET /dossiers/{id}/prov` (HTML/SVG), rendered by a Jinja template in `dossier_engine/templates/prov_timeline.html`. The frontend could embed or link to that page rather than reimplementing it — the activity timeline in the detail view is a simpler text version sufficient for most review work.
+- **Search is stubbed.** The backend's `GET /dossiers` is a basic listing, not a real search endpoint. Production deployments would add workflow-specific endpoints that query Elasticsearch (see the `post_activity_hook` pattern).
+- **"Login" is just a user picker.** The current profile persists to `localStorage`, and every API call sends `X-POC-User: <username>`. The backend's `POCAuthMiddleware` looks up user definitions from `workflow.yaml`. This is the same auth model the backend tests use and is not suitable for production — real deployments would swap in JWT auth at the middleware layer.
+
+### Structure
+
+```
+dossier_frontend/
+├── index.html
+├── package.json           # Vue 3, Vue Router, Pinia, Tailwind, Vite
+├── vite.config.js         # /api proxy to :8000
+├── tailwind.config.js     # custom palette (ink/paper/brass + status)
+├── postcss.config.js
+└── src/
+    ├── main.js
+    ├── App.vue            # top bar + router view + footer
+    ├── router.js          # 4 routes, auth guard
+    ├── api.js             # fetch wrapper, X-POC-User injection
+    ├── styles.css         # Tailwind + base typography + component primitives
+    ├── stores/
+    │   └── auth.js        # current POC user, persisted to localStorage
+    ├── views/
+    │   ├── LoginView.vue         # profile picker
+    │   ├── DashboardView.vue     # list of accessible dossiers
+    │   ├── DossierDetailView.vue # two-column detail + inline activity forms
+    │   └── NewAanvraagView.vue   # dienAanvraagIn form
+    └── components/
+        ├── UserBadge.vue              # top-right user dropdown
+        ├── StatusPill.vue             # coloured status label
+        ├── ActivityCard.vue           # timeline entry
+        ├── EntityDisplay.vue          # generic entity content renderer
+        ├── ReviseAanvraagForm.vue     # shared form for bewerkAanvraag + vervolledigAanvraag
+        └── NeemBeslissingForm.vue     # decision form (goedgekeurd / afgekeurd / onvolledig)
+```
+
+### Demo script
+
+A five-minute walk through the full workflow:
+
+1. Open the app, pick **Jan Peeters** (aanvrager). Dashboard is empty; click "Nieuwe aanvraag".
+2. Fill in the form — leave **Brugge** as the gemeente so Marie can later take the decision. Submit.
+3. You land on the new dossier's detail view. Status: *ingediend*. The aanvraag content is rendered; the activity timeline shows the `dienAanvraagIn` plus any system-triggered side-effects (`duidVerantwoordelijkeOrganisatieAan`, `setSystemFields`).
+4. Via the user-badge dropdown, switch to **Marie Vandenbroeck** (behandelaar Brugge). The dashboard now shows the new dossier in her workbench. Open it.
+5. The "Volgende stap" panel now offers *Bewerk aanvraag* and *Neem beslissing*. Click *Neem beslissing*, pick **Onvolledig**, confirm. The dossier transitions to *aanvraag_onvolledig*.
+6. Switch back to **Jan**. Open the dossier — a new action, *Vervolledig aanvraag*, is now available. Click it, edit the onderwerp to add the requested details, and submit. The status returns to *ingediend*.
+7. Switch back to **Marie**. *Neem beslissing* is available again. This time pick **Goedgekeurd**. The dossier transitions to *Verleend*.
+8. Switch to **Wouter Claeys** (beheerder). Open the dossier. The archive-export button appears in the header. Click it — a PDF/A archive of the entire dossier downloads, with the full PROV trail embedded as a PROV-JSON attachment.
+
+This sequence exercises the onvolledig → vervolledig → goedgekeurd loop, which demonstrates the core value of the PROV model: the final archive contains the *entire* correspondence, including the original submission, the incomplete decision, Jan's revision, and the final goedgekeuring — all cryptographically linked via `derivedFrom`.
+
 ## Key Design Decisions
 
 - **Activity-driven** — single endpoint pattern `PUT /dossiers/{id}/activities/{id}`, all state changes are activities.

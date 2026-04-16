@@ -1,0 +1,101 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    font-family: theme("fontFamily.sans");
+    font-size: 15px;
+    color: theme("colors.ink.DEFAULT");
+    background-color: theme("colors.paper.DEFAULT");
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    /* Subtle paper texture. A very faint cross-hatch noise pattern
+       that reads as "printed document" rather than digital surface.
+       Generated as an inline SVG to avoid an extra asset request. */
+    background-image:
+      url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' seed='4'/><feColorMatrix values='0 0 0 0 0.4 0 0 0 0 0.35 0 0 0 0 0.25 0 0 0 0.02 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+  }
+
+  /* Displays use the serif. Applied via class rather than default
+     so body text keeps the utilitarian sans. */
+
+  h1, h2, h3 {
+    font-family: theme("fontFamily.display");
+    font-weight: 400;
+    letter-spacing: -0.01em;
+  }
+
+  /* Form controls: strip default chrome, rebuild deliberately */
+  input[type="text"],
+  input[type="url"],
+  select,
+  textarea {
+    @apply w-full bg-paper-card border border-ink-line px-3 py-2 rounded-none;
+    @apply font-sans text-ink placeholder:text-ink-soft;
+    @apply focus:outline-none focus:border-brass focus:ring-1 focus:ring-brass/40;
+    @apply transition-colors duration-150;
+  }
+
+  /* Hairline focus ring on buttons */
+  button:focus-visible {
+    @apply outline-none ring-1 ring-brass/50 ring-offset-2 ring-offset-paper;
+  }
+
+  /* Code/kbd */
+  code, kbd {
+    font-family: theme("fontFamily.mono");
+    font-size: 0.86em;
+  }
+}
+
+@layer components {
+  /* Label style: uppercase micro-text, wider tracking.
+     Used for field labels and section eyebrows. */
+  .label-eyebrow {
+    @apply text-[11px] uppercase tracking-widest text-ink-soft font-medium;
+  }
+
+  /* Hairline rule used liberally between sections. */
+  .rule {
+    @apply border-t border-ink-line;
+  }
+
+  /* Button primitives. Rectangular, no rounded corners —
+     reinforces the documentary feel. */
+  .btn {
+    @apply inline-flex items-center gap-2 px-4 py-2 text-sm font-medium;
+    @apply border transition-colors duration-150;
+  }
+  .btn-primary {
+    @apply btn bg-ink text-paper border-ink;
+    @apply hover:bg-ink-muted hover:border-ink-muted;
+  }
+  .btn-ghost {
+    @apply btn bg-transparent text-ink border-ink;
+    @apply hover:bg-ink hover:text-paper;
+  }
+  .btn-brass {
+    @apply btn bg-brass text-paper border-brass;
+    @apply hover:bg-brass-dark hover:border-brass-dark;
+  }
+  .btn-link {
+    @apply text-brass-dark hover:text-ink underline underline-offset-2;
+    @apply decoration-brass/50 hover:decoration-ink transition-colors;
+  }
+
+  /* Status pill. Filled, small, wide-tracked uppercase. */
+  .pill {
+    @apply inline-flex items-center px-2 py-0.5 text-[10px] uppercase;
+    @apply tracking-widest font-medium text-paper;
+  }
+
+  /* Card: the main content container. Soft shadow, hairline border,
+     generous internal padding. */
+  .paper-card {
+    @apply bg-paper-card border border-ink-line shadow-paper;
+  }
+}
