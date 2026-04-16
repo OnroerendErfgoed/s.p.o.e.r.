@@ -54,6 +54,19 @@ async def check_idempotency(state: ActivityState) -> dict | None:
 async def ensure_dossier(state: ActivityState) -> None:
     """Look up the dossier, or create it if this activity bootstraps one.
 
+    Takes a row-level exclusive lock (SELECT ... FOR UPDATE) on the
+    dossier row. This serializes concurrent activities against the
+    same dossier — two API calls that both try to act on dossier X
+    will execute one after the other, not in parallel. The lock is
+    held for the duration of the enclosing transaction and released
+    on commit/rollback, so other dossiers are unaffected.
+
+    The lock is the optimistic-concurrency replacement: rather than
+    requiring clients to pass a version/ETag and retrying on mismatch,
+    the DB serializes at the natural boundary (the dossier) where
+    activities genuinely conflict. Fine-grained row locks keep
+    unrelated dossiers fully parallel.
+
     A dossier may not exist yet for the very first activity in its
     lifetime. The activity definition's `can_create_dossier` flag
     controls whether such a creation is allowed — only a small number
@@ -68,7 +81,7 @@ async def ensure_dossier(state: ActivityState) -> None:
     Raises: 404 if no dossier and the activity can't create one.
             400 if creation is allowed but `workflow_name` is missing.
     """
-    state.dossier = await state.repo.get_dossier(state.dossier_id)
+    state.dossier = await state.repo.get_dossier_for_update(state.dossier_id)
     if state.dossier is not None:
         return
 

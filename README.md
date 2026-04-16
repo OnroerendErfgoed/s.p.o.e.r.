@@ -423,8 +423,7 @@ The `GET /dossiers/{id}/archive` endpoint produces a self-contained PDF/A-3b arc
 - **Cover page** — dossier metadata, workflow, status, creation date, all involved agents with their canonical URIs, and a full activity timeline.
 - **Provenance timeline** — a static SVG rendered server-side (pure Python, no D3 or browser required) showing activity columns and entity version markers.
 - **Entity version history** — every version of every entity type (external, domain, and system entities) with full JSON content, derivation references, timestamps, and tombstone markers.
-- **PROV-JSON pages** — the complete W3C PROV-JSON export printed as readable text.
-- **Embedded `prov.json`** — the same PROV-JSON as a PDF/A-3 attachment for machine extraction.
+- **Embedded `prov.json`** — the complete W3C PROV-JSON export as a PDF/A-3 attachment for machine extraction.
 - **Embedded bijlagen** — all file attachments referenced by any entity's `bijlagen` array, embedded as PDF/A-3 attachments alongside `prov.json`.
 
 Embedded files are accessible through the attachments panel of any PDF/A-3-aware viewer (Evince: sidebar paperclip; Okular: Tools → Embedded Files; Adobe Reader: left panel → paperclip). The XMP metadata declares `pdfaid:part=3` and `pdfaid:conformance=B`.

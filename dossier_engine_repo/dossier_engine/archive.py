@@ -531,24 +531,8 @@ async def generate_archive(
                         pdf.set_text_color(0, 0, 0)
                     pdf.ln(1)
 
-    # --- PROV-JSON as readable pages ---
-    pdf.add_page()
-    pdf.set_font("DejaVu", "B", 14)
-    pdf.cell(0, 10, "PROV-JSON -- Machine-leesbare provenance", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("DejaVu", "", 9)
-    pdf.set_text_color(100, 100, 100)
-    pdf.cell(0, 6, "Volledige W3C PROV-JSON export van dit dossier.", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_text_color(0, 0, 0)
-    pdf.ln(3)
-
+    # Prepare PROV-JSON for embedding (not rendered as pages — attachment only)
     prov_str = json.dumps(prov_json, indent=2, ensure_ascii=False, default=str)
-    pdf.set_font("DejaVuMono", "", 6)
-    for line in prov_str.split("\n"):
-        if pdf.get_y() > pdf.h - 15:
-            pdf.add_page()
-            pdf.set_font("DejaVuMono", "", 6)
-        safe_line = line[:180].replace("\t", "  ")
-        pdf.cell(0, 3, safe_line, new_x="LMARGIN", new_y="NEXT")
 
     # --- Collect bijlagen from all entity versions ---
     import os
@@ -583,25 +567,36 @@ async def generate_archive(
                     except OSError:
                         pass  # skip unreadable files
 
-    # --- Bijlagen summary page ---
-    if bijlagen_files:
-        pdf.add_page()
-        pdf.set_font("DejaVu", "B", 14)
-        pdf.cell(0, 10, "Bijlagen -- Ingesloten bestanden", new_x="LMARGIN", new_y="NEXT")
-        pdf.set_font("DejaVu", "", 9)
-        pdf.set_text_color(100, 100, 100)
-        pdf.cell(0, 6, f"{len(bijlagen_files)} bestand(en) ingesloten als PDF/A-3 bijlage(n).", new_x="LMARGIN", new_y="NEXT")
-        pdf.set_text_color(0, 0, 0)
-        pdf.ln(3)
+    # --- Bijlagen summary page (always rendered; prov.json is always included) ---
+    prov_json_size = len(prov_str.encode("utf-8"))
+    pdf.add_page()
+    pdf.set_font("DejaVu", "B", 14)
+    pdf.cell(0, 10, "Bijlagen -- Ingesloten bestanden", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("DejaVu", "", 9)
+    pdf.set_text_color(100, 100, 100)
+    total_attachments = 1 + len(bijlagen_files)  # prov.json + bijlagen
+    pdf.cell(0, 6, f"{total_attachments} bestand(en) ingesloten als PDF/A-3 bijlage(n).", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(3)
 
-        for fid, fname, ctype, fdata in bijlagen_files:
-            pdf.set_font("DejaVu", "B", 10)
-            pdf.cell(0, 6, f"  {fname}", new_x="LMARGIN", new_y="NEXT")
-            pdf.set_font("DejaVu", "", 8)
-            pdf.set_text_color(80, 80, 80)
-            pdf.cell(0, 5, f"    Type: {ctype}  |  Grootte: {len(fdata):,} bytes  |  ID: {fid}", new_x="LMARGIN", new_y="NEXT")
-            pdf.set_text_color(0, 0, 0)
-            pdf.ln(2)
+    # prov.json always first
+    pdf.set_font("DejaVu", "B", 10)
+    pdf.cell(0, 6, "  prov.json", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("DejaVu", "", 8)
+    pdf.set_text_color(80, 80, 80)
+    pdf.cell(0, 5, f"    Type: application/json  |  Grootte: {prov_json_size:,} bytes  |  W3C PROV-JSON export", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(2)
+
+    # Then the bijlagen
+    for fid, fname, ctype, fdata in bijlagen_files:
+        pdf.set_font("DejaVu", "B", 10)
+        pdf.cell(0, 6, f"  {fname}", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("DejaVu", "", 8)
+        pdf.set_text_color(80, 80, 80)
+        pdf.cell(0, 5, f"    Type: {ctype}  |  Grootte: {len(fdata):,} bytes  |  ID: {fid}", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(2)
 
     # --- PDF/A-3b XMP metadata ---
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

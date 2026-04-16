@@ -228,6 +228,86 @@ class TestEnsureDossier:
         assert exc.value.status_code == 400
         assert "workflow" in str(exc.value).lower()
 
+    async def test_ensure_dossier_takes_row_level_lock(self, repo):
+        """`ensure_dossier` uses `get_dossier_for_update` under the
+        hood, which issues `SELECT ... FOR UPDATE`. This test proves
+        the lock is actually acquired by inspecting the SQL.
+
+        We capture executed statements via the session's sync bind
+        engine event hooks; any SELECT against the dossiers table
+        issued during `ensure_dossier` should carry `FOR UPDATE`.
+        """
+        await repo.create_dossier(D1, "toelatingen")
+        await repo.session.flush()
+
+        # Clear the repo cache so ensure_dossier forces a fresh read.
+        repo._dossier_cache.clear()
+
+        executed_sql: list[str] = []
+        from sqlalchemy import event
+        sync_engine = repo.session.bind.sync_engine
+
+        def _capture(conn, cursor, statement, params, context, executemany):
+            executed_sql.append(statement)
+
+        event.listen(sync_engine, "before_cursor_execute", _capture)
+        try:
+            state = _state(repo)
+            await ensure_dossier(state)
+        finally:
+            event.remove(sync_engine, "before_cursor_execute", _capture)
+
+        # At least one of the captured SELECTs on dossiers must carry FOR UPDATE.
+        dossier_selects = [
+            s for s in executed_sql
+            if "FROM dossiers" in s and s.strip().upper().startswith("SELECT")
+        ]
+        assert dossier_selects, f"No dossier SELECTs captured: {executed_sql}"
+        assert any("FOR UPDATE" in s for s in dossier_selects), (
+            f"ensure_dossier must issue SELECT ... FOR UPDATE, "
+            f"got: {dossier_selects}"
+        )
+
+    async def test_get_dossier_for_update_bypasses_cache(self, repo):
+        """Even if `get_dossier` was called earlier without the
+        lock and cached the row, `get_dossier_for_update` must
+        still issue a fresh SELECT FOR UPDATE. Otherwise the lock
+        silently fails to materialize for any dossier already
+        touched in the session.
+        """
+        await repo.create_dossier(D1, "toelatingen")
+        await repo.session.flush()
+
+        # First, load without lock (populates the cache).
+        first = await repo.get_dossier(D1)
+        assert first is not None
+        assert D1 in repo._dossier_cache
+
+        # Now capture SQL for the locked read.
+        executed_sql: list[str] = []
+        from sqlalchemy import event
+        sync_engine = repo.session.bind.sync_engine
+
+        def _capture(conn, cursor, statement, params, context, executemany):
+            executed_sql.append(statement)
+
+        event.listen(sync_engine, "before_cursor_execute", _capture)
+        try:
+            locked = await repo.get_dossier_for_update(D1)
+        finally:
+            event.remove(sync_engine, "before_cursor_execute", _capture)
+
+        assert locked is not None
+        # A fresh SELECT was issued even though the row was cached.
+        locked_selects = [
+            s for s in executed_sql
+            if "FROM dossiers" in s and "FOR UPDATE" in s
+        ]
+        assert locked_selects, (
+            f"get_dossier_for_update must bypass cache and issue "
+            f"SELECT ... FOR UPDATE even for cached rows, got: {executed_sql}"
+        )
+
 
 # --------------------------------------------------------------------
 # resolve_role (sync function, no DB reads — pure unit)

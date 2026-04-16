@@ -202,6 +202,31 @@ class Repository:
         self._dossier_cache[dossier_id] = result
         return result
 
+    async def get_dossier_for_update(self, dossier_id: UUID) -> Optional[DossierRow]:
+        """Fetch the dossier row with a row-level exclusive lock.
+
+        Issued as `SELECT ... FOR UPDATE` so concurrent activities
+        against the same dossier serialize. The lock is held until
+        the enclosing transaction commits or rolls back. Other
+        dossiers are unaffected — the lock is scoped to one row.
+
+        The session cache is bypassed: if the row was loaded earlier
+        in this transaction without the lock, SQLAlchemy's identity
+        map would return it unchanged. Forcing a fresh query with
+        FOR UPDATE guarantees the lock is actually acquired.
+
+        Used by the activity pipeline as the optimistic-concurrency
+        replacement (see pipeline/preconditions.py::ensure_dossier).
+        """
+        from sqlalchemy import select
+        # Invalidate any previously loaded version so FOR UPDATE
+        # actually hits the database.
+        self._dossier_cache.pop(dossier_id, None)
+        stmt = select(DossierRow).where(DossierRow.id == dossier_id).with_for_update()
+        result = (await self.session.execute(stmt)).scalar_one_or_none()
+        self._dossier_cache[dossier_id] = result
+        return result
+
     async def create_dossier(self, dossier_id: UUID, workflow: str) -> DossierRow:
         row = DossierRow(id=dossier_id, workflow=workflow)
         self.session.add(row)
