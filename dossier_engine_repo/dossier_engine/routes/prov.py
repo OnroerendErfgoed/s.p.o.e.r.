@@ -738,8 +738,26 @@ def register_prov_routes(app, registry: PluginRegistry, get_user, global_access:
 
             # Write to temp file to avoid bytearray encoding issues
             tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-            tmp.write(bytes(pdf_bytes) if isinstance(pdf_bytes, bytearray) else pdf_bytes)
+            pdf_body = bytes(pdf_bytes) if isinstance(pdf_bytes, bytearray) else pdf_bytes
+            tmp.write(pdf_body)
             tmp.close()
+
+            # Audit event: PDF/A export is a full data extraction from
+            # the dossier. Highest-priority event for compliance; a
+            # dedicated action name so the SIEM can retain and alert
+            # on exports separately from ordinary reads.
+            from ..audit import emit_audit
+            emit_audit(
+                action="dossier.exported",
+                actor_id=user.id,
+                actor_name=user.name,
+                target_type="Dossier",
+                target_id=str(dossier_id),
+                outcome="allowed",
+                dossier_id=str(dossier_id),
+                export_format="pdfa3",
+                bytes_sent=len(pdf_body),
+            )
 
             from fastapi.responses import FileResponse
             return FileResponse(

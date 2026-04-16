@@ -156,6 +156,25 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     # --- Startup: DB init + Alembic migrations ---
     @app.on_event("startup")
     async def startup():
+        # Audit logging wires up first — errors emitted during DB init
+        # or migrations may themselves need to go through audit.
+        # Safe no-op if the audit log path isn't writable (dev/test).
+        # Reads `audit.log_path` from config, falling back to the
+        # `DOSSIER_AUDIT_LOG_PATH` env var, then to the module default.
+        #
+        # `or {}` handles the case where the `audit:` key is present in
+        # config.yaml but has no non-commented children — YAML parses
+        # `audit:` with only commented lines under it as `None`, not as
+        # an empty dict, so `config.get("audit", {})` returns `None`
+        # and a subsequent `.get()` call would raise AttributeError.
+        from .audit import configure_audit_logging
+        audit_config = config.get("audit") or {}
+        configure_audit_logging(
+            path=audit_config.get("log_path"),
+            max_bytes=audit_config.get("max_bytes", 100 * 1024 * 1024),
+            backup_count=audit_config.get("backup_count", 10),
+        )
+
         db_url = config.get("database", {}).get("url")
         if not db_url:
             raise RuntimeError(

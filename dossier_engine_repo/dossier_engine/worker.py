@@ -451,6 +451,29 @@ async def complete_task(
         caller=Caller.SYSTEM,
     )
 
+    # Audit: one event per task completion, regardless of outcome.
+    # Outcome mirrors the final task status: `completed` → allowed,
+    # `dead_letter` → error, `scheduled` (retry) → we deliberately
+    # emit nothing here because the retry is not a final state —
+    # a later completion or dead-letter will produce the definitive
+    # audit event. That gives SIEM one event per task lifecycle
+    # rather than one per attempt.
+    if status in ("completed", "dead_letter"):
+        from .audit import emit_audit
+        emit_audit(
+            action="worker.task_executed",
+            actor_id="system",
+            actor_name="Systeem",
+            target_type="Task",
+            target_id=str(task.entity_id),
+            outcome="allowed" if status == "completed" else "error",
+            dossier_id=str(dossier_id),
+            task_function=task.content.get("function") if task.content else None,
+            task_kind=task.content.get("kind") if task.content else None,
+            task_status=status,
+            reason=f"Task {status}" if status == "dead_letter" else None,
+        )
+
 
 async def process_task(task: EntityRow, registry, config):
     """Legacy entry point — opens its own session and calls the

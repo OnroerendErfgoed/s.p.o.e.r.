@@ -308,9 +308,22 @@ async def _run_activity(
     Centralizes the `[item.model_dump() for item in ...]` pattern
     that all three endpoints repeat — the engine takes plain dicts,
     not Pydantic models.
+
+    Also the chokepoint for audit emission on writes: every activity
+    execution emits exactly one audit event here. The two success
+    actions (`dossier.created` for root, `dossier.updated` otherwise)
+    differ by whether the activity is marked as root in its YAML
+    definition — `root: True` means it creates the dossier row. On
+    `ActivityError`, we emit `dossier.error` with the validator's
+    reason so SIEM can correlate failed write attempts to users.
     """
+    from ..audit import emit_audit
+
+    is_root = bool(act_def.get("root"))
+    action = "dossier.created" if is_root else "dossier.updated"
+
     try:
-        return await execute_activity(
+        result = await execute_activity(
             plugin=plugin,
             activity_def=act_def,
             repo=repo,
@@ -325,4 +338,51 @@ async def _run_activity(
             informed_by=informed_by,
         )
     except ActivityError as e:
+        # Classify the failure. 403 is an authorization denial —
+        # semantically distinct from validation/business-rule errors
+        # (422, 400, etc.) and emitted with outcome=denied so SIEM
+        # rules for "who's being turned away" work correctly. Everything
+        # else is a generic `dossier.error` with outcome=error.
+        code = getattr(e, 'code', None)
+        message = getattr(e, 'message', str(e))
+        if code == 403:
+            emit_audit(
+                action="dossier.denied",
+                actor_id=user.id,
+                actor_name=user.name,
+                target_type="Dossier",
+                target_id=str(dossier_id),
+                outcome="denied",
+                dossier_id=str(dossier_id),
+                reason=message,
+                activity_type=act_def.get("name"),
+                activity_id=str(activity_id),
+            )
+        else:
+            emit_audit(
+                action="dossier.error",
+                actor_id=user.id,
+                actor_name=user.name,
+                target_type="Dossier",
+                target_id=str(dossier_id),
+                outcome="error",
+                dossier_id=str(dossier_id),
+                reason=f"{code or 'unknown'}: {message}",
+                activity_type=act_def.get("name"),
+                activity_id=str(activity_id),
+            )
         raise activity_error_to_http(e)
+
+    # Success. One audit event per committed activity.
+    emit_audit(
+        action=action,
+        actor_id=user.id,
+        actor_name=user.name,
+        target_type="Dossier",
+        target_id=str(dossier_id),
+        outcome="allowed",
+        dossier_id=str(dossier_id),
+        activity_type=act_def.get("name"),
+        activity_id=str(activity_id),
+    )
+    return result

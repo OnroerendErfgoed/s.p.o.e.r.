@@ -534,6 +534,255 @@ gs -dPDFA=3 -dBATCH -dNOPAUSE -dNOOUTERSAVE \
    -sOutputFile=archive_pdfa.pdf archive.pdf
 ```
 
+## Audit Log
+
+Separate from the PROV graph (which records successful state transitions) and from Sentry (which captures exceptions), the audit log is an append-only record of **who did what to what, when** — including reads, denials, and exports. It answers compliance questions like "who looked up applicant X's dossier?" or "who exported data between dates Y and Z?"
+
+The PROV graph already covers the "what changed" half of any audit story — every activity has an actor, a timestamp, and the set of entities it touched. What PROV doesn't cover is read events (nothing was modified, so nothing is persisted), authorisation denials (the activity never ran, so no activity row), and data exports (the PDF/A archive isn't a PROV activity). The audit log fills those gaps.
+
+### Design
+
+The engine writes newline-delimited JSON (NDJSON) to a local file. A Wazuh agent on the same host tails the file and forwards events to the SIEM. The application does not talk to Wazuh over the network — it writes a file, Wazuh reads the file. This matters for two reasons: if Wazuh is down, the application keeps running (writes still succeed, the agent catches up later), and if the application crashes, the file is already on disk (no buffered-in-memory events lost).
+
+One complete JSON object per physical line, `\n`-terminated. Rotation is handled by Python's `RotatingFileHandler`, not by `logrotate` — the Wazuh agent tails by inode, so the handler's rename-on-rotation doesn't lose events across the boundary.
+
+### Event shape
+
+```json
+{
+  "event_action": "dossier.exported",
+  "actor": {"id": "claeyswo", "name": "Claeys Wouter"},
+  "target": {"type": "Dossier", "id": "d1000000-0000-0000-0000-000000000001"},
+  "outcome": "allowed",
+  "dossier_id": "d1000000-0000-0000-0000-000000000001",
+  "extra": {"export_format": "pdfa3", "bytes_sent": 125478},
+  "@timestamp": "2026-04-16T10:51:08.583947+00:00"
+}
+```
+
+Fields:
+
+- `event_action` — namespaced verb, a small stable vocabulary (see table below). SIEM alert rules key on exact strings, so don't rename without coordinating with the SIEM team. The JSON key is `event_action` (not `action`) to avoid a collision with Wazuh's reserved static field names: `user`, `srcip`, `dstip`, `srcport`, `dstport`, `protocol`, **`action`**, `id`, `url`, `data`, `extra_data`, `status`, `system_name`. Any one of those as a top-level key in JSON audit events would fail to match in Wazuh rules because the JSON decoder won't place them into the dynamic-field table.
+- `actor.id` / `actor.name` — who did it. `actor.id` is the stable identifier (usually a username or user UUID); `actor.name` is for human-readable reports. Worker-driven events use `"system"` / `"Systeem"`.
+- `target.type` / `target.id` — what was acted on. Usually `Dossier` + dossier UUID.
+- `outcome` — exactly one of `allowed` / `denied` / `error`.
+- `dossier_id` — always the containing dossier's UUID when the event is dossier-scoped; denormalised so SIEM queries filter without joining on target.
+- `reason` — free-text explanation, only present for `denied` / `error`.
+- `extra` — action-specific structured fields. Examples: `export_format` for exports, `bytes_sent` for file downloads, `query` for searches. Nested under `extra` rather than at top level, so keys named `status` / `id` / etc. don't hit the reserved-name collision either.
+- `@timestamp` — ISO-8601 UTC with microseconds. Produced by the application, not the Wazuh agent, so a delayed write doesn't get misattributed to a later bucket.
+
+### Action vocabulary
+
+| Action | Emitted when | Typical outcome |
+|---|---|---|
+| `dossier.created` | Root activity (e.g. `dienAanvraagIn`) commits successfully | `allowed` |
+| `dossier.updated` | Any subsequent activity commits successfully | `allowed` |
+| `dossier.read` | `GET /dossiers/{id}` or `GET /dossiers/{id}/prov` serves a response | `allowed` |
+| `dossier.searched` | Search query executes | `allowed` |
+| `dossier.exported` | `GET /dossiers/{id}/archive` produces a PDF/A | `allowed` |
+| `dossier.file_accessed` | Bijlage download served | `allowed` |
+| `dossier.denied` | Authorization refused an action (read or write) | `denied` |
+| `dossier.error` | Validation or pipeline failure | `error` |
+| `worker.task_executed` | Worker completes or dead-letters a task | `allowed` / `error` |
+
+### Enabling in the application
+
+Audit emission is off by default — the `dossier.audit` logger has no handler, and `emit_audit()` is a silent no-op. This keeps dev and test environments clean. To enable, add an `audit:` block to `config.yaml`:
+
+```yaml
+audit:
+  log_path: "/var/log/dossier/audit.json"
+  max_bytes: 104857600       # 100 MB per file (optional; this is the default)
+  backup_count: 10           # keep 10 rotated files, ~1 GB ceiling (optional)
+```
+
+On startup, the engine logs one INFO line confirming configuration:
+
+```
+INFO  dossier  Audit log configured: /var/log/dossier/audit.json (rotation: 10 × 104857600 bytes)
+```
+
+If the configured path's directory doesn't exist, the engine logs a warning and continues without audit (emissions become silent no-ops). This is deliberate — the SIEM is out of scope for application dependencies, and we never want a missing audit directory to fail the app. The ops team is responsible for provisioning the directory.
+
+### Host setup (for the ops team)
+
+**Directory:**
+
+```bash
+sudo mkdir -p /var/log/dossier
+sudo chown dossier-app:wazuh /var/log/dossier
+sudo chmod 2750 /var/log/dossier
+```
+
+Group `wazuh` is the group the `wazuh-agent` process runs under; it gets read access via the group bit so it can tail the file. The `2` in `2750` is the setgid bit — new files inherit the group so rotated files stay readable by the agent. The `dossier-app` user is whatever user uvicorn runs as; it gets write.
+
+**Wazuh agent** — add the following block to the agent's `ossec.conf` (typically at `/var/ossec/etc/ossec.conf` inside the `<ossec_config>` root) and restart the agent:
+
+```xml
+<localfile>
+  <log_format>json</log_format>
+  <location>/var/log/dossier/audit.json</location>
+  <label key="@source">dossier_engine</label>
+  <label key="component">audit</label>
+</localfile>
+```
+
+The two `<label>` blocks stamp every event with `@source=dossier_engine` and `component=audit` so the SIEM team can filter cleanly in the Wazuh dashboard. A dashboard KQL query like `@source: dossier_engine AND component: audit AND event_action: dossier.exported` (or `rule.groups: audit` once custom rules are in place) returns every export event across all hosts running the engine.
+
+Restart the agent to pick up the new block:
+
+```bash
+sudo systemctl restart wazuh-agent
+```
+
+Verify the agent sees the file:
+
+```bash
+sudo tail -n 5 /var/ossec/logs/ossec.log | grep -i "audit.json"
+# Expected: "Analyzing file: '/var/log/dossier/audit.json'."
+```
+
+**Custom rules and retention** — the Wazuh server-side rules and retention policy (e.g. "keep audit events for 7 years") are the SIEM team's responsibility, not the application's. Without rules, events reach the manager but are dropped from the alert pipeline (Wazuh indexes only events that trigger a rule) — so the SIEM team needs to write at least a baseline set of rules for the `@source: dossier_engine` stream before anything appears in the dashboard. A starter rule block is in the [Testing locally](#testing-locally) section below; copy, adapt severities to your alert philosophy, drop into `/var/ossec/etc/rules/local_rules.xml`, and restart the manager.
+
+Richer rules (alert on unusual export rates, cross-correlate `dossier.denied` with same actor, etc.) are out of scope for this README — they belong in the SIEM team's rulebook.
+
+### Testing locally
+
+Two levels of local test, from cheapest to most realistic:
+
+**Level 1 — just the file, no Wazuh at all.** Enable the audit block in `config.yaml` with `log_path: "/tmp/dossier_audit/audit.json"`, create the directory (`mkdir -p /tmp/dossier_audit`), start the app, drive a request, and inspect the file with `tail -F /tmp/dossier_audit/audit.json | jq .`. This verifies the application side end-to-end: are events being emitted at the right moments, with the right actor, target, and outcome? Every line should be a complete single-line JSON object that `jq` parses without complaint. 90% of audit bugs are caught at this level.
+
+**Level 2 — local Wazuh agent, no manager.** Install only the agent and point it at your audit file, then use the `wazuh-logtest` replay tool to confirm the agent correctly parses each event shape through its decoder chain. The agent doesn't need to actually forward anywhere; `wazuh-logtest` runs the decoder pipeline locally and prints what would have been sent. On Ubuntu/Debian:
+
+```bash
+curl -sO https://packages.wazuh.com/4.x/apt/pool/main/w/wazuh-agent/wazuh-agent_4.7.0-1_amd64.deb
+sudo WAZUH_MANAGER="localhost" dpkg -i wazuh-agent_*.deb
+sudo systemctl enable --now wazuh-agent
+```
+
+Add the `<localfile>` block from the "Host setup" section above to `/var/ossec/etc/ossec.conf`, create `/var/log/dossier/` with the permissions shown there, and restart the agent. Then:
+
+```bash
+sudo /var/ossec/bin/wazuh-logtest
+# Paste a single NDJSON line from your audit file.
+# Output shows the JSON decoding, extracted fields, and rule matches.
+```
+
+**Level 3 — full Wazuh stack.** Only necessary when you want to see events in the dashboard, build visualizations, or test alert rules. The single-node Docker compose is the fastest path:
+
+```bash
+git clone https://github.com/wazuh/wazuh-docker.git
+cd wazuh-docker/single-node
+docker compose -f generate-indexer-certs.yml run --rm generator
+docker compose up -d
+```
+
+Takes a couple of minutes and a few GB of RAM. Dashboard on `https://localhost:443`, default login `admin` / `SecretPassword` (change immediately). After pointing the agent's `WAZUH_MANAGER` at `127.0.0.1` and restarting it, your audit events reach the manager — but **they will not appear in the dashboard yet**. Two things still need to happen:
+
+1. **Custom rules on the manager.** Wazuh only indexes events that match a rule; unmatched events are silently dropped from the alert pipeline. Drop the rule block below into `/var/ossec/etc/rules/local_rules.xml` on the manager and run `sudo systemctl restart wazuh-manager`:
+
+    ```xml
+    <group name="dossier,audit">
+
+      <rule id="100201" level="3">
+        <decoded_as>json</decoded_as>
+        <field name="component">audit</field>
+        <field name="event_action">dossier.read</field>
+        <description>Dossier read by $(actor.name) on $(target.id)</description>
+      </rule>
+
+      <rule id="100202" level="5">
+        <decoded_as>json</decoded_as>
+        <field name="component">audit</field>
+        <field name="event_action">dossier.exported</field>
+        <description>Dossier exported by $(actor.name): $(target.id)</description>
+      </rule>
+
+      <rule id="100203" level="8">
+        <decoded_as>json</decoded_as>
+        <field name="component">audit</field>
+        <field name="event_action">dossier.denied</field>
+        <description>Dossier access denied: $(actor.name) on $(target.id)</description>
+      </rule>
+
+      <rule id="100204" level="6">
+        <decoded_as>json</decoded_as>
+        <field name="component">audit</field>
+        <field name="event_action">dossier.error</field>
+        <description>Dossier activity error: $(reason)</description>
+      </rule>
+
+      <rule id="100205" level="3">
+        <decoded_as>json</decoded_as>
+        <field name="component">audit</field>
+        <field name="event_action">dossier.created</field>
+        <description>Dossier created by $(actor.name): $(target.id)</description>
+      </rule>
+
+      <rule id="100206" level="3">
+        <decoded_as>json</decoded_as>
+        <field name="component">audit</field>
+        <field name="event_action">dossier.updated</field>
+        <description>Dossier updated by $(actor.name): $(target.id)</description>
+      </rule>
+
+      <rule id="100207" level="4">
+        <decoded_as>json</decoded_as>
+        <field name="component">audit</field>
+        <field name="event_action">worker.task_executed</field>
+        <description>Worker task executed</description>
+      </rule>
+
+    </group>
+    ```
+
+    Each rule is self-contained. Two `<field>` selectors per rule gate the match: `component: audit` (injected by the agent's `<label>` block) identifies the stream, and `event_action` picks the specific event type within it.
+
+    **Don't match on `@source` — it doesn't work reliably.** The `<label key="@source">dossier_engine</label>` value appears in decoded output and in alert JSON, but Wazuh's `<field>` selector can't reliably match on field names starting with `@`. Rules using `<field name="@source">dossier_engine</field>` appear to work for some events but mysteriously fail for others. Match on `component` (plain name) instead. This was verified via `wazuh-logtest` on 4.14.2: identical events where `<field name="@source">` fails, `<field name="component">` matches.
+
+    **Why `event_action` and not `action`?** Wazuh reserves 13 static-field names: `user`, `srcip`, `dstip`, `srcport`, `dstport`, `protocol`, **`action`**, `id`, `url`, `data`, `extra_data`, `status`, `system_name`. Using any of those as top-level JSON keys either fails to match in `<field name="...">` rules, or (for `action` specifically) causes a fatal `Field 'action' is static` rule-load error that prevents `local_rules.xml` from loading at all. The app emits `event_action` to sidestep this.
+
+    **Flat rules, not parent/child.** The more elegant pattern — one parent rule at level 2 matching the stream, child rules via `<if_sid>` matching specific actions — fires inconsistently in practice: identical-shape events chain through for some `event_action` values and silently bypass the parent for others. Flattening each rule into its own complete match spec avoids the issue at the cost of a few repeated lines. Individual child levels are starting points — tune to your SIEM team's alert philosophy. Keep them at level ≥ 3 so they pass Wazuh's default `log_alert_level` threshold.
+
+    To verify a rule matches against a real production event, grab one from `/var/ossec/logs/archives/archives.json` (with archives enabled via `<logall_json>yes</logall_json>` in the manager's `<global>` block), extract the `full_log` string, and pipe it through `wazuh-logtest`:
+
+    ```bash
+    cat > /tmp/test_event.json <<'EOF'
+    {"event_action":"dossier.denied","actor":{"id":"u1","name":"Test"},"target":{"type":"Dossier","id":"d1"},"outcome":"denied","dossier_id":"d1","reason":"no access","@timestamp":"2026-04-16T12:00:00.000000+00:00","@source":"dossier_engine","component":"audit"}
+    EOF
+    cat /tmp/test_event.json | sudo /var/ossec/bin/wazuh-logtest
+    ```
+
+    Phase 3 should show `Rule id: '100203' (level 8)`. Turn archives off afterwards (`<logall_json>no</logall_json>`) — they double indexer storage use.
+
+2. **Find the events in the right dashboard view.** On Wazuh 4.9 and later, the left-hand sidebar has **Explore** (the data-query section) rather than the legacy "Modules" entry. Expand Explore → **Discover** (also shown as "Threat Hunting" or "Events" depending on minor version) to see your audit alerts. Select the `wazuh-alerts-*` index pattern at the top-left, widen the time picker to "Last 24 hours," then filter by `rule.groups: audit` to isolate the dossier-engine stream, or by `event_action: dossier.exported` to narrow further.
+
+**Seeing nothing in Threat Hunting?** Three layers to check, in order:
+
+- `sudo tail /var/ossec/logs/ossec.log | grep audit.json` on the **agent host** — confirms the agent is reading the file. You want a line like `Analyzing file: '/var/log/dossier/audit.json'`.
+- `sudo tail /var/ossec/logs/archives/archives.json` on the **manager** (requires `<logall_json>yes</logall_json>` in the manager's `ossec.conf` `<global>` block) — confirms events are reaching the manager at all, regardless of rules.
+- Only if both of those check out, then it's a rule-matching or indexing issue — check that `wazuh-alerts-*` index exists in Stack Management → Index Patterns, and that your rule IDs don't collide with another file in `/var/ossec/etc/rules/`.
+
+A common pitfall during dev: `> /var/log/dossier/audit.json` truncates the file, which leaves the agent's saved read-position past the new end-of-file. The agent then stops reading until you restart it (`sudo systemctl restart wazuh-agent`). This only happens during manual truncation — the application's `RotatingFileHandler` does proper rotation, which the agent handles correctly.
+
+### Rotation and disk use
+
+At 100 MB × 10 files = 1 GB maximum disk footprint. At a typical load of ~1 KB per event and ~10 events per dossier interaction (create + a few reads + maybe an export), one MB holds roughly 1000 interactions, so a 100 MB file holds ~100 000 interactions. A single rotated file should cover weeks in normal operation.
+
+Rotation is triggered by size, not time. If volume spikes (e.g. a bulk-processing job), rotations accelerate; retention of *all* events ultimately depends on Wazuh consuming from the file faster than it rotates, so the 1 GB ceiling is a soft backpressure signal rather than a hard retention guarantee. Monitoring for rotation frequency in Wazuh lets you catch anomalies before the oldest rotated file gets dropped.
+
+### PII and minimisation
+
+Audit events use UUIDs as identifiers (`actor.id`, `dossier.id`, `target.id`), not applicant names or national register numbers. This keeps the audit log one join away from the PII — queries that need human-readable context dereference through the database at query time, not at write time. The benefit is that subject access requests and data-deletion requests don't require touching the audit log at all; the join target changes, the audit events don't.
+
+`actor.name` is a display-name (typically from JWT claims), not sensitive personal data — it's always a name *the actor chose to present*. If your JWT contains sensitive name data, scrub it before it reaches `emit_audit()`.
+
+### Observability
+
+The audit logger is deliberately isolated from the rest of the logging tree: `propagate = False` on `dossier.audit`. This prevents audit events from bubbling up to the root logger and ending up in stderr, Sentry, or your general log aggregator (which would each have the wrong retention policy and, in Sentry's case, the wrong trust boundary — you don't want audit events triggering alerts or being visible to general developers).
+
+Failures to write to the audit file are swallowed (so the user request never fails because the disk filled), but the underlying `RotatingFileHandler` logs its own warning via the root logger when it can't write, which your standard log pipeline will surface.
+
 ## Data Migrations
 
 The engine includes a framework for one-shot data migrations that operate on existing entity content. Migrations are executed as PROV activities (one `systemAction` per dossier) so the transformation itself is recorded in the provenance graph. The framework is idempotent: once applied to a dossier, a `system:note` entity with the migration UUID is created, and re-running skips that dossier.

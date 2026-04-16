@@ -181,6 +181,28 @@ def register(app: FastAPI, *, registry, get_user, global_access) -> None:
                         "informedBy": str(a.informed_by) if a.informed_by else None,
                     })
 
+            # Audit: successful dossier read. Emitted after all access
+            # checks passed but before the response is serialized, so
+            # a late JSON encoding error wouldn't lose the audit record
+            # of the access attempt.
+            # NOTE: use `dossier_status` (not `status`) in the audit
+            # payload — `status` is one of Wazuh's 13 reserved static
+            # field names and can produce accidental rule matches
+            # against built-in rules that key on the static `status`
+            # slot.
+            from ..audit import emit_audit
+            emit_audit(
+                action="dossier.read",
+                actor_id=user.id,
+                actor_name=user.name,
+                target_type="Dossier",
+                target_id=str(dossier_id),
+                outcome="allowed",
+                dossier_id=str(dossier_id),
+                workflow=dossier.workflow,
+                dossier_status=status,
+            )
+
             return DossierDetailResponse(
                 id=str(dossier_id),
                 workflow=dossier.workflow,
