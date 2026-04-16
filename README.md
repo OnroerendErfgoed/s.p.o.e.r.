@@ -199,7 +199,8 @@ compatible ranges `>=0.1.0,<0.2.0`, the app pins strict `==0.1.0`):
 ✓ relation_validators/ (activity-level relation semantics)
 ✓ validators/ (custom business rules)
 ✓ tasks/ (type 2 recorded task handlers)
-✓ post_activity_hook (search index updates)
+✓ pre_commit_hooks (synchronous validation/side effects, can veto an activity)
+✓ post_activity_hook (search index updates, advisory, exceptions swallowed)
 ✓ search route (/dossiers/toelatingen/search)
 ```
 
@@ -279,6 +280,7 @@ Key concepts:
 - **Idempotent PUTs** — activity IDs are client-generated. Replaying the exact same request returns the cached response body without re-executing. Replaying with different content against an existing ID is a 409.
 - **Append-only with one exception** — activity rows and entity version rows are never updated. The only exception is tombstone: it NULLs the `content` column on tombstoned entity rows in place, leaves the row itself (plus `entity_id`, `schema_version`, timestamps, and `generated_by`), and stamps `tombstoned_by` with the tombstone activity ID. The row survives so the PROV graph keeps its shape; only the blob content is gone.
 - **Schema versioning** — entity types can declare multiple Pydantic models under versioned keys. Activities declare `new_version` (the version stamped on fresh entities) and `allowed_versions` (the versions the activity will accept as revision parents). The engine rejects revisions of entities at disallowed versions with `422 unsupported_schema_version`.
+- **Per-dossier write serialization** — every activity takes a `SELECT ... FOR UPDATE` lock on its dossier row as its first action (in `ensure_dossier`). Concurrent activities against the same dossier execute one after the other, not in parallel. Other dossiers remain fully parallel — the lock is row-level, not table-level. When the second-to-arrive request wakes up after the first commits, it reads fresh state; if its client-supplied `derivedFrom` is now stale (the first request already produced a newer version), the derivation-chain validator rejects with `422 invalid_derivation_chain`. This is the optimistic-concurrency mechanism — no client-side ETag headers, no retry loops, just Postgres row locks at the natural serialization boundary.
 
 ## Task System
 
@@ -415,6 +417,60 @@ ORDER BY (content->>'next_attempt_at')::timestamptz;
 For the full attempt history of a specific task (who failed, when, what error), query Sentry by `task_id:<entity_id>`. The database only stores operational state, not error details.
 
 **Running multiple workers.** On Postgres with `FOR UPDATE OF entities SKIP LOCKED`, concurrent workers are safe by construction. Run as many as your task throughput requires. A sensible starting point is one worker per CPU core for CPU-bound task functions, or a few workers per core for IO-bound ones. All workers connect to the same Postgres instance; no other coordination is needed.
+
+## Plugin Extension Points
+
+A workflow plugin can hook into the activity pipeline at two distinct points. They look superficially similar but have very different contracts — pick deliberately.
+
+### `pre_commit_hooks` (strict, can veto)
+
+A list of callables that run after persistence, side effects, and task scheduling, but before the `cached_status` / `eligible_activities` projection and before the transaction commits. Exceptions raised from a hook **propagate out of the pipeline and roll the activity back**. Hooks run in declaration order; the first raise stops subsequent hooks.
+
+Use for: synchronous validation and mandatory side effects that must succeed or the activity is invalid. Examples: PKI signature verification against an external service before recording that a document was signed; reserving an external ID in another system; enforcing cross-entity invariants that can't be expressed statically in the workflow YAML.
+
+Signature:
+
+```python
+async def my_hook(
+    *, repo, dossier_id, plugin, activity_def,
+    generated_items, used_rows, user,
+) -> None:
+    # Inspect state. Raise ActivityError(code, message) to reject.
+    ...
+```
+
+Registration on the `Plugin` dataclass:
+
+```python
+plugin = Plugin(
+    ...,
+    pre_commit_hooks=[my_hook, another_hook],
+)
+```
+
+### `post_activity_hook` (advisory, best-effort)
+
+A single callable invoked after the cached status is computed. Exceptions are logged as warnings and **swallowed** — a failing hook never fails the activity. Runs inside the same transaction, so writes the hook performs are atomic with the activity, but a crash in the hook doesn't undo the activity itself.
+
+Use for: search index updates, cache invalidation, metrics emission, outbound notifications where "best-effort" is acceptable. Examples: pushing a denormalized document to Elasticsearch, nudging a downstream webhook subscriber.
+
+Signature:
+
+```python
+async def my_hook(
+    repo, dossier_id, activity_type, status, entities,
+) -> None:
+    ...
+```
+
+### Choosing between them
+
+The question to ask: **if this hook fails, should the user see their activity succeeded or failed?**
+
+* "The activity must not proceed if this step can't complete" → `pre_commit_hooks`
+* "The activity succeeded; any downstream propagation is a separate concern" → `post_activity_hook`
+
+A flaky search index should not block users from submitting forms. A failed mandatory signature verification should.
 
 ## Dossier Archive (PDF/A-3b)
 

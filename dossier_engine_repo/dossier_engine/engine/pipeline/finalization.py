@@ -36,6 +36,39 @@ from .status import derive_status
 _log = logging.getLogger("dossier.engine")
 
 
+async def run_pre_commit_hooks(state: ActivityState) -> None:
+    """Run plugin-declared synchronous pre-commit hooks.
+
+    Unlike `post_activity_hook` (whose exceptions are logged and
+    swallowed), these hooks have veto power: a raised exception
+    propagates out of the pipeline and rolls the entire activity
+    back. Use for validation and mandatory side effects that must
+    succeed or the activity is invalid.
+
+    Hooks run in declaration order; the first raise aborts the chain.
+
+    Reads:  state.plugin.pre_commit_hooks, state.repo, state.dossier_id,
+            state.plugin, state.activity_def, state.generated,
+            state.used_rows, state.user
+    Writes: nothing directly (hooks may call state.repo themselves)
+    Raises: whatever the hook raises (typically ActivityError)
+    """
+    hooks = getattr(state.plugin, "pre_commit_hooks", None) or []
+    if not hooks:
+        return
+
+    for hook in hooks:
+        await hook(
+            repo=state.repo,
+            dossier_id=state.dossier_id,
+            plugin=state.plugin,
+            activity_def=state.activity_def,
+            generated_items=state.generated,
+            used_rows=state.used_rows_by_ref,
+            user=state.user,
+        )
+
+
 def determine_status(state: ActivityState) -> None:
     """Resolve the activity's contribution to dossier status and
     stamp it on the activity row.

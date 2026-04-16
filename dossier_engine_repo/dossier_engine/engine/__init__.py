@@ -37,6 +37,7 @@ from .pipeline.finalization import (
     build_full_response,
     determine_status,
     finalize_dossier,
+    run_pre_commit_hooks,
 )
 from .pipeline.handlers import run_handler
 from .pipeline.invariants import enforce_used_generated_disjoint
@@ -223,6 +224,13 @@ async def execute_activity(
     # includes the activity we just ran. Anchor-scoped: only cancels
     # if this activity actually advanced the anchored entity.
     await cancel_matching_tasks(state)
+
+    # Plugin-declared synchronous pre-commit hooks. These run AFTER
+    # persistence, side effects, and task scheduling but BEFORE the
+    # cached_status projection and the transaction commit. Exceptions
+    # roll back the whole activity — use for validation / side effects
+    # that must succeed or the activity is invalid.
+    await run_pre_commit_hooks(state)
 
     # Finalization: derive current dossier status, run post-activity
     # hook, cache status + eligible activities on the dossier row,

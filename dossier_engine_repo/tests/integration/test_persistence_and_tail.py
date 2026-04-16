@@ -35,6 +35,7 @@ from dossier_engine.engine.pipeline.eligibility import (
 )
 from dossier_engine.engine.pipeline.finalization import (
     determine_status, finalize_dossier, build_full_response,
+    run_pre_commit_hooks,
 )
 from dossier_engine.engine.pipeline.persistence import (
     create_activity_row, persist_outputs,
@@ -841,6 +842,126 @@ class TestFinalizeDossier:
 
         # No exception raised by finalize itself.
         await finalize_dossier(state)
+
+
+# --------------------------------------------------------------------
+# run_pre_commit_hooks
+# --------------------------------------------------------------------
+
+
+class TestRunPreCommitHooks:
+    """Pre-commit hooks are the strict counterpart of post_activity_hook.
+    Unlike post_activity_hook, whose exceptions are logged and swallowed,
+    pre-commit hooks propagate exceptions so the engine can roll back
+    the transaction. Use them for mandatory validation/side effects."""
+
+    async def test_no_hooks_is_noop(self, repo):
+        """Plugin with no pre_commit_hooks → phase returns silently.
+        This is the default and must stay a pure no-op so nothing
+        regresses for existing plugins."""
+        plugin = _EligibilityPlugin([])
+        # Default Plugin would have pre_commit_hooks=[]; the stub
+        # doesn't declare it, which also must be tolerated (getattr
+        # with default).
+        state = _state(repo, plugin=plugin)
+
+        await run_pre_commit_hooks(state)  # must not raise
+
+    async def test_empty_list_is_noop(self, repo):
+        """Explicit empty list also behaves as no-op."""
+        plugin = _EligibilityPlugin([])
+        plugin.pre_commit_hooks = []
+        state = _state(repo, plugin=plugin)
+
+        await run_pre_commit_hooks(state)
+
+    async def test_single_hook_invoked_with_kwargs(self, repo):
+        """A declared hook is called once, receiving the expected
+        keyword arguments (repo, dossier_id, plugin, activity_def,
+        generated_items, used_rows, user)."""
+        await repo.create_dossier(D1, "toelatingen")
+
+        calls = []
+        async def hook(**kwargs):
+            calls.append(kwargs)
+
+        plugin = _EligibilityPlugin([])
+        plugin.pre_commit_hooks = [hook]
+        state = _state(
+            repo,
+            plugin=plugin,
+            activity_def={"name": "test"},
+        )
+
+        await run_pre_commit_hooks(state)
+
+        assert len(calls) == 1
+        kw = calls[0]
+        assert kw["repo"] is repo
+        assert kw["dossier_id"] == D1
+        assert kw["plugin"] is plugin
+        assert kw["activity_def"] == {"name": "test"}
+        # generated_items / used_rows / user keys are present
+        assert "generated_items" in kw
+        assert "used_rows" in kw
+        assert "user" in kw
+
+    async def test_hook_exception_propagates(self, repo):
+        """Unlike post_activity_hook, pre-commit exceptions escape —
+        this is the whole point. The caller (execute_activity) is
+        inside a transaction; letting the exception bubble up is
+        what rolls back the activity."""
+        await repo.create_dossier(D1, "toelatingen")
+
+        async def hook(**kwargs):
+            raise RuntimeError("veto")
+
+        plugin = _EligibilityPlugin([])
+        plugin.pre_commit_hooks = [hook]
+        state = _state(repo, plugin=plugin)
+
+        with pytest.raises(RuntimeError, match="veto"):
+            await run_pre_commit_hooks(state)
+
+    async def test_hooks_run_in_declaration_order(self, repo):
+        """Multiple hooks run in the order they're declared.
+        Important for hooks that logically depend on each other."""
+        await repo.create_dossier(D1, "toelatingen")
+
+        order = []
+        async def hook_a(**kwargs): order.append("a")
+        async def hook_b(**kwargs): order.append("b")
+        async def hook_c(**kwargs): order.append("c")
+
+        plugin = _EligibilityPlugin([])
+        plugin.pre_commit_hooks = [hook_a, hook_b, hook_c]
+        state = _state(repo, plugin=plugin)
+
+        await run_pre_commit_hooks(state)
+
+        assert order == ["a", "b", "c"]
+
+    async def test_first_raise_stops_subsequent_hooks(self, repo):
+        """When a hook raises, later hooks in the chain DON'T run.
+        This mirrors a normal Python function — there's no 'all
+        hooks must get a chance' semantics. First veto wins."""
+        await repo.create_dossier(D1, "toelatingen")
+
+        ran = []
+        async def hook_a(**kwargs): ran.append("a")
+        async def hook_b(**kwargs):
+            ran.append("b")
+            raise RuntimeError("veto")
+        async def hook_c(**kwargs): ran.append("c")
+
+        plugin = _EligibilityPlugin([])
+        plugin.pre_commit_hooks = [hook_a, hook_b, hook_c]
+        state = _state(repo, plugin=plugin)
+
+        with pytest.raises(RuntimeError):
+            await run_pre_commit_hooks(state)
+
+        assert ran == ["a", "b"], f"hook_c must not run after hook_b raised, got {ran}"
 
 
 # --------------------------------------------------------------------

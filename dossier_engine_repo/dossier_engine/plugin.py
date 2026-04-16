@@ -176,6 +176,22 @@ class Plugin:
     # Use to update Elasticsearch indices.
     post_activity_hook: Callable | None = None
 
+    # Called after persistence but BEFORE the cached_status / eligible_activities
+    # projection and BEFORE transaction commit. Unlike post_activity_hook,
+    # exceptions raised here are NOT swallowed — they propagate and roll the
+    # whole activity back. Use for synchronous validation / side effects that
+    # MUST succeed or the activity should be rejected: PKI signature checks,
+    # external ID reservations, mandatory file service operations, etc.
+    #
+    # Signature:
+    #   async def hook(*, repo, dossier_id, plugin, activity_def,
+    #                     generated_items, used_rows, user) -> None
+    #
+    # Hooks run in declaration order. First raise wins — subsequent hooks
+    # don't run. Raise ActivityError for structured HTTP responses; any other
+    # exception becomes a 500.
+    pre_commit_hooks: list[Callable] = field(default_factory=list)
+
     # Called during route registration. Receives (app, get_user) and should
     # register workflow-specific search endpoints like /dossiers/{workflow_name}/...
     search_route_factory: Callable | None = None
