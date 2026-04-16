@@ -573,17 +573,19 @@ Fields:
 
 ### Action vocabulary
 
-| Action | Emitted when | Typical outcome |
-|---|---|---|
-| `dossier.created` | Root activity (e.g. `dienAanvraagIn`) commits successfully | `allowed` |
-| `dossier.updated` | Any subsequent activity commits successfully | `allowed` |
-| `dossier.read` | `GET /dossiers/{id}` or `GET /dossiers/{id}/prov` serves a response | `allowed` |
-| `dossier.searched` | Search query executes | `allowed` |
-| `dossier.exported` | `GET /dossiers/{id}/archive` produces a PDF/A | `allowed` |
-| `dossier.file_accessed` | Bijlage download served | `allowed` |
-| `dossier.denied` | Authorization refused an action (read or write) | `denied` |
-| `dossier.error` | Validation or pipeline failure | `error` |
-| `worker.task_executed` | Worker completes or dead-letters a task | `allowed` / `error` |
+| Action | Emitted when | Typical outcome | Status |
+|---|---|---|---|
+| `dossier.created` | Entry-point activity (an activity with `can_create_dossier: true`, e.g. `dienAanvraagIn`) commits successfully | `allowed` | wired |
+| `dossier.updated` | Any subsequent activity commits successfully | `allowed` | wired |
+| `dossier.read` | `GET /dossiers/{id}` serves a response | `allowed` | wired |
+| `dossier.exported` | `GET /dossiers/{id}/archive` produces a PDF/A | `allowed` | wired |
+| `dossier.denied` | Authorization refused an action (read access check or write-side `ActivityError(403)`) | `denied` | wired |
+| `dossier.searched` | Search query executes | `allowed` | reserved — not yet emitted; the current `/dossiers` list endpoint is a stub, real search belongs to future workflow-specific endpoints |
+| `dossier.file_accessed` | Bijlage download served | `allowed` | reserved — not yet emitted; downloads are handled by the `file_service`, which would need its own audit emission |
+
+Non-authorization errors (validation failures, business-rule violations, 422/400 responses) are deliberately *not* in the vocabulary. Those belong in the application log and Sentry, not the SIEM audit trail — security teams care about *what actors did*, not *which form fields failed validation*. If a pattern of validation failures turns out to be security-relevant later (e.g. someone probing for working field combinations), Sentry's rate-and-pattern tooling is the right place to notice.
+
+Worker task execution is similarly not in the vocabulary. Task lifecycle is internal to the engine (retries, dead-lettering) and belongs in the operational monitoring stream (Sentry + metrics), not the audit trail. Every worker-driven action that has security meaning already produces an audit event via the standard `dossier.created` / `dossier.updated` path — because the worker uses the same `execute_activity` code path as user-initiated writes.
 
 ### Enabling in the application
 
@@ -705,13 +707,6 @@ Takes a couple of minutes and a few GB of RAM. Dashboard on `https://localhost:4
         <description>Dossier access denied: $(actor.name) on $(target.id)</description>
       </rule>
 
-      <rule id="100204" level="6">
-        <decoded_as>json</decoded_as>
-        <field name="component">audit</field>
-        <field name="event_action">dossier.error</field>
-        <description>Dossier activity error: $(reason)</description>
-      </rule>
-
       <rule id="100205" level="3">
         <decoded_as>json</decoded_as>
         <field name="component">audit</field>
@@ -724,13 +719,6 @@ Takes a couple of minutes and a few GB of RAM. Dashboard on `https://localhost:4
         <field name="component">audit</field>
         <field name="event_action">dossier.updated</field>
         <description>Dossier updated by $(actor.name): $(target.id)</description>
-      </rule>
-
-      <rule id="100207" level="4">
-        <decoded_as>json</decoded_as>
-        <field name="component">audit</field>
-        <field name="event_action">worker.task_executed</field>
-        <description>Worker task executed</description>
       </rule>
 
     </group>

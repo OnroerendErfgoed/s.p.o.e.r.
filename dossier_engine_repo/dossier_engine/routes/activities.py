@@ -312,14 +312,19 @@ async def _run_activity(
     Also the chokepoint for audit emission on writes: every activity
     execution emits exactly one audit event here. The two success
     actions (`dossier.created` for root, `dossier.updated` otherwise)
-    differ by whether the activity is marked as root in its YAML
-    definition — `root: True` means it creates the dossier row. On
-    `ActivityError`, we emit `dossier.error` with the validator's
-    reason so SIEM can correlate failed write attempts to users.
+    differ by whether the activity is marked as dossier-creating in
+    its workflow YAML — `can_create_dossier: true` means it's the
+    entry-point activity that spawns a new dossier row (e.g.
+    `dienAanvraagIn`). On authorization denial (`ActivityError` with
+    code 403), we emit `dossier.denied` so SIEM sees both read-side
+    denials (from `routes/access.py`) and write-side denials (from
+    here) in one stream. Non-authorization errors (validation, 422,
+    etc.) are not audited — those belong in the application log /
+    Sentry, not the SIEM audit trail.
     """
     from ..audit import emit_audit
 
-    is_root = bool(act_def.get("root"))
+    is_root = bool(act_def.get("can_create_dossier"))
     action = "dossier.created" if is_root else "dossier.updated"
 
     try:
@@ -338,13 +343,12 @@ async def _run_activity(
             informed_by=informed_by,
         )
     except ActivityError as e:
-        # Classify the failure. 403 is an authorization denial —
-        # semantically distinct from validation/business-rule errors
-        # (422, 400, etc.) and emitted with outcome=denied so SIEM
-        # rules for "who's being turned away" work correctly. Everything
-        # else is a generic `dossier.error` with outcome=error.
+        # Write-side authorization denial: emit dossier.denied so this
+        # shows up in the SIEM stream alongside read-side denials from
+        # routes/access.py. Non-403 errors (validation, business rule
+        # violations) are NOT audited — those are app-level concerns,
+        # not security events.
         code = getattr(e, 'code', None)
-        message = getattr(e, 'message', str(e))
         if code == 403:
             emit_audit(
                 action="dossier.denied",
@@ -354,20 +358,7 @@ async def _run_activity(
                 target_id=str(dossier_id),
                 outcome="denied",
                 dossier_id=str(dossier_id),
-                reason=message,
-                activity_type=act_def.get("name"),
-                activity_id=str(activity_id),
-            )
-        else:
-            emit_audit(
-                action="dossier.error",
-                actor_id=user.id,
-                actor_name=user.name,
-                target_type="Dossier",
-                target_id=str(dossier_id),
-                outcome="error",
-                dossier_id=str(dossier_id),
-                reason=f"{code or 'unknown'}: {message}",
+                reason=getattr(e, 'message', str(e)),
                 activity_type=act_def.get("name"),
                 activity_id=str(activity_id),
             )
