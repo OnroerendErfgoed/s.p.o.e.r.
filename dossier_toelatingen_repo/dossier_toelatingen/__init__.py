@@ -26,6 +26,7 @@ from dossier_engine.plugin import (
 from .handlers import HANDLERS
 from .validators import VALIDATORS
 from .relation_validators import RELATION_VALIDATORS
+from .field_validators import FIELD_VALIDATORS
 from .tasks import TASK_HANDLERS
 
 logger = logging.getLogger("toelatingen.index")
@@ -136,6 +137,7 @@ def create_plugin() -> Plugin:
         handlers=HANDLERS,
         validators=VALIDATORS,
         relation_validators=RELATION_VALIDATORS,
+        field_validators=FIELD_VALIDATORS,
         task_handlers=TASK_HANDLERS,
         post_activity_hook=update_search_index,
         search_route_factory=register_search_routes,

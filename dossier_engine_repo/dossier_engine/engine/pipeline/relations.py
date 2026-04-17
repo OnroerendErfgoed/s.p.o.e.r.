@@ -282,10 +282,70 @@ async def _parse_remove_relations(
 # Validator dispatch
 # =====================================================================
 
+def _resolve_validator(
+    plugin: Plugin, activity_def: dict, rel_type: str, operation: str,
+):
+    """Find the validator callable for a relation type + operation.
+
+    Lookup order:
+    1. Activity-level YAML ``validators:`` dict with per-operation
+       keys (``add`` / ``remove``). This is the new style::
+
+           relations:
+             - type: "oe:betreft"
+               kind: domain
+               validators:
+                 add: "validate_betreft_target"
+                 remove: "validate_betreft_removable"
+
+    2. Activity-level YAML ``validator:`` string (legacy shorthand,
+       fires for all operations)::
+
+           relations:
+             - type: "oe:betreft"
+               validator: "validate_betreft_target"
+
+    3. Plugin-level ``relation_validators[rel_type]`` (the original
+       process-control pattern, fires for all operations).
+
+    Returns None if no validator is registered at any level.
+    """
+    decls = _relation_declarations(activity_def)
+    decl = decls.get(rel_type, {})
+
+    # Style 1: per-operation validators dict.
+    validators_dict = decl.get("validators")
+    if isinstance(validators_dict, dict):
+        validator_name = validators_dict.get(operation)
+        if validator_name:
+            fn = plugin.relation_validators.get(validator_name)
+            if fn:
+                return fn
+
+    # Style 2: single validator string on the declaration.
+    validator_name = decl.get("validator")
+    if validator_name:
+        fn = plugin.relation_validators.get(validator_name)
+        if fn:
+            return fn
+
+    # Style 3: plugin-level by relation type name.
+    return plugin.relation_validators.get(rel_type)
+
+
 async def _dispatch_validators(
     state: ActivityState, allowed: set[str],
 ) -> None:
-    """Invoke registered validators for activity-level opt-in types."""
+    """Invoke registered validators for activity-level opt-in types.
+
+    For domain relations, validators are resolved per-operation:
+    add-entries use the ``add`` validator, remove-entries use the
+    ``remove`` validator. If no per-operation validator is declared,
+    falls back to the type-level validator.
+
+    For process-control relations (which are always adds), the
+    type-level validator fires as before.
+    """
     activity_level_types = set(
         _relation_declarations(state.activity_def).keys()
     )
@@ -304,17 +364,42 @@ async def _dispatch_validators(
                 },
             )
 
-        validator = state.plugin.relation_validators.get(rel_type)
-        if validator is None:
-            continue
+        # Collect add-entries (from relations_by_type) and
+        # remove-entries (from validated_remove_relations).
+        add_entries = state.relations_by_type.get(rel_type, [])
+        remove_entries = [
+            r for r in state.validated_remove_relations
+            if r["relation_type"] == rel_type
+        ]
 
-        entries = state.relations_by_type.get(rel_type, [])
-        await validator(
-            plugin=state.plugin,
-            repo=state.repo,
-            dossier_id=state.dossier_id,
-            activity_def=state.activity_def,
-            entries=entries,
-            used_rows_by_ref=state.used_rows_by_ref,
-            generated_items=state.generated,
+        # Dispatch add validator. Fires even with empty entries —
+        # the validator may enforce "at least one relation required."
+        add_validator = _resolve_validator(
+            state.plugin, state.activity_def, rel_type, "add",
         )
+        if add_validator:
+            await add_validator(
+                plugin=state.plugin,
+                repo=state.repo,
+                dossier_id=state.dossier_id,
+                activity_def=state.activity_def,
+                entries=add_entries,
+                used_rows_by_ref=state.used_rows_by_ref,
+                generated_items=state.generated,
+            )
+
+        # Dispatch remove validator.
+        if remove_entries:
+            remove_validator = _resolve_validator(
+                state.plugin, state.activity_def, rel_type, "remove",
+            )
+            if remove_validator:
+                await remove_validator(
+                    plugin=state.plugin,
+                    repo=state.repo,
+                    dossier_id=state.dossier_id,
+                    activity_def=state.activity_def,
+                    entries=remove_entries,
+                    used_rows_by_ref=state.used_rows_by_ref,
+                    generated_items=state.generated,
+                )

@@ -30,6 +30,7 @@ from . import activities as _activities_routes
 from . import dossiers as _dossiers_routes
 from . import entities as _entities_routes
 from . import files as _files_routes
+from . import reference as _reference_routes
 
 # Back-compat re-exports — leaf module symbols under the names the
 # pre-Stage-6 monolith used. New code should import from the leaf
@@ -88,6 +89,11 @@ def register_routes(
         global_access=global_access,
     )
     _files_routes.register(app, get_user=get_user)
+
+    _reference_routes.register(
+        app,
+        registry=registry,
+    )
 
     # Per-plugin search route factories (Elasticsearch-backed search
     # endpoints declared by individual workflow plugins).

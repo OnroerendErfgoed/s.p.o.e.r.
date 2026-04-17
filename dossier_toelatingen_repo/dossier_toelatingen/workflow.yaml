@@ -124,6 +124,65 @@ authorization:
 tombstone:
   allowed_roles: ["beheerder"]
 
+# Static reference data served via GET /{workflow}/reference/{list_name}.
+# Loaded into memory at startup, sub-millisecond response, no DB hit.
+reference_data:
+
+  bijlagetypes:
+    - key: "detailplan"
+      label: "Detailplan"
+    - key: "foto"
+      label: "Foto"
+    - key: "inplantingsplan"
+      label: "Inplantingsplan"
+    - key: "motivatienota"
+      label: "Motivatienota"
+    - key: "vergunning"
+      label: "Vergunning eerder verleend"
+    - key: "overig"
+      label: "Overig"
+
+  handelingen:
+    - key: "renovatie"
+      label: "Renovatie"
+    - key: "restauratie"
+      label: "Restauratie"
+    - key: "sloop_deel"
+      label: "Gedeeltelijke sloop"
+    - key: "sloop_volledig"
+      label: "Volledige sloop"
+    - key: "nieuwbouw"
+      label: "Nieuwbouw in beschermd gebied"
+    - key: "herbestemming"
+      label: "Herbestemming"
+    - key: "onderhoud"
+      label: "Onderhoud en instandhouding"
+
+  beslissingstypes:
+    - key: "goedgekeurd"
+      label: "Goedgekeurd"
+    - key: "goedgekeurd_voorwaarden"
+      label: "Goedgekeurd met voorwaarden"
+    - key: "afgekeurd"
+      label: "Afgekeurd"
+
+  gemeenten:
+    - key: "brugge"
+      label: "Brugge"
+      nis_code: "31005"
+    - key: "gent"
+      label: "Gent"
+      nis_code: "44021"
+    - key: "antwerpen"
+      label: "Antwerpen"
+      nis_code: "11002"
+    - key: "leuven"
+      label: "Leuven"
+      nis_code: "24062"
+    - key: "mechelen"
+      label: "Mechelen"
+      nis_code: "12025"
+
 # Workflow-wide PROV-extension relations. Any activity in this workflow may
 # emit these on its request body unless it overrides the list with its own
 # `relations:` block. Each entry declares a relation type and the plugin

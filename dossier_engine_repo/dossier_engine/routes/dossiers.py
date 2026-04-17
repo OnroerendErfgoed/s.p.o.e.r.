@@ -239,12 +239,8 @@ def register(app: FastAPI, *, registry, get_user, global_access) -> None:
     @app.get(
         "/dossiers",
         tags=["dossiers"],
-        summary="List dossiers (stub)",
-        description=(
-            "Basic dossier listing. For production, use the workflow-"
-            "specific search endpoints (e.g. /dossiers/toelatingen/search) "
-            "which query Elasticsearch."
-        ),
+        summary="List dossiers (cross-workflow)",
+        description="List dossiers across all workflows.",
     )
     async def list_dossiers(
         workflow: Optional[str] = None,
@@ -257,6 +253,37 @@ def register(app: FastAPI, *, registry, get_user, global_access) -> None:
                 query = query.where(DossierRow.workflow == workflow)
             query = query.order_by(DossierRow.created_at.desc()).limit(100)
 
+            result = await session.execute(query)
+            dossiers = list(result.scalars().all())
+
+            items = [
+                {
+                    "id": str(d.id),
+                    "workflow": d.workflow,
+                    "createdAt": d.created_at.isoformat() if d.created_at else None,
+                }
+                for d in dossiers
+            ]
+            return {"dossiers": items}
+
+    @app.get(
+        "/{workflow}/dossiers",
+        tags=["dossiers"],
+        summary="List dossiers (workflow-scoped)",
+        description="List and search dossiers within a specific workflow.",
+    )
+    async def list_dossiers_scoped(
+        workflow: str,
+        user: User = Depends(get_user),
+    ):
+        session_factory = get_session_factory()
+        async with session_factory() as session, session.begin():
+            query = (
+                select(DossierRow)
+                .where(DossierRow.workflow == workflow)
+                .order_by(DossierRow.created_at.desc())
+                .limit(100)
+            )
             result = await session.execute(query)
             dossiers = list(result.scalars().all())
 

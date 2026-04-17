@@ -583,7 +583,7 @@ class TestPutActivityTypedWrapper:
         aanvraag_ref, _, _ = _new_ref("oe:aanvraag")
 
         r = await activity_client.put(
-            f"/dossiers/{D1}/activities/{activity_id}/createStuff",
+            f"/testwf/dossiers/{D1}/activities/{activity_id}/createStuff",
             json={
                 # No "type" field — the URL carries it
                 "generated": [
@@ -606,7 +606,7 @@ class TestPutActivityTypedWrapper:
         exists AND the auth check fires."""
         await _commit(repo)
         r = await activity_client.put(
-            f"/dossiers/{D1}/activities/{uuid4()}/systemAction",
+            f"/testwf/dossiers/{D1}/activities/{uuid4()}/systemAction",
             json={},
             headers={"X-POC-User": "aanvrager"},
         )

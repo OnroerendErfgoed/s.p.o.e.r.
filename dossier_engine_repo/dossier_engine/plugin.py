@@ -171,6 +171,16 @@ class Plugin:
     #                       entries, used_rows_by_ref, generated_items) -> None
     relation_validators: dict[str, Callable] = field(default_factory=dict)
 
+    # Lightweight field-level validators callable between activities
+    # via POST /{workflow}/validate/{name}. Each validator is an async
+    # callable that receives the request body (dict) and returns a
+    # result dict. Used for checks that need server-side logic
+    # (URI resolution, cross-field rules) but shouldn't wait until
+    # activity submission. Signature:
+    #   async def validator(body: dict) -> dict
+    # Return {"valid": True, ...} or {"valid": False, "error": "..."}.
+    field_validators: dict[str, Callable] = field(default_factory=dict)
+
     # Called after each activity completes (inside the transaction).
     # Signature: async def hook(repo, dossier_id, activity_type, status, entities) -> None
     # Use to update Elasticsearch indices.
