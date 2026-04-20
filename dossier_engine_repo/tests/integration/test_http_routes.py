@@ -226,8 +226,14 @@ class TestAuthHeader:
 
 
 class TestListDossiers:
+    """/dossiers reads from the dossiers-common Elasticsearch index.
+    When ES isn't configured (the test setup here), the endpoint
+    returns 200 with an empty list and a `reason` field — dossiers
+    existing in Postgres don't leak through without an index."""
 
-    async def test_returns_all_dossiers(self, client, repo):
+    async def test_returns_empty_when_es_not_configured(self, client, repo):
+        """ES isn't set up in tests → empty result regardless of
+        what Postgres holds. The reason field explains why."""
         await _bootstrap_dossier(repo, D1, "test")
         await _bootstrap_dossier(repo, D2, "test")
         await _commit(repo)
@@ -236,12 +242,13 @@ class TestListDossiers:
         assert r.status_code == 200
         body = r.json()
         assert "dossiers" in body
-        assert len(body["dossiers"]) == 2
-        ids = {d["id"] for d in body["dossiers"]}
-        assert str(D1) in ids
-        assert str(D2) in ids
+        assert body["dossiers"] == []
+        assert body["total"] == 0
+        assert "reason" in body
+        assert "not configured" in body["reason"].lower()
 
-    async def test_workflow_filter(self, client, repo):
+    async def test_workflow_filter_same_empty_behavior(self, client, repo):
+        """Even with a workflow filter, no ES means no hits."""
         await _bootstrap_dossier(repo, D1, "test")
         await _bootstrap_dossier(repo, D2, "other")
         await _commit(repo)
@@ -252,8 +259,7 @@ class TestListDossiers:
         )
         assert r.status_code == 200
         body = r.json()
-        assert len(body["dossiers"]) == 1
-        assert body["dossiers"][0]["id"] == str(D2)
+        assert body["dossiers"] == []
 
     async def test_empty_list_when_no_dossiers(self, client, repo):
         await _commit(repo)

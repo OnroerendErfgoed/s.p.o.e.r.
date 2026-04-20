@@ -51,6 +51,61 @@ version: "1.0"                    # version of this workflow definition
 
 ---
 
+## Namespaces (IRI vocabularies this workflow uses)
+
+```yaml
+# Declare any external RDF vocabularies your workflow's entity types,
+# relations, or PROV annotations reference. The engine's namespace
+# registry uses this to emit correct PROV-JSON prefixes and to fail
+# fast at plugin load if any declared entity type uses an undeclared
+# prefix.
+#
+# Built-in prefixes are always available and don't need declaration:
+#   prov, xsd, rdf, rdfs
+# Your plugin's own prefix is registered automatically from
+# config.yaml's iri_base.ontology.
+#
+# Adopt external vocabularies here if you need to reference them
+# (e.g. FOAF for agents, Dublin Core for bibliographic entities):
+#
+# namespaces:
+#   foaf: "http://xmlns.com/foaf/0.1/"
+#   dcterms: "http://purl.org/dc/terms/"
+#   skos: "http://www.w3.org/2004/02/skos/core#"
+```
+
+Using an entity type like `foaf:Person` means your plugin *stores* `foaf:Person` instances — you own the data. Linking to instances that live elsewhere is a different thing: those are external URIs (`{"entity": "http://example.org/agents/bob"}`).
+
+---
+
+## Workflow Constants (typed config with env-var override)
+
+```yaml
+# Plugin-scoped constants accessible as context.constants in handlers
+# and plugin.constants in hooks/factories/validators. Declare a
+# Pydantic BaseSettings class in your plugin (see dossier_toelatingen/
+# constants.py), then optionally override its defaults here.
+#
+# Precedence (highest wins):
+#   1. Environment variables (DOSSIER_{WORKFLOW_NAME}_...) — operator
+#      escape hatch and the only acceptable place for secrets
+#   2. This block — domain-level tuning that's committable
+#   3. Class defaults in the Pydantic class
+#
+# Secrets (API keys, signing keys) should ONLY come from env vars.
+# Never commit them to workflow.yaml.
+#
+# constants:
+#   values:
+#     aanvraag_deadline_days: 45      # overrides class default of 30
+#     max_bijlagen_per_aanvraag: 30
+#     # external_api_key: NEVER — use env vars for secrets
+```
+
+Your plugin's `create_plugin()` instantiates the constants class with these YAML values as kwargs. Environment variables win over both layers via Pydantic's `BaseSettings` mechanism. Frozen after load — no runtime mutation.
+
+---
+
 ## Roles
 
 ```yaml
@@ -240,6 +295,45 @@ activities:
     #       aanvraag = context.get_used_entity("oe:aanvraag")
     #       return HandlerResult(content={"organisatie": "..."}, status="ingediend")
 
+    # --- Split-style hooks (optional, alternative to returning
+    # status/tasks from the handler) ---
+    #
+    # Activities with a lot of status-decision or task-scheduling
+    # logic can lift those concerns out of the handler into
+    # dedicated, single-responsibility functions referenced by name
+    # in YAML. The handler is then free to just compute content.
+    #
+    # The engine enforces "exactly one source per concern": declaring
+    # a status_resolver forbids the handler from returning status;
+    # declaring task_builders forbids the handler from returning
+    # tasks. If both are set the activity execution fails with a
+    # clear 500.
+    #
+    # status_resolver: "resolve_beslissing_status"
+    # task_builders:
+    #   - "schedule_trekAanvraag_if_onvolledig"
+    #   - "send_ontvangstbevestiging"
+    #
+    # In the plugin:
+    #   async def resolve_beslissing_status(ctx: ActivityContext) -> str | None:
+    #       beslissing = ctx.get_typed("oe:beslissing")
+    #       return "toelating_verleend" if beslissing.beslissing == "goedgekeurd" else None
+    #
+    #   async def schedule_trekAanvraag_if_onvolledig(ctx: ActivityContext) -> list[dict]:
+    #       beslissing = ctx.get_typed("oe:beslissing")
+    #       if not beslissing or beslissing.beslissing != "onvolledig":
+    #           return []
+    #       return [{"kind": "scheduled_activity", "target_activity": "trekAanvraagIn",
+    #                "scheduled_for": "+30d", "cancel_if_activities": ["vervolledigAanvraag"]}]
+    #
+    # Register them on the Plugin alongside handlers:
+    #   Plugin(..., handlers=HANDLERS,
+    #          status_resolvers=STATUS_RESOLVERS,
+    #          task_builders=TASK_BUILDERS)
+    #
+    # See docs/plugin_guidebook.md "Split-style hooks" for decision
+    # criteria (when to split vs keep a monolithic handler).
+
     # --- Authorization ---
     authorization:
       access: ""                  # "everyone", "authenticated", "roles"
@@ -406,14 +500,28 @@ activities:
 
       # --- Type 3: Scheduled activity (same dossier) ---
       # Worker executes the target activity at the scheduled time.
-      # scheduled_for can be a static ISO datetime or resolved from an entity field.
-      # cancel_if_activities: list of activity types that cancel this task if they
-      # occur after the task was created.
+      #
+      # scheduled_for accepts two forms:
+      #   * Relative offset: "+Nd" / "+Nh" / "+Nm" / "+Nw" (resolved
+      #     against the activity's start time). Good for "N days after
+      #     the triggering activity" cases.
+      #   * Absolute ISO 8601: "2026-05-01T00:00:00Z". Good for fixed
+      #     wall-clock times (calibration dates, regulatory cutoffs).
+      #
+      # YAML cannot read entity fields — there is no templating. For
+      # dynamic deadlines that depend on entity content or runtime
+      # config, compute the ISO string in a handler and return it in
+      # HandlerResult.tasks (see "Conditional Task Queueing from
+      # Handlers" below and dossier_toelatingen's handle_beslissing
+      # for a worked example using context.constants).
+      #
+      # cancel_if_activities: activity types that cancel this task if
+      # they occur after the task was created.
       # PROV: activity → task (scheduled) → target_activity (wasInformedBy original)
       #       → completeTask (wasInformedBy target_activity) → task (completed)
       - kind: "scheduled_activity"
         target_activity: "trekAanvraagIn"
-        scheduled_for: "2026-05-01T00:00:00Z"    # or resolved dynamically
+        scheduled_for: "+30d"           # 30 days from activity start
         cancel_if_activities: ["vervolledigAanvraag", "bewerkAanvraag"]
         allow_multiple: false
 
@@ -429,31 +537,13 @@ activities:
         target_activity: "ontvangMelding"
         allow_multiple: true
 
-    # --- Conditional tasks in YAML ---
-    # You can make YAML tasks conditional on entity content using the
-    # `condition` field. The engine checks the condition before creating
-    # the task entity. If the condition is not met, the task is skipped.
-    #
-    # condition:
-    #   from_entity: "oe:beslissing"       # entity type to check
-    #   field: "content.beslissing"         # dotted path to value
-    #   equals: "onvolledig"               # value to match
-    #
-    # Example: only schedule trekAanvraagIn when beslissing is onvolledig
-    #
-    # tasks:
-    #   - kind: "scheduled_activity"
-    #     target_activity: "trekAanvraagIn"
-    #     scheduled_for: "2026-05-01T00:00:00Z"
-    #     cancel_if_activities: ["vervolledigAanvraag"]
-    #     condition:
-    #       from_entity: "oe:beslissing"
-    #       field: "content.beslissing"
-    #       equals: "onvolledig"
-    #
-    # For more complex conditions (multiple fields, computed logic),
-    # use handler-appended tasks instead (see "Conditional Task Queueing
-    # from Handlers" section below).
+    # --- Conditional tasks live in handlers ---
+    # YAML tasks are unconditional: if the activity runs, the task is
+    # scheduled. For "only schedule trekAanvraagIn when beslissing is
+    # onvolledig" style rules, put the logic in a handler and append
+    # tasks to HandlerResult.tasks. See "Conditional Task Queueing from
+    # Handlers" below and dossier_toelatingen/handlers/__init__.py for
+    # worked examples.
 ```
 
 ---
@@ -754,16 +844,20 @@ The `dossier_access` entity controls who can see what. It is managed by a `setDo
       "view": ["oe:aanvraag", "oe:beslissing", "oe:handtekening", "external"],
       "activity_view": "own"
     }
-  ]
+  ],
+  "audit_access": ["ondertekenaar"]
 }
 ```
 
 - `role` or `agents`: who this entry applies to
 - `view`: which entity types are visible (empty = nothing). Include `"external"` for external URI entities.
 - `activity_view`: `"own"` (only own activities), `"related"` (own + touching visible entities), `"all"`
+- `audit_access` (optional): list of roles that get full-provenance views (`/prov`, `/prov/graph/columns`, `/archive`) for this dossier. Combines with `global_audit_access` from config.yaml. Role-only (no per-agent grants).
 
-Applied to: GET dossier, entity endpoints, PROV-JSON, PROV graph.
-Users without any matching entry get HTTP 403.
+Applied to: GET dossier, entity endpoints, PROV graph timeline.
+Users without any matching `access` entry get HTTP 403.
+
+**Two-tier model.** The `access` list gates business views (entity reads, timeline). The `audit_access` list (+ `global_audit_access` in config.yaml) gates the full-record views — PROV-JSON export, columns graph, archive PDF. A user with ordinary `access` does NOT automatically get audit views; the audit role has to be explicit. See the dossier-engine README's "Audit-level access" section.
 
 ---
 
@@ -780,12 +874,12 @@ Users without any matching entry get HTTP 403.
 | `GET` | `/dossiers/{id}/entities/{type}` | All versions of an entity type |
 | `GET` | `/dossiers/{id}/entities/{type}/{entity_id}` | All versions of a logical entity |
 | `GET` | `/dossiers/{id}/entities/{type}/{entity_id}/{version_id}` | Single entity version |
-| `GET` | `/dossiers/{id}/prov` | PROV-JSON export (filtered by access) |
-| `GET` | `/dossiers/{id}/prov/graph/timeline` | Interactive timeline visualization |
-| `GET` | `/dossiers/{id}/prov/graph/columns` | Column layout visualization |
+| `GET` | `/dossiers/{id}/prov/graph/timeline` | Timeline — user view (dossier access) |
+| `GET` | `/dossiers/{id}/prov` | PROV-JSON export (audit access) |
+| `GET` | `/dossiers/{id}/prov/graph/columns` | Column layout — full record (audit access) |
+| `GET` | `/dossiers/{id}/archive` | PDF/A-3b archive — full record (audit access) |
 
-Timeline query parameters: `?include_system_activities=true`, `?include_tasks=true`
-Columns query parameters: `?include_tasks=true` (default)
+No query-parameter toggles on the PROV endpoints. Timeline always hides system activities and tasks; audit endpoints always include them. Behavior is determined by access tier.
 
 ---
 
@@ -796,13 +890,13 @@ a heritage permit ("toelating beschermd erfgoed") workflow with:
 
 - Client activities: dienAanvraagIn, bewerkAanvraag, vervolledigAanvraag, doeVoorstelBeslissing, tekenBeslissing, neemBeslissing, trekAanvraagIn
 - System activities: setDossierAccess, duidVerantwoordelijkeOrganisatieAan, duidBehandelaarAan, setSystemFields
-- Shared handler: `handle_beslissing` used by both tekenBeslissing and neemBeslissing
+- Shared split-style hooks: `resolve_beslissing_status` + `schedule_trekAanvraag_if_onvolledig` referenced from both tekenBeslissing and neemBeslissing
 - Scoped authorization (municipality-based roles)
 - Entity-derived authorization (RRN/KBO from aanvraag)
 - Side effect chains (dienAanvraagIn → duidVerantwoordelijkeOrganisatieAan → duidBehandelaarAan + setDossierAccess)
-- Two decision paths: direct (neemBeslissing) and indirect (doeVoorstelBeslissing → tekenBeslissing → handle_beslissing)
+- Two decision paths: direct (neemBeslissing) and indirect (doeVoorstelBeslissing → tekenBeslissing)
 - Four-eyes principle (behandelaar proposes, separate ondertekenaar signs or declines)
-- Conditional tasks: handler schedules trekAanvraagIn only when beslissing is onvolledig
+- Conditional tasks: task builder schedules trekAanvraagIn only when beslissing is onvolledig
 - Recorded tasks (type 2): send_ontvangstbevestiging, log_beslissing_genomen, etc.
 - Task cancellation: vervolledigAanvraag cancels pending trekAanvraagIn deadline
 - External entities: heritage object URIs persisted with full PROV trail

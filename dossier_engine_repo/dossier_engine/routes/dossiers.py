@@ -239,32 +239,41 @@ def register(app: FastAPI, *, registry, get_user, global_access) -> None:
     @app.get(
         "/dossiers",
         tags=["dossiers"],
-        summary="List dossiers (cross-workflow)",
-        description="List dossiers across all workflows.",
+        summary="Search dossiers (cross-workflow)",
+        description=(
+            "Search the common dossier index. Supports fuzzy match on "
+            "onderwerp and exact filter on workflow. Results are "
+            "filtered to dossiers the current user may see (ACL = "
+            "user.roles ∪ user.id, includes global_access roles). "
+            "The common index is the only source — when Elasticsearch "
+            "is not configured or the index is missing, this endpoint "
+            "returns zero results. Set DOSSIER_ES_URL and run "
+            "/admin/search/common/recreate + reindex to populate it."
+        ),
     )
     async def list_dossiers(
+        q: Optional[str] = None,
         workflow: Optional[str] = None,
+        limit: int = 100,
         user: User = Depends(get_user),
     ):
-        session_factory = get_session_factory()
-        async with session_factory() as session, session.begin():
-            query = select(DossierRow)
-            if workflow:
-                query = query.where(DossierRow.workflow == workflow)
-            query = query.order_by(DossierRow.created_at.desc()).limit(100)
+        from ..search.common_index import search_common
 
-            result = await session.execute(query)
-            dossiers = list(result.scalars().all())
-
-            items = [
+        result = await search_common(
+            user=user, workflow=workflow, onderwerp=q, limit=limit,
+        )
+        return {
+            "dossiers": [
                 {
-                    "id": str(d.id),
-                    "workflow": d.workflow,
-                    "createdAt": d.created_at.isoformat() if d.created_at else None,
+                    "id": hit.get("dossier_id"),
+                    "workflow": hit.get("workflow"),
+                    "onderwerp": hit.get("onderwerp"),
                 }
-                for d in dossiers
-            ]
-            return {"dossiers": items}
+                for hit in result.get("hits", [])
+            ],
+            "total": result.get("total", 0),
+            **({"reason": result["reason"]} if "reason" in result else {}),
+        }
 
 
 async def _user_is_agent(session, activity_id: UUID, user_id: str) -> bool:

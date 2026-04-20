@@ -183,6 +183,97 @@ And register on the plugin:
 Plugin(..., handlers=HANDLERS)
 ```
 
+### Split-style hooks — status_resolver and task_builders
+
+A handler can return three things: content, status, tasks. For simple activities that's fine. For complex activities — especially those where status depends on multiple entities, or where several different tasks get scheduled conditionally — the handler becomes a Swiss army knife and the YAML tells you nothing about what side effects the activity has.
+
+You can optionally split those concerns across dedicated functions declared in the YAML:
+
+```yaml
+- name: "tekenBeslissing"
+  # No handler needed — this activity doesn't compute entity content
+  # beyond what the client submits.
+  status_resolver: "resolve_beslissing_status"
+  task_builders:
+    - "schedule_trekAanvraag_if_onvolledig"
+    - "send_ontvangstbevestiging"
+```
+
+Each function has a single responsibility:
+
+```python
+async def resolve_beslissing_status(ctx: ActivityContext) -> str | None:
+    """Map the latest handtekening + beslissing to a status string."""
+    handtekening = ctx.get_typed("oe:handtekening")
+    beslissing = ctx.get_typed("oe:beslissing")
+    if not handtekening:
+        return "beslissing_te_tekenen"
+    if beslissing and beslissing.beslissing == "goedgekeurd":
+        return "toelating_verleend"
+    # ...
+    return None  # leave unchanged
+
+
+async def schedule_trekAanvraag_if_onvolledig(
+    ctx: ActivityContext,
+) -> list[dict]:
+    """Return a task dict when beslissing is onvolledig, else []."""
+    beslissing = ctx.get_typed("oe:beslissing")
+    if not beslissing or beslissing.beslissing != "onvolledig":
+        return []
+    return [{
+        "kind": "scheduled_activity",
+        "target_activity": "trekAanvraagIn",
+        "scheduled_for": f"+{ctx.constants.aanvraag_deadline_days}d",
+        "cancel_if_activities": ["vervolledigAanvraag"],
+        "anchor_type": "oe:aanvraag",
+    }]
+
+
+STATUS_RESOLVERS = {"resolve_beslissing_status": resolve_beslissing_status}
+TASK_BUILDERS = {
+    "schedule_trekAanvraag_if_onvolledig": schedule_trekAanvraag_if_onvolledig,
+}
+```
+
+Register alongside handlers:
+
+```python
+Plugin(
+    ...,
+    handlers=HANDLERS,
+    status_resolvers=STATUS_RESOLVERS,
+    task_builders=TASK_BUILDERS,
+)
+```
+
+#### When to use which style
+
+The two styles coexist permanently — legacy handlers keep working and new activities can use either. The decision is about readability and testability, not correctness.
+
+**Stick with a handler when:**
+- The activity is simple (one short function, one concern)
+- Content / status / task decisions are tightly coupled — branching on the same condition to produce all three
+- You have one focused test that exercises the whole activity
+
+**Split when:**
+- The handler has grown past ~50 lines
+- Multiple different tasks are scheduled from one activity
+- A task_builder is reusable across activities (declare the builder once, reference from both YAML entries)
+- A domain reviewer would benefit from seeing "this activity schedules X and Y" in the YAML without opening Python
+
+#### The "exactly one source" rule
+
+An activity that declares `status_resolver` must NOT also have a handler returning `status`. Same for `task_builders` + handler `tasks`. The engine raises `ActivityError(500)` with a clear message at activity execution time if it finds both:
+
+```
+Activity 'tekenBeslissing' declares status_resolver 'resolve_beslissing_status'
+but its handler also returned status='toelating_verleend'. Remove one — the
+same activity cannot have status come from both sources.
+```
+
+This keeps "who decides X" unambiguous per activity. Mixing styles within one activity is always a bug (usually a half-finished migration); the engine catches it loudly instead of silently picking a winner.
+
 ### Reference data — static lists for the frontend
 
 Dropdowns, type lists, municipality codes — anything the frontend needs to render forms. Declared in the YAML, served from memory, sub-millisecond.
@@ -382,24 +473,70 @@ Handlers have full access to `context.get_typed("oe:aanvraag")` to read entity c
 
 ### Search — Elasticsearch integration
 
-For production search, register a `post_activity_hook` that pushes data to Elasticsearch after each activity, and a `search_route_factory` that registers the search endpoint.
+The platform ships with a two-tier index model: a **common index** (`dossiers-common`, engine-owned, one doc per dossier across all workflows) and an optional **workflow-specific index** (e.g. `dossiers-toelatingen`, plugin-owned, fields tuned to that workflow's entity shape). A plugin wires into search via three hooks.
+
+**1. `post_activity_hook` — incremental indexing.** Runs after every activity completes. Upserts both the plugin's own index and the engine's common index. Silent no-op when `DOSSIER_ES_URL` is empty.
 
 ```python
 async def update_index(repo, dossier_id, activity_type, status, entities):
-    # Push to Elasticsearch
+    # Build a common-index doc (for /dossiers?workflow=...)
+    # and a workflow-specific doc, then push both to ES.
     pass
+```
 
+**2. `search_route_factory` — the plugin's search endpoint.** Registers `GET /{workflow}/dossiers` with fuzzy/exact filters over the workflow-specific index. Always AND's in `build_acl_filter(user)` so users only see what they're allowed to see.
+
+```python
 def register_search(app, get_user):
     @app.get("/mijn_workflow/dossiers")
     async def search(...):
-        # Query Elasticsearch
+        # Query the workflow-specific ES index, ACL-filtered.
         pass
+```
+
+**3. `build_common_doc_for_dossier` — bulk reindex builder.** Optional, but **strongly recommended**. Called by the engine's `POST /admin/search/common/reindex` endpoint when it walks every dossier to rebuild the common index from Postgres. Without this, the engine falls back to a minimal doc (`onderwerp=""`, `__acl__` with only global-access roles) for your workflow's dossiers — which makes every non-global user invisible from search until the next per-activity upsert rewrites the doc. A bulk reindex shortly after a mapping change or a fresh cluster is exactly when you need this most, so plugins should implement it.
+
+```python
+async def build_common_doc_for_dossier(repo, dossier_id):
+    """Produce the common-index doc for one of this plugin's
+    dossiers. Called by engine-level reindex."""
+    from dossier_engine.search.common_index import build_common_doc
+
+    aanvraag = await repo.get_singleton_entity(dossier_id, "oe:aanvraag")
+    access = await repo.get_singleton_entity(dossier_id, "oe:dossier_access")
+    if aanvraag is None and access is None:
+        return None  # counts as "skipped"
+
+    onderwerp = (aanvraag.content or {}).get("onderwerp") if aanvraag else None
+    return build_common_doc(
+        dossier_id=dossier_id,
+        workflow="mijn_workflow",
+        onderwerp=onderwerp,
+        access_entity_content=access.content if access else None,
+    )
 
 Plugin(...,
     post_activity_hook=update_index,
     search_route_factory=register_search,
+    build_common_doc_for_dossier=build_common_doc_for_dossier,
 )
 ```
+
+The engine provides `build_common_doc(...)` to assemble the standard shape — plugin code only supplies onderwerp and the access entity's content (so ACL is derived consistently across plugins).
+
+### Activity names — qualified vs bare
+
+Activity names in `workflow.yaml` can be written bare (`dienAanvraagIn`) or qualified with the plugin's prefix (`oe:dienAanvraagIn`). At plugin registration time, the engine walks the workflow dict and qualifies any bare name it finds — including cross-references:
+
+- `activities[*].name`
+- `activities[*].requirements.activities`
+- `activities[*].forbidden.activities`
+- `activities[*].side_effects[*].activity`
+- `activities[*].tasks[*].target_activity` and `cancel_if_activities`
+
+After registration, every activity name in the plugin object is qualified. **Downstream code should compare by qualified name only.** This is why the DB stores qualified activity types, URLs route on qualified names (`/toelatingen/dossiers/{id}/activities/{aid}/oe:dienAanvraagIn`), and the frontend keys lookups on qualified types.
+
+**What this means for plugin authors:** write whichever form feels natural — the engine normalizes. But be aware that if you add a new YAML shape that cross-references an activity name (e.g. `my_new_feature.activities`), you need to extend `_normalize_plugin_activity_names` to qualify entries in that shape too. Otherwise bare names silently pass through and downstream filters (like `system_activity_types` in the columns PROV graph) will miss.
 
 ### Using external ontologies
 
@@ -549,6 +686,8 @@ Everything a plugin can register:
 | `entity_models` | `dict[str, BaseModel]` | Entity type → Pydantic model |
 | `entity_schemas` | `dict[tuple, BaseModel]` | (type, version) → Pydantic model (optional) |
 | `handlers` | `dict[str, Callable]` | Handler name → async function |
+| `status_resolvers` | `dict[str, Callable]` | Status resolver name → async function (split-style) |
+| `task_builders` | `dict[str, Callable]` | Task builder name → async function (split-style) |
 | `validators` | `dict[str, Callable]` | Validator name → async function |
 | `relation_validators` | `dict[str, Callable]` | Relation type → async validator |
 | `field_validators` | `dict[str, Callable]` | Validator name → async function |
@@ -556,6 +695,7 @@ Everything a plugin can register:
 | `pre_commit_hooks` | `list[Callable]` | Strict hooks (can veto activity) |
 | `post_activity_hook` | `Callable` | Advisory hook (errors swallowed) |
 | `search_route_factory` | `Callable` | Registers search endpoints |
+| `build_common_doc_for_dossier` | `Callable` | Builds per-dossier doc for engine-level common-index reindex |
 | `constants` | `BaseSettings` | Typed workflow constants (env vars + YAML) |
 
 Most plugins use only `entity_models`, `handlers`, and perhaps `task_handlers`. Everything else is opt-in for when you need it.

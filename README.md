@@ -226,34 +226,39 @@ The API has two URL families: **workflow-scoped** routes (the workflow name is i
 | `PUT` | `/{workflow}/dossiers/{id}/activities/{id}/{type}` | Execute a typed activity |
 | `PUT` | `/{workflow}/dossiers/{id}/activities/{id}` | Execute a generic activity |
 | `PUT` | `/{workflow}/dossiers/{id}/activities` | Execute batch activities atomically |
-| `GET` | `/{workflow}/dossiers` | List/search dossiers within a workflow |
+| `GET` | `/{workflow}/dossiers` | Search workflow-specific index (fuzzy onderwerp, exact filters; ACL-filtered) |
 | `GET` | `/{workflow}/reference` | All reference data lists (sub-ms, in-memory) |
 | `GET` | `/{workflow}/reference/{list_name}` | Single reference data list |
 | `GET` | `/{workflow}/validate` | List available field validators |
 | `POST` | `/{workflow}/validate/{validator_name}` | Run a field-level validator |
+| `POST` | `/{workflow}/admin/search/recreate` | Drop + recreate workflow index (admin access) |
+| `POST` | `/{workflow}/admin/search/reindex` | Re-index workflow dossiers into workflow index (admin access) |
+| `POST` | `/{workflow}/admin/search/reindex-all` | Re-index workflow dossiers into workflow + common indices (admin access) |
 
 ### Workflow-agnostic
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/dossiers` | List dossiers across all workflows |
+| `GET` | `/dossiers` | Search common index (fuzzy onderwerp, exact workflow; ACL-filtered) |
 | `GET` | `/dossiers/{id}` | Get dossier detail (entities, activities, domain relations, filtered by access) |
 | `PUT` | `/dossiers/{id}/activities/{id}` | Execute a generic activity |
 | `PUT` | `/dossiers/{id}/activities` | Execute batch activities atomically |
 | `GET` | `/dossiers/{id}/entities/{type}` | All versions of an entity type |
 | `GET` | `/dossiers/{id}/entities/{type}/{eid}` | All versions of a logical entity |
 | `GET` | `/dossiers/{id}/entities/{type}/{eid}/{vid}` | Single entity version |
-| `GET` | `/dossiers/{id}/prov` | PROV-JSON export |
-| `GET` | `/dossiers/{id}/prov/graph/timeline` | Timeline visualization |
-| `GET` | `/dossiers/{id}/prov/graph/columns` | Column layout visualization |
-| `GET` | `/dossiers/{id}/archive` | PDF/A-3b archive (self-contained) |
+| `GET` | `/dossiers/{id}/prov` | PROV-JSON export (audit access) |
+| `GET` | `/dossiers/{id}/prov/graph/timeline` | Timeline — user view (dossier access) |
+| `GET` | `/dossiers/{id}/prov/graph/columns` | Column layout — full record (audit access) |
+| `GET` | `/dossiers/{id}/archive` | PDF/A-3b archive — full record (audit access) |
+| `POST` | `/admin/search/common/recreate` | Drop + recreate common index (admin access) |
+| `POST` | `/admin/search/common/reindex` | Re-index every dossier into common (admin access) |
 | `POST` | `/files/upload/request` | Mint a signed upload URL for the file service |
 | `GET` | `/health` | Liveness probe |
 | `GET` | `/health/ready` | Readiness probe (checks DB) |
 
 Entity endpoint paths match the canonical IRI structure (`https://id.erfgoed.net/dossiers/{id}/entities/{type}/{eid}/{vid}`), so domain relation `from_ref` / `to_ref` values are directly resolvable as API URLs.
 
-Graph query parameters: `?include_system_activities=true`, `?include_tasks=true`
+**Access tiers:** the three endpoints marked "audit access" (`/prov`, `/prov/graph/columns`, `/archive`) require a role in `global_audit_access` (config.yaml) or the dossier's `audit_access` list. They return the complete unfiltered record — system activities, tasks, all entities — and are intended for auditors, compliance, and long-term preservation. The timeline endpoint (`/prov/graph/timeline`) uses ordinary dossier access and honors per-user filtering; it never shows system activities or tasks. No query-parameter toggles — behavior is determined by access tier.
 
 ### CORS
 
@@ -702,6 +707,93 @@ GET /toelatingen/validate
 
 No DB writes, no PROV records, no transaction — pure validation functions. The frontend calls these on blur/change for instant feedback.
 
+## Search (Elasticsearch)
+
+Dossier listing and search go through Elasticsearch, not Postgres. Two indices:
+
+- **`dossiers-common`** — one doc per dossier, every workflow. Fields: `dossier_id`, `workflow`, `onderwerp`, `__acl__`. Served at `GET /dossiers` with fuzzy match on `onderwerp` and exact filter on `workflow`.
+- **`dossiers-toelatingen`** — one doc per toelatingen dossier. Fields: `dossier_id`, `onderwerp`, `gemeente`, `beslissing`, `__acl__`. Served at `GET /toelatingen/dossiers` with fuzzy match on `onderwerp` and exact filters on `gemeente` and `beslissing`. Each workflow plugin owns its own specific index the same way.
+
+Both indices receive upserts after every activity via each plugin's `post_activity_hook`. When Elasticsearch is not configured, the hooks are silent no-ops (the activity still commits) and the search endpoints return empty results with an explanatory `reason` field — no Postgres fallback, deliberately. An index with no data is a configuration problem, not something to paper over.
+
+### ACL filtering
+
+Every indexed doc carries a flat `__acl__` list — role names and agent UUIDs concatenated from three sources:
+
+1. Per-dossier `access` entries in the `oe:dossier_access` entity (roles and agents)
+2. Per-dossier `audit_access` list on the same entity
+3. Global roles from `config.yaml`'s `global_access` block
+
+Every search query AND's in a `terms` filter that checks `__acl__` against `user.roles ∪ {user.id}`. Users see only dossiers they could also open directly via `GET /dossiers/{id}`. Global-access users (e.g. `beheerder`) see everything because their role is in every doc's `__acl__`.
+
+### Enabling Elasticsearch
+
+Set two environment variables before starting the app:
+
+```bash
+export DOSSIER_ES_URL="https://your-cluster.example.be:9200"
+export DOSSIER_ES_API_KEY="encoded-api-key-from-your-cluster"
+
+# Optional: disable for self-signed dev clusters
+export DOSSIER_ES_VERIFY_CERTS=false
+```
+
+The API key is used verbatim in the `Authorization: ApiKey <key>` header. Generate one in Kibana (Stack Management → Security → API keys) with permissions to read/write both indices. The URL and key should only come from env vars — never commit them to `config.yaml`.
+
+Add at least one role to `global_admin_access` in `config.yaml` so the admin endpoints are reachable:
+
+```yaml
+global_admin_access:
+  - "beheerder"
+```
+
+After setting env vars and restarting the app, create the indices and populate them:
+
+```bash
+# Create the dossiers-common index (drops first if it exists)
+curl -X POST http://localhost:8000/admin/search/common/recreate \
+  -H "X-POC-User: claeyswo"
+
+# Populate it from Postgres
+curl -X POST http://localhost:8000/admin/search/common/reindex \
+  -H "X-POC-User: claeyswo"
+
+# Same for the toelatingen-specific index
+curl -X POST http://localhost:8000/toelatingen/admin/search/recreate \
+  -H "X-POC-User: claeyswo"
+curl -X POST http://localhost:8000/toelatingen/admin/search/reindex \
+  -H "X-POC-User: claeyswo"
+
+# Convenience: toelatingen + common in one walk (both indices get
+# fresh docs for every toelatingen dossier)
+curl -X POST http://localhost:8000/toelatingen/admin/search/reindex-all \
+  -H "X-POC-User: claeyswo"
+```
+
+From then on, each activity's `post_activity_hook` keeps both indices in sync — no further manual reindexing needed unless the mapping changes.
+
+### Admin endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/admin/search/common/recreate` | Drop + recreate common index |
+| `POST` | `/admin/search/common/reindex` | Re-index every dossier into common |
+| `POST` | `/toelatingen/admin/search/recreate` | Drop + recreate toelatingen index |
+| `POST` | `/toelatingen/admin/search/reindex` | Re-index toelatingen dossiers (toelatingen index only) |
+| `POST` | `/toelatingen/admin/search/reindex-all` | Re-index toelatingen dossiers into both indices |
+
+All gated on `global_admin_access` (strict role check, default-deny on misconfiguration).
+
+### Three access tiers
+
+The platform now has three orthogonal role tiers in `config.yaml`:
+
+- **`global_access`** — day-to-day business views; controls dossier/entity visibility via `view`/`activity_view`. Also contributes to `__acl__` so these users find dossiers in search.
+- **`global_audit_access`** — full-record views (`/prov`, `/prov/graph/columns`, `/archive`). Role-only.
+- **`global_admin_access`** — destructive operations (recreate/reindex). Role-only. Default-deny if empty.
+
+They don't imply each other — a `beheerder` that appears in all three lists gets all three sets of powers explicitly. A role granted audit doesn't automatically get admin or vice versa.
+
 ## Activity Visibility
 
 The `activity_view` setting on access entries controls which activities a user sees in the dossier timeline. Five input forms, all normalised to an `ActivityViewMode` dataclass by `parse_activity_view()`:
@@ -716,9 +808,24 @@ The `activity_view` setting on access entries controls which activities a user s
 
 The combined dict form is useful for aanvragers who should see their own actions plus all decisions, even if someone else made them. The shared module `routes/_activity_visibility.py` provides `parse_activity_view()` and `is_activity_visible()`, used by both the dossier-detail and PROV endpoints via callback-based lookups (no code duplication).
 
+### Audit-level access
+
+Some endpoints expose the complete, unfiltered provenance record — all activities (including system ones), all tasks, all entities regardless of per-user filtering. These are the auditor, compliance, and long-term-preservation views:
+
+- `GET /dossiers/{id}/prov` — PROV-JSON export
+- `GET /dossiers/{id}/prov/graph/columns` — full-record column visualization
+- `GET /dossiers/{id}/archive` — PDF/A-3b archive
+
+Access to these is gated by `check_audit_access` rather than the ordinary dossier access check. A user with ordinary dossier access does **not** automatically get audit-level views; they need an explicit role grant. Two sources, both role-based (no per-agent grants):
+
+- `global_audit_access` in `config.yaml` — applies to every dossier.
+- `audit_access` list on the dossier's `oe:dossier_access` entity — per-dossier roles (e.g. a signing authority for this specific application).
+
+Default-deny: no match → 403 and an audit trail entry (`dossier.audit_denied`) for compliance investigations. The timeline endpoint (`/prov/graph/timeline`) is unaffected — it's the day-to-day user view and uses ordinary dossier access with per-user filtering.
+
 ## Dossier Archive (PDF/A-3b)
 
-The `GET /dossiers/{id}/archive` endpoint produces a self-contained PDF/A-3b archive suitable for long-term (30+ year) retention. The archive contains:
+The `GET /dossiers/{id}/archive` endpoint produces a self-contained PDF/A-3b archive suitable for long-term (30+ year) retention. It's an audit-level endpoint — see the [Audit-level access](#audit-level-access) section for role requirements. The archive contains:
 
 - **Cover page** — dossier metadata, workflow, status, creation date, all involved agents with their canonical URIs, and a full activity timeline.
 - **Provenance timeline** — a static SVG rendered server-side (pure Python, no D3 or browser required) showing activity columns and entity version markers.
@@ -1202,6 +1309,11 @@ This sequence exercises the onvolledig → vervolledig → goedgekeurd loop, whi
 - **External entities persisted** — external URIs stored as entities with type `"external"`, full PROV trail.
 - **Reference data is YAML-declared, served from memory** — no DB hit, sub-millisecond. Field validators are plugin-registered async callables, called between activities for fast feedback.
 - **Pipeline phases are small and documented** — every phase function in `engine/pipeline/` declares its Reads/Writes contract, which makes individual phases unit-testable against fixture `ActivityState` objects without needing the full HTTP stack.
+- **Two-tier access** — `check_dossier_access` gates business views (filtered per user); `check_audit_access` gates full-record views (`/prov`, `/prov/graph/columns`, `/archive`). A role in `global_audit_access` or the dossier's `audit_access` list is required for audit views; ordinary dossier access is not enough.
+- **Workflow constants typed and env-overridable** — each plugin declares a Pydantic `BaseSettings` subclass (`context.constants.x` from handlers, `plugin.constants.x` from hooks). Precedence: env vars > `workflow.yaml` > class defaults. Secrets go only via env vars. See `dossier_toelatingen/constants.py`.
+- **Qualified activity names** — activity names in YAML and URLs are prefixed with the plugin's IRI prefix (`oe:dienAanvraagIn`), so cross-plugin workflows can coexist without collision. The engine normalizes bare names and matches by local name where appropriate for backward-friendly plugin code.
+- **Namespace registry** — plugins declare the vocabularies they use (`namespaces:` block in workflow.yaml). Built-in prefixes (`prov`, `xsd`, `rdf`, `rdfs`) are always available; unknown prefixes fail at load time rather than producing bogus IRIs at runtime.
+- **Split-style activity hooks (opt-in)** — alongside the classic handler-returns-everything style, activities can declare `status_resolver: "name"` and/or `task_builders: [...]` in YAML to route those concerns through dedicated single-responsibility functions. Makes workflow side effects visible in the YAML without opening Python. Engine enforces "exactly one source per concern" — declaring a split hook forbids the handler from also returning that field. See `docs/plugin_guidebook.md` "Split-style hooks" for decision criteria.
 
 ## Adding a New Workflow
 

@@ -415,6 +415,105 @@ class TestProvGraphColumns:
         assert "PROV Columns" in body
         assert "d3.min.js" in body
 
+    async def test_side_effect_activities_attach_to_parent_column(
+        self, prov_client, repo,
+    ):
+        """Regression: side-effect activities (``client_callable: false``)
+        must NOT appear as their own top-row columns. They attach as
+        ``side_effects`` on the parent client activity's column.
+
+        The earlier bug: the normalizer left ``side_effects: [{"activity":
+        "foo"}]`` unqualified, so the DB stored bare-name activity rows
+        while ``system_activity_types`` was built from qualified names.
+        The filter missed, every activity got ``kind=client``, and the
+        three-band layout collapsed into one long row.
+
+        We verify the fix by:
+        1. Creating a client activity whose parent kicks off a
+           ``client_callable: false`` side-effect activity
+        2. Rendering the columns graph
+        3. Parsing out the embedded ``const columns = ...;`` JSON
+        4. Asserting the parent column has the side effect in its
+           ``side_effects`` array, and no column exists for the
+           system activity directly
+        """
+        import json, re
+
+        # Bootstrap: one parent activity, one system side-effect.
+        # The plugin's workflow needs to declare the system activity
+        # with client_callable=false so the filter in prov_columns
+        # can classify it.
+        plugin = prov_client._transport.app.state.registry.get("test")
+        plugin.workflow["activities"].append({
+            "name": "oe:doSystem",
+            "label": "Do system thing",
+            "can_create_dossier": False,
+            "client_callable": False,
+            "default_role": "systeem",
+            "allowed_roles": ["systeem"],
+            "authorization": {"access": "roles", "roles": [{"role": "systeemgebruiker"}]},
+            "used": [], "generates": [], "status": None,
+            "validators": [], "side_effects": [], "tasks": [],
+        })
+
+        # Bootstrap a dossier with a parent + side-effect pair.
+        await repo.create_dossier(D1, "test")
+        await repo.ensure_agent("alice", "natuurlijk_persoon", "Alice", {})
+        await repo.ensure_agent("system", "systeem", "Systeem", {})
+
+        now = datetime.now(timezone.utc)
+        parent_id = uuid4()
+        await repo.create_activity(
+            activity_id=parent_id, dossier_id=D1, type="createEntity",
+            started_at=now, ended_at=now,
+        )
+        repo.session.add(AssociationRow(
+            id=uuid4(), activity_id=parent_id, agent_id="alice",
+            agent_name="Alice", agent_type="natuurlijk_persoon",
+            role="oe:aanvrager",
+        ))
+
+        se_id = uuid4()
+        await repo.create_activity(
+            activity_id=se_id, dossier_id=D1, type="oe:doSystem",
+            started_at=now, ended_at=now, informed_by=str(parent_id),
+        )
+        repo.session.add(AssociationRow(
+            id=uuid4(), activity_id=se_id, agent_id="system",
+            agent_name="Systeem", agent_type="systeem", role="systeem",
+        ))
+        await _commit(repo)
+
+        r = await prov_client.get(
+            f"/dossiers/{D1}/prov/graph/columns",
+            headers={"X-POC-User": "alice"},
+        )
+        assert r.status_code == 200
+
+        # Extract the inline `const columns = [...]` JSON.
+        m = re.search(r"const columns = (\[.*?\]);", r.text, re.DOTALL)
+        assert m, "columns JSON block not found in HTML"
+        columns = json.loads(m.group(1))
+
+        # Parent column should exist with side-effect attached.
+        parent_cols = [c for c in columns if c["type"] == "createEntity"]
+        assert len(parent_cols) == 1
+        parent = parent_cols[0]
+        assert parent["kind"] == "client"
+
+        se_labels = [se["type"] for se in parent.get("side_effects", [])]
+        assert "oe:doSystem" in se_labels, (
+            f"side-effect activity should be attached to parent's "
+            f"side_effects array; got {se_labels}"
+        )
+
+        # System activity must NOT appear as its own top-row column.
+        se_top_cols = [c for c in columns if c["type"] == "oe:doSystem"]
+        assert se_top_cols == [], (
+            f"system activity leaked into top row: {se_top_cols}. "
+            "This is the exact collapsed-timeline bug."
+        )
+
 
 class TestAuditAccess:
     """The audit-level endpoints (/prov, /prov/graph/columns,

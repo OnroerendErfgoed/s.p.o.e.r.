@@ -338,9 +338,31 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     # Register routes
     global_access = config.get("global_access", [])
     global_audit_access = config.get("global_audit_access", [])
+    global_admin_access = config.get("global_admin_access", [])
+
+    # Make global_access and global_admin_access available to the
+    # search module so indexers include global roles in __acl__ and
+    # plugin admin endpoints can gate on admin roles without needing
+    # to have them plumbed through the factory signature.
+    from .search import configure_global_access, configure_global_admin_access
+    configure_global_access(global_access)
+    configure_global_admin_access(global_admin_access)
+
     register_routes(app, registry, auth_middleware, global_access)
     register_prov_routes(
         app, registry, auth_middleware, global_access, global_audit_access
     )
+
+    # Admin search routes (common index only; plugins register their
+    # own workflow-specific admin endpoints via search_route_factory).
+    from .routes.admin_search import register_admin_search_routes
+    register_admin_search_routes(
+        app, registry, auth_middleware, global_admin_access,
+    )
+
+    @app.on_event("shutdown")
+    async def _close_search_client():
+        from .search import close_client
+        await close_client()
 
     return app

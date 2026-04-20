@@ -453,3 +453,124 @@ class TestPluginRegistry:
 
         assert registry.get("wf") is second
         assert len(registry.all_plugins()) == 1
+
+
+class TestSideEffectsNormalization:
+    """Regression tests: ``side_effects:`` in workflow YAML is a
+    list of dicts (``{"activity": "foo", "condition": ...}``), not
+    a list of strings. The normalizer has to qualify the ``activity``
+    key inside each dict so that downstream code (side_effects
+    pipeline, prov_columns) can match by qualified name consistently.
+
+    A bug in this area caused the columns PROV graph to collapse into
+    a single row: bare-named side-effect activities in the DB never
+    matched the qualified names in ``system_activity_types``, so the
+    filter that routes them to the middle band always missed. Keep
+    this regression covered — the bug was invisible to end-to-end
+    tests because the graph still rendered, just wrongly.
+    """
+
+    def test_dict_form_side_effects_activity_qualified(self):
+        registry = PluginRegistry()
+        p = _make_plugin(workflow={
+            "activities": [
+                {
+                    "name": "dienAanvraagIn",
+                    "side_effects": [
+                        {"activity": "duidVerantwoordelijkeOrganisatieAan"},
+                        {"activity": "setSystemFields"},
+                    ],
+                },
+            ],
+        })
+        p.name = "wf"
+        registry.register(p)
+
+        side = p.workflow["activities"][0]["side_effects"]
+        assert side == [
+            {"activity": "oe:duidVerantwoordelijkeOrganisatieAan"},
+            {"activity": "oe:setSystemFields"},
+        ]
+
+    def test_dict_form_preserves_other_keys(self):
+        """Qualifying ``activity`` must not drop the ``condition``
+        key (or any other metadata carried on the entry)."""
+        registry = PluginRegistry()
+        p = _make_plugin(workflow={
+            "activities": [
+                {
+                    "name": "submit",
+                    "side_effects": [
+                        {
+                            "activity": "followup",
+                            "condition": {"from_entity": "oe:beslissing"},
+                        },
+                    ],
+                },
+            ],
+        })
+        p.name = "wf"
+        registry.register(p)
+
+        se = p.workflow["activities"][0]["side_effects"][0]
+        assert se["activity"] == "oe:followup"
+        assert se["condition"] == {"from_entity": "oe:beslissing"}
+
+    def test_already_qualified_activity_is_idempotent(self):
+        """Running the normalizer over YAML that already has
+        qualified names must not change anything."""
+        registry = PluginRegistry()
+        p = _make_plugin(workflow={
+            "activities": [
+                {
+                    "name": "oe:submit",
+                    "side_effects": [
+                        {"activity": "oe:followup"},
+                    ],
+                },
+            ],
+        })
+        p.name = "wf"
+        registry.register(p)
+
+        side = p.workflow["activities"][0]["side_effects"]
+        assert side == [{"activity": "oe:followup"}]
+
+    def test_legacy_string_side_effects_still_work(self):
+        """Back-compat: old-style YAML that used bare strings instead
+        of dicts should still get qualified. This path may be dead
+        in the current toelatingen plugin but external plugins might
+        still use it."""
+        registry = PluginRegistry()
+        p = _make_plugin(workflow={
+            "activities": [
+                {"name": "submit", "side_effects": ["followup"]},
+            ],
+        })
+        p.name = "wf"
+        registry.register(p)
+
+        assert p.workflow["activities"][0]["side_effects"] == ["oe:followup"]
+
+    def test_mixed_dict_and_string_side_effects(self):
+        """A plugin could have mixed legacy + new-style entries in
+        the same list during migration. Both get qualified."""
+        registry = PluginRegistry()
+        p = _make_plugin(workflow={
+            "activities": [
+                {
+                    "name": "submit",
+                    "side_effects": [
+                        "followup_a",
+                        {"activity": "followup_b"},
+                    ],
+                },
+            ],
+        })
+        p.name = "wf"
+        registry.register(p)
+
+        assert p.workflow["activities"][0]["side_effects"] == [
+            "oe:followup_a",
+            {"activity": "oe:followup_b"},
+        ]

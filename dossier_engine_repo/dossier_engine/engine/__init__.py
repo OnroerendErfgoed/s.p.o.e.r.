@@ -40,6 +40,7 @@ from .pipeline.finalization import (
     run_pre_commit_hooks,
 )
 from .pipeline.handlers import run_handler
+from .pipeline.split_hooks import run_split_hooks
 from .pipeline.invariants import enforce_used_generated_disjoint
 from .pipeline.persistence import create_activity_row, persist_outputs
 from .pipeline.relations import process_relations
@@ -195,6 +196,13 @@ async def execute_activity(
     # derived_from based on cardinality), override the dossier status,
     # and append tasks. See pipeline/handlers.py.
     await run_handler(state)
+
+    # Split-style hooks: if the activity declared status_resolver or
+    # task_builders in YAML, invoke them now and populate handler_result
+    # with their outputs. Raises ActivityError if the handler ALSO
+    # returned values for the same concern — "who decides X" must be
+    # unambiguous. Legacy activities (no split hooks) are unaffected.
+    await run_split_hooks(state)
 
     # Persist all outputs of the activity: local generated entities,
     # external entity rows, tombstone redactions (if applicable),

@@ -187,6 +187,26 @@ class Plugin:
     validators: dict[str, Callable] = field(default_factory=dict)  # validator_name → async function
     task_handlers: dict[str, Callable] = field(default_factory=dict)  # task_name → async function
 
+    # Split-style hooks, opt-in via YAML activity declarations. An
+    # activity can declare a `status_resolver: "name"` and/or
+    # `task_builders: [...]` to lift those concerns out of the
+    # handler into dedicated, single-responsibility functions.
+    #
+    # When an activity declares a status_resolver, its handler MUST
+    # NOT return `status` — the engine raises ActivityError(500) if
+    # both are set. Same rule for task_builders + handler `tasks`.
+    # This keeps "who decides X" unambiguous for every activity.
+    #
+    # Signatures:
+    #   async def resolver(context: ActivityContext) -> str | None
+    #   async def task_builder(context: ActivityContext) -> list[dict]
+    #
+    # Both styles coexist indefinitely — legacy handlers that return
+    # content + status + tasks keep working untouched. See the plugin
+    # guidebook for the decision criteria ("when to split").
+    status_resolvers: dict[str, Callable] = field(default_factory=dict)
+    task_builders: dict[str, Callable] = field(default_factory=dict)
+
     # Validators for custom PROV-extension relations (e.g. oe:neemtAkteVan).
     # Keyed by relation type string. Each validator receives the full
     # activity context (resolved used rows, pending generated items, the
@@ -228,6 +248,20 @@ class Plugin:
     # Called during route registration. Receives (app, get_user) and should
     # register workflow-specific search endpoints like /dossiers/{workflow_name}/...
     search_route_factory: Callable | None = None
+
+    # Plugin-owned builder for the engine-level common-index document.
+    # Signature: ``async def build(repo, dossier_id) -> dict | None``.
+    #
+    # Invoked by ``dossier_engine.search.common_index.reindex_all``
+    # when the engine walks every dossier. Each plugin that owns
+    # dossiers of its workflow supplies this so the engine-level
+    # reindex writes rich docs (with onderwerp + full per-dossier
+    # ACL) instead of the bare-minimum fallback. Without this, the
+    # fallback emits docs with empty onderwerp and only global-access
+    # roles in ``__acl__`` — which makes every non-global user
+    # invisible from search after a reindex. Return None to skip the
+    # dossier (counted as "skipped" in the reindex summary).
+    build_common_doc_for_dossier: Callable | None = None
 
     # Workflow-scoped constants/config. A Pydantic BaseSettings instance
     # populated at plugin load from (in precedence order, highest wins):
@@ -401,14 +435,27 @@ def _normalize_plugin_activity_names(plugin: Plugin) -> None:
                         for r in act_refs
                     ]
 
-        # `side_effects` is a list of activity names — cross-references
-        # fired after the current activity succeeds.
+        # `side_effects` is a list of entries, each a dict with an
+        # ``activity:`` key pointing at another activity name (plus
+        # optional ``condition:``). Legacy callers may still pass
+        # bare strings, which we keep supporting. Either way, qualify
+        # the activity reference so downstream code compares against
+        # qualified names consistently.
         side = act.get("side_effects") or []
         if isinstance(side, list):
-            act["side_effects"] = [
-                qualify(r, default_prefix) if isinstance(r, str) else r
-                for r in side
-            ]
+            normalized_side = []
+            for r in side:
+                if isinstance(r, str):
+                    normalized_side.append(qualify(r, default_prefix))
+                elif isinstance(r, dict):
+                    entry = dict(r)
+                    ref = entry.get("activity")
+                    if isinstance(ref, str):
+                        entry["activity"] = qualify(ref, default_prefix)
+                    normalized_side.append(entry)
+                else:
+                    normalized_side.append(r)
+            act["side_effects"] = normalized_side
 
         # Tasks can reference cancel_if_activities by name
         for task in act.get("tasks", []) or []:

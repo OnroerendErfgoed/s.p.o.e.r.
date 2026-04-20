@@ -76,17 +76,22 @@ const canExport = computed(() => {
 
 // Find activity-definition metadata so we can pick the right form.
 function pickForm(actType) {
-  // Maps activity type to the form component. The `ReviseAanvraagForm`
-  // handles both activities that produce a new `oe:aanvraag` version
-  // from an existing one — they share the same data operation and
-  // only differ in who's allowed to run them and in which dossier
-  // state. `dienAanvraagIn` has its own view because it also creates
-  // the dossier row. System activities (e.g.
-  // `duidVerantwoordelijkeOrganisatieAan`) aren't client-callable.
+  // Maps qualified activity type to the form component. The
+  // ReviseAanvraagForm handles both activities that produce a new
+  // oe:aanvraag version from an existing one — they share the same
+  // data operation and only differ in who's allowed to run them and
+  // in which dossier state. oe:dienAanvraagIn has its own view
+  // because it also creates the dossier row. System activities
+  // (e.g. oe:duidVerantwoordelijkeOrganisatieAan) aren't client-
+  // callable so they never appear in allowedActivities.
+  //
+  // Activity types are qualified with the plugin's IRI prefix
+  // (oe:bewerkAanvraag). The backend emits them qualified; we key
+  // the lookup accordingly to avoid silent prefix-strip bugs.
   const map = {
-    bewerkAanvraag: ReviseAanvraagForm,
-    vervolledigAanvraag: ReviseAanvraagForm,
-    neemBeslissing: NeemBeslissingForm,
+    "oe:bewerkAanvraag": ReviseAanvraagForm,
+    "oe:vervolledigAanvraag": ReviseAanvraagForm,
+    "oe:neemBeslissing": NeemBeslissingForm,
   };
   return map[actType] || null;
 }

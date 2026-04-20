@@ -121,17 +121,19 @@ Derives the current dossier status from all activities, computes which activitie
 | Field | Set by | Read by |
 |---|---|---|
 | `dossier` | ensure_dossier | authorize, workflow_rules, finalization |
-| `used_refs` | resolve_used | enforce_disjoint, persistence |
+| `used_refs` (`list[UsedRef]`) | resolve_used | enforce_disjoint, persistence |
 | `resolved_entities` | resolve_used | handlers, task anchor resolution |
 | `used_rows_by_ref` | resolve_used | relation validators |
 | `generated` | process_generated, handler | persistence, validators, task scheduling |
-| `validated_relations` | process_relations | persistence |
-| `validated_domain_relations` | process_relations | persistence |
-| `validated_remove_relations` | process_relations | persistence |
+| `validated_relations` (`list[ValidatedRelation]`) | process_relations | persistence |
+| `validated_domain_relations` (`list[DomainRelationEntry]`) | process_relations | persistence |
+| `validated_remove_relations` (`list[DomainRelationEntry]`) | process_relations | persistence |
 | `handler_result` | run_handler | persistence, task scheduling |
 | `computed_status` | determine_status | finalization |
 
-The risk: a phase reads a field that a later phase sets. This is always a bug, but Python won't catch it — the field exists (with its default value) and the read silently gets stale or empty data. When adding a new phase, trace every field it reads and confirm the setter phase runs earlier.
+The intermediate collections (`used_refs`, `validated_relations`, the two domain-relation lists) are typed as lists of frozen dataclasses. Reading a field a phase has not yet set gets you an empty typed list, and attribute access on items catches most shape bugs at development time rather than runtime. Input collections (`used_items`, `generated_items`, `relation_items`) stay as Pydantic-validated dicts because they come from the HTTP request body. The handler-facing collections (`generated`, `allowed_activities`, `handler_tasks`) remain as dicts — typing those would widen into the plugin API.
+
+The residual risk: a phase reads a field that a later phase sets. Python won't catch it — the field exists with its empty-list default and the read silently gets nothing. When adding a new phase, trace every field it reads and confirm the setter phase runs earlier.
 
 ## Relations: two kinds, one pipeline
 

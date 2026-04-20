@@ -48,3 +48,10 @@ global_access:
 # matching role here or in a dossier's audit_access list get 403.
 global_audit_access:
   - "beheerder"
+
+# Admin-level access — roles that may run destructive / bulk
+# operations (search index recreate, reindex). Strict superset of
+# who should be allowed to reshape the cluster. Role-only, no
+# per-dossier grant — these are purely operational powers.
+global_admin_access:
+  - "beheerder"
