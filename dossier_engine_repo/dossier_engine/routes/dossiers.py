@@ -266,37 +266,6 @@ def register(app: FastAPI, *, registry, get_user, global_access) -> None:
             ]
             return {"dossiers": items}
 
-    @app.get(
-        "/{workflow}/dossiers",
-        tags=["dossiers"],
-        summary="List dossiers (workflow-scoped)",
-        description="List and search dossiers within a specific workflow.",
-    )
-    async def list_dossiers_scoped(
-        workflow: str,
-        user: User = Depends(get_user),
-    ):
-        session_factory = get_session_factory()
-        async with session_factory() as session, session.begin():
-            query = (
-                select(DossierRow)
-                .where(DossierRow.workflow == workflow)
-                .order_by(DossierRow.created_at.desc())
-                .limit(100)
-            )
-            result = await session.execute(query)
-            dossiers = list(result.scalars().all())
-
-            items = [
-                {
-                    "id": str(d.id),
-                    "workflow": d.workflow,
-                    "createdAt": d.created_at.isoformat() if d.created_at else None,
-                }
-                for d in dossiers
-            ]
-            return {"dossiers": items}
-
 
 async def _user_is_agent(session, activity_id: UUID, user_id: str) -> bool:
     """Return True if `user_id` has an association row for `activity_id`."""

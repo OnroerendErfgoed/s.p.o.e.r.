@@ -1,6 +1,13 @@
 database:
   url: "postgresql+asyncpg://dossier:dossier@127.0.0.1:5432/dossiers"
 
+# IRI namespace used to mint PROV entity/activity/agent IRIs and to
+# classify domain-relation refs as platform vs external. Change this
+# to your organisation's namespace before deploying.
+iri_base:
+  dossier: "https://id.erfgoed.net/dossiers/"
+  ontology: "https://id.erfgoed.net/vocab/ontology#"
+
 plugins:
   - dossier_toelatingen
 

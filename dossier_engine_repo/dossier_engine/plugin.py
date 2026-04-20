@@ -280,11 +280,21 @@ class Plugin:
 
     def find_activity_def(self, activity_type: str) -> dict | None:
         """Return the activity definition dict for `activity_type`, or
-        None if this plugin's workflow doesn't declare it. A linear scan
-        — workflows have a few dozen activities at most, so the cost
-        is negligible compared to caching."""
+        None if this plugin's workflow doesn't declare it.
+
+        Accepts bare or qualified input. Compares by the *local
+        name* portion since the stored YAML may have been registered
+        via ``PluginRegistry.register`` (which qualifies everything
+        to ``oe:``) or may still be bare if the plugin wasn't
+        registered (test fixtures constructing Plugin directly).
+
+        A linear scan — workflows have a few dozen activities at
+        most, so the cost is negligible compared to caching.
+        """
+        from .activity_names import local_name
+        target_local = local_name(activity_type)
         for act in self.workflow.get("activities", []):
-            if act.get("name") == activity_type:
+            if local_name(act.get("name", "")) == target_local:
                 return act
         return None
 
@@ -296,16 +306,32 @@ class PluginRegistry:
         self._plugins: dict[str, Plugin] = {}
 
     def register(self, plugin: Plugin):
+        """Register a plugin.
+
+        Normalizes all activity names to qualified form (``oe:foo``
+        instead of bare ``foo``). This runs on every registration
+        path — ``create_app`` and direct test fixtures — so the rest
+        of the engine always sees consistent qualified names.
+        """
+        _normalize_plugin_activity_names(plugin)
         self._plugins[plugin.name] = plugin
 
     def get(self, workflow_name: str) -> Plugin | None:
         return self._plugins.get(workflow_name)
 
     def get_for_activity(self, activity_type: str) -> tuple[Plugin, dict] | None:
-        """Find which plugin owns an activity type. Returns (plugin, activity_def)."""
+        """Find which plugin owns an activity type. Returns (plugin, activity_def).
+
+        Accepts both bare (``submit``) and qualified (``oe:submit``)
+        forms — bare names are qualified to the default prefix first.
+        The registry stores activities with qualified names, so the
+        lookup always compares qualified-to-qualified.
+        """
+        from .activity_names import qualify
+        qualified = qualify(activity_type)
         for plugin in self._plugins.values():
             for act in plugin.workflow.get("activities", []):
-                if act["name"] == activity_type:
+                if act["name"] == qualified:
                     return plugin, act
         return None
 
@@ -314,3 +340,75 @@ class PluginRegistry:
 
     def all_workflow_names(self) -> list[str]:
         return list(self._plugins.keys())
+
+
+def _normalize_plugin_activity_names(plugin: Plugin) -> None:
+    """Normalize activity names to qualified form in-place.
+
+    Qualifies bare activity names (``dienAanvraagIn``) to the
+    workflow's default prefix (``oe:dienAanvraagIn``). Also
+    qualifies cross-references in ``requirements``, ``forbidden``,
+    ``side_effects``, ``tasks.cancel_if_activities``, and
+    ``tasks.target_activity``.
+
+    Called from ``PluginRegistry.register``, so it runs for every
+    plugin load regardless of entry point. Idempotent — running it
+    twice is a no-op.
+
+    The default prefix comes from the namespace registry if
+    configured; otherwise falls back to ``oe``. In test fixtures
+    that skip ``create_app``, this fallback is correct for the
+    current toelatingen workflow.
+    """
+    from .activity_names import qualify
+
+    # Default prefix: registry if configured, else "oe".
+    try:
+        from .namespaces import namespaces
+        default_prefix = namespaces().default_workflow_prefix
+    except (RuntimeError, ImportError):
+        default_prefix = "oe"
+
+    wf = plugin.workflow
+    for act in wf.get("activities", []) or []:
+        if not isinstance(act, dict):
+            continue
+        name = act.get("name")
+        if name and ":" not in name:
+            act["name"] = qualify(name, default_prefix)
+
+        # `requirements` and `forbidden` are dicts with sub-keys
+        # `activities`, `statuses`, `entities`. Only the `activities`
+        # list contains cross-references to other activity names.
+        for field_key in ("requirements", "forbidden"):
+            block = act.get(field_key)
+            if isinstance(block, dict):
+                act_refs = block.get("activities") or []
+                if isinstance(act_refs, list):
+                    block["activities"] = [
+                        qualify(r, default_prefix) if isinstance(r, str) else r
+                        for r in act_refs
+                    ]
+
+        # `side_effects` is a list of activity names — cross-references
+        # fired after the current activity succeeds.
+        side = act.get("side_effects") or []
+        if isinstance(side, list):
+            act["side_effects"] = [
+                qualify(r, default_prefix) if isinstance(r, str) else r
+                for r in side
+            ]
+
+        # Tasks can reference cancel_if_activities by name
+        for task in act.get("tasks", []) or []:
+            if not isinstance(task, dict):
+                continue
+            cancel = task.get("cancel_if_activities") or []
+            if isinstance(cancel, list):
+                task["cancel_if_activities"] = [
+                    qualify(r, default_prefix) if isinstance(r, str) else r
+                    for r in cancel
+                ]
+            target = task.get("target_activity")
+            if isinstance(target, str) and ":" not in target:
+                task["target_activity"] = qualify(target, default_prefix)

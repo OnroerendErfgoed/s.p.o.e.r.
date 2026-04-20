@@ -280,7 +280,15 @@ async def cancel_matching_tasks(state: ActivityState) -> None:
             continue
 
         cancel_list = task_entity.content.get("cancel_if_activities", [])
-        if state.activity_def["name"] not in cancel_list:
+        # Compare by local name so bare names from handler code
+        # (``cancel_if_activities: ["vervolledigAanvraag"]``) match
+        # the qualified name on the current activity definition
+        # (``oe:vervolledigAanvraag``). Plugin authors can write
+        # either form without caring about normalization.
+        from ...activity_names import local_name
+        current_local = local_name(state.activity_def["name"])
+        cancel_locals = {local_name(n) for n in cancel_list}
+        if current_local not in cancel_locals:
             continue
 
         # Anchor scope: anchored tasks only cancel when this activity

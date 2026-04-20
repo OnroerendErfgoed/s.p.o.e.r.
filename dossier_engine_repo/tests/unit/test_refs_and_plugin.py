@@ -97,14 +97,24 @@ class TestEntityRefParse:
         """Parse accepts None (saves a guard at every call site)."""
         assert EntityRef.parse(None) is None
 
-    def test_uppercase_prefix_rejected(self):
-        """The regex is case-sensitive on the prefix: uppercase
-        letters don't match, so an uppercased prefix routes to
-        external. This is documented current behavior — locking
-        it in so a future refactor has to update the test to
-        relax the regex."""
+    def test_uppercase_prefix_accepted(self):
+        """The regex accepts mixed-case prefixes and local names to
+        support standard RDF vocabularies (foaf:Person,
+        dcterms:BibliographicResource, etc.). Only a leading-digit or
+        structurally malformed prefix is rejected."""
         ref = (
-            "OE:aanvraag/"
+            "FOAF:Person/"
+            "e1000000-0000-0000-0000-000000000001@"
+            "f1000000-0000-0000-0000-000000000001"
+        )
+        parsed = EntityRef.parse(ref)
+        assert parsed is not None
+        assert parsed.type == "FOAF:Person"
+
+    def test_leading_digit_prefix_rejected(self):
+        """Prefixes must start with a letter per RDF QName rules."""
+        ref = (
+            "1invalid:thing/"
             "e1000000-0000-0000-0000-000000000001@"
             "f1000000-0000-0000-0000-000000000001"
         )
@@ -405,7 +415,9 @@ class TestPluginRegistry:
         assert result is not None
         plugin, act_def = result
         assert plugin is p2
-        assert act_def["name"] == "approve"
+        # After registration, activity names are normalized to the
+        # qualified form (default prefix `oe:`).
+        assert act_def["name"] == "oe:approve"
 
     def test_get_for_activity_missing_returns_none(self):
         registry = PluginRegistry()

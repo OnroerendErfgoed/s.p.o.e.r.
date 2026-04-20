@@ -86,8 +86,138 @@ def load_config_and_registry(config_path: str = "config.yaml") -> tuple[dict, Pl
     return config, registry
 
 
+def _validate_plugin_prefixes(plugin, ns_registry) -> None:
+    """Walk a plugin's workflow YAML and verify every qualified type
+    name uses a declared prefix.
+
+    Covers: entity types, workflow-level relation types, activity-level
+    relation types, and activity `generates`/`used`/`tombstones`
+    declarations. Raises ValueError on first unknown prefix with a
+    clear path to the offending declaration.
+    """
+    wf = plugin.workflow
+
+    # Activity name validation — ``name`` may be bare or qualified.
+    # Qualified forms must use a declared prefix.
+    for act in wf.get("activities", []) or []:
+        if isinstance(act, dict):
+            name = act.get("name", "")
+            if name and ":" in name:
+                try:
+                    ns_registry.validate_type(name)
+                except ValueError as e:
+                    raise ValueError(
+                        f"In plugin '{plugin.name}', activity name {name!r}: {e}"
+                    ) from None
+
+    # Entity type declarations
+    for et in wf.get("entity_types", []) or []:
+        t = et.get("type") if isinstance(et, dict) else et
+        if t and isinstance(t, str):
+            try:
+                ns_registry.validate_type(t)
+            except ValueError as e:
+                raise ValueError(
+                    f"In plugin '{plugin.name}', entity_types[...]: {e}"
+                ) from None
+
+    # Workflow-level relation declarations
+    for rel in wf.get("relations", []) or []:
+        if isinstance(rel, dict):
+            t = rel.get("type")
+            if t:
+                try:
+                    ns_registry.validate_type(t)
+                except ValueError as e:
+                    raise ValueError(
+                        f"In plugin '{plugin.name}', relations[...]: {e}"
+                    ) from None
+
+    # Activity-level declarations
+    for act in wf.get("activities", []) or []:
+        if not isinstance(act, dict):
+            continue
+        act_name = act.get("name", "?")
+        # generates
+        for gen in act.get("generates", []) or []:
+            if isinstance(gen, str):
+                try:
+                    ns_registry.validate_type(gen)
+                except ValueError as e:
+                    raise ValueError(
+                        f"In plugin '{plugin.name}', activity '{act_name}' "
+                        f"generates[...]: {e}"
+                    ) from None
+        # used
+        for used in act.get("used", []) or []:
+            t = used.get("type") if isinstance(used, dict) else used
+            if t and isinstance(t, str):
+                try:
+                    ns_registry.validate_type(t)
+                except ValueError as e:
+                    raise ValueError(
+                        f"In plugin '{plugin.name}', activity '{act_name}' "
+                        f"used[...]: {e}"
+                    ) from None
+        # activity-level relations
+        for rel in act.get("relations", []) or []:
+            if isinstance(rel, dict):
+                t = rel.get("type")
+                if t:
+                    try:
+                        ns_registry.validate_type(t)
+                    except ValueError as e:
+                        raise ValueError(
+                            f"In plugin '{plugin.name}', activity '{act_name}' "
+                            f"relations[...]: {e}"
+                        ) from None
+
+
 def create_app(config_path: str = "config.yaml") -> FastAPI:
     config, registry = load_config_and_registry(config_path)
+
+    # Configure the IRI namespace used for PROV entity/activity/agent
+    # IRIs and for classify_ref(). Must happen before any route that
+    # generates or parses IRIs is registered.
+    iri_base = config.get("iri_base", {})
+    if iri_base:
+        from .prov_iris import configure_iri_base
+        configure_iri_base(
+            dossier_prefix=iri_base.get("dossier", "https://id.erfgoed.net/dossiers/"),
+            ontology_ns=iri_base.get("ontology", "https://id.erfgoed.net/vocab/ontology#"),
+        )
+
+    # Build the namespace registry. Seeded with built-in RDF/PROV
+    # prefixes; app-level `namespaces:` in config.yaml adds globals;
+    # each plugin can add its own workflow-specific prefixes.
+    from .namespaces import NamespaceRegistry, set_namespaces
+    ns_registry = NamespaceRegistry()
+
+    # The workflow ontology prefix comes from `iri_base.ontology`.
+    # Register it as the plugin's default prefix, name it "oe" by
+    # default (overrideable via `iri_base.ontology_prefix`).
+    default_prefix = iri_base.get("ontology_prefix", "oe")
+    default_iri = iri_base.get("ontology", "https://id.erfgoed.net/vocab/ontology#")
+    ns_registry.register(default_prefix, default_iri)
+    ns_registry.default_workflow_prefix = default_prefix
+
+    # App-level shared namespaces (FOAF, Dublin Core, etc.).
+    for prefix, iri in (config.get("namespaces") or {}).items():
+        ns_registry.register(prefix, iri)
+
+    # Per-plugin namespaces declared in each workflow.yaml.
+    for plugin in registry.all_plugins():
+        for prefix, iri in (plugin.workflow.get("namespaces") or {}).items():
+            ns_registry.register(prefix, iri)
+
+    # Validate every entity type / relation type referenced by every
+    # plugin. Fails fast at startup on typo'd or undeclared prefixes.
+    # (Activity names themselves are normalized to qualified form
+    # inside PluginRegistry.register — see plugin.py.)
+    for plugin in registry.all_plugins():
+        _validate_plugin_prefixes(plugin, ns_registry)
+
+    set_namespaces(ns_registry)
 
     app = FastAPI(
         title="Dossier API",

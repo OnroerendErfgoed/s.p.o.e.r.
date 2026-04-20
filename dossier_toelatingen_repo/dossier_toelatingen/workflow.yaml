@@ -2,6 +2,17 @@ name: "toelatingen"
 description: "Toelatingen beschermd erfgoed"
 version: "0.1"
 
+# Namespace prefixes used in this workflow's entity types, relations,
+# and PROV output. ``oe:`` is pre-registered from config.yaml's
+# iri_base.ontology. Add any external vocabularies here to use them
+# in entity types (e.g. ``foaf:Person``) or relation types.
+# Built-in prefixes (prov, xsd, rdf, rdfs) are always available.
+namespaces:
+  # Example — uncomment to adopt an external ontology:
+  # foaf: "http://xmlns.com/foaf/0.1/"
+  # dcterms: "http://purl.org/dc/terms/"
+  # schema: "http://schema.org/"
+
 roles:
   - name: "oe:aanvrager"
     description: "Aanvrager van de toelating"

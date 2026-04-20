@@ -8,7 +8,6 @@ Provides:
 - validators
 - task handlers
 - post_activity_hook (updates search indices)
-- search_route_factory (registers /dossiers/toelatingen/search)
 """
 
 from __future__ import annotations
@@ -80,34 +79,73 @@ async def update_search_index(repo, dossier_id, activity_type, status, entities)
 
 
 def register_search_routes(app, get_user):
-    """Register toelatingen-specific search endpoint."""
+    """Register toelatingen search endpoint at /toelatingen/dossiers.
+
+    This replaces a generic engine-level listing. The toelatingen
+    workflow exposes rich query parameters (gemeente, status,
+    handeling, date range, aanvrager identity) that are specific to
+    this workflow's entity content and wouldn't make sense for other
+    workflows. Each plugin owns its own search endpoint.
+    """
     from fastapi import Depends, Query
+    from sqlalchemy import select
     from dossier_engine.auth import User
+    from dossier_engine.db import get_session_factory
+    from dossier_engine.db.models import DossierRow
 
     @app.get(
-        "/dossiers/toelatingen/search",
+        "/toelatingen/dossiers",
         tags=["toelatingen"],
-        summary="Search toelatingen dossiers",
-        description="Search the toelatingen Elasticsearch index. "
-                    "POC stub — returns empty results. "
-                    "In production, queries the dossiers-toelatingen index.",
+        summary="List/search toelatingen dossiers",
+        description=(
+            "List and search toelatingen dossiers. In production "
+            "queries the `dossiers-toelatingen` Elasticsearch index. "
+            "In the POC this falls back to a simple Postgres filter "
+            "on workflow name."
+        ),
     )
     async def search_toelatingen(
-        q: str = Query(None, description="Full-text search query"),
-        gemeente: str = Query(None, description="Filter by gemeente"),
-        status: str = Query(None, description="Filter by status"),
+        q: str = Query(None, description="Full-text search over aanvraag content"),
+        gemeente: str = Query(None, description="Filter by gemeente (e.g. 'brugge')"),
+        status: str = Query(None, description="Filter by dossier status"),
+        handeling: str = Query(None, description="Filter by handeling type"),
+        limit: int = Query(100, ge=1, le=500),
         user: User = Depends(get_user),
     ):
         # In production:
-        # query = build_es_query(q=q, gemeente=gemeente, status=status, user=user)
+        # query = build_es_query(q=q, gemeente=gemeente, status=status,
+        #                        handeling=handeling, user=user)
         # results = await es.search(index="dossiers-toelatingen", body=query)
         # return {"results": [hit["_source"] for hit in results["hits"]["hits"]]}
 
-        return {
-            "message": "Search stub — Elasticsearch not connected",
-            "query": {"q": q, "gemeente": gemeente, "status": status},
-            "results": [],
-        }
+        # POC: Postgres fallback with workflow filter only.
+        session_factory = get_session_factory()
+        async with session_factory() as session, session.begin():
+            stmt = (
+                select(DossierRow)
+                .where(DossierRow.workflow == "toelatingen")
+                .order_by(DossierRow.created_at.desc())
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            dossiers = list(result.scalars().all())
+
+            return {
+                "query": {
+                    "q": q, "gemeente": gemeente,
+                    "status": status, "handeling": handeling,
+                },
+                "results": [
+                    {
+                        "id": str(d.id),
+                        "workflow": d.workflow,
+                        "createdAt": d.created_at.isoformat() if d.created_at else None,
+                    }
+                    for d in dossiers
+                ],
+                "note": "POC stub — Elasticsearch not connected. Filters "
+                        "are not yet applied; only workflow filtering runs.",
+            }
 
 
 def create_plugin() -> Plugin:

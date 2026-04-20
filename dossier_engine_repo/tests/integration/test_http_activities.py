@@ -202,7 +202,7 @@ class TestPutActivityHappyPath:
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["activity"]["id"] == str(activity_id)
-        assert body["activity"]["type"] == "createStuff"
+        assert body["activity"]["type"] == "oe:createStuff"
         assert body["dossier"]["id"] == str(D1)
         assert body["dossier"]["status"] == "ingediend"
         # Generated entity appears in the response
@@ -509,8 +509,8 @@ class TestPutActivityBatch:
         assert r.status_code == 200, r.text
         body = r.json()
         assert len(body["activities"]) == 2
-        assert body["activities"][0]["activity"]["type"] == "createStuff"
-        assert body["activities"][1]["activity"]["type"] == "readStuff"
+        assert body["activities"][0]["activity"]["type"] == "oe:createStuff"
+        assert body["activities"][1]["activity"]["type"] == "oe:readStuff"
         # Final dossier state reflects the last activity
         assert body["dossier"]["status"] == "beoordeeld"
 
@@ -583,7 +583,7 @@ class TestPutActivityTypedWrapper:
         aanvraag_ref, _, _ = _new_ref("oe:aanvraag")
 
         r = await activity_client.put(
-            f"/testwf/dossiers/{D1}/activities/{activity_id}/createStuff",
+            f"/testwf/dossiers/{D1}/activities/{activity_id}/oe:createStuff",
             json={
                 # No "type" field — the URL carries it
                 "generated": [
@@ -594,7 +594,7 @@ class TestPutActivityTypedWrapper:
         )
         assert r.status_code == 200, r.text
         body = r.json()
-        assert body["activity"]["type"] == "createStuff"
+        assert body["activity"]["type"] == "oe:createStuff"
 
     async def test_typed_wrapper_not_registered_for_noncallable(
         self, activity_client, repo,

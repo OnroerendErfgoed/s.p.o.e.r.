@@ -125,11 +125,21 @@ plugins:
 Start the API. Your endpoints appear automatically:
 
 ```
-PUT /mijn_workflow/dossiers/{id}/activities/{id}/dienAanvraagIn
-PUT /mijn_workflow/dossiers/{id}/activities/{id}/behandelAanvraag
+PUT /mijn_workflow/dossiers/{id}/activities/{id}/oe:dienAanvraagIn
+PUT /mijn_workflow/dossiers/{id}/activities/{id}/oe:behandelAanvraag
 GET /dossiers/{id}
 GET /dossiers/{id}/prov
 ```
+
+Note the `oe:` prefix in the activity URL. Type-like path segments
+are always qualified — entity types (`/entities/oe:aanvraag/...`)
+and activity types (`/activities/{id}/oe:dienAanvraagIn`) follow
+the same convention. If you declare a bare name (`dienAanvraagIn`)
+in your workflow YAML, the engine automatically qualifies it to
+the default prefix. Your client can also use the generic endpoint
+`PUT /{workflow}/dossiers/{id}/activities/{id}` with a bare name
+in the body's `type` field — the engine qualifies on the server
+side.
 
 ## Adding complexity gradually
 
@@ -335,6 +345,54 @@ Plugin(...,
     search_route_factory=register_search,
 )
 ```
+
+### Using external ontologies
+
+Your workflow doesn't have to invent its own vocabulary for everything. You can adopt types from standard ontologies like FOAF (people), Dublin Core (documents), Schema.org (general-purpose), or PROV (provenance itself). This makes your PROV graph interoperable — other systems that understand these vocabularies can consume your data directly.
+
+Declare external prefixes in your `workflow.yaml`:
+
+```yaml
+namespaces:
+  foaf: "http://xmlns.com/foaf/0.1/"
+  dcterms: "http://purl.org/dc/terms/"
+  schema: "http://schema.org/"
+```
+
+Then use them anywhere a qualified type goes — entity types, relations, activity generates/used:
+
+```yaml
+entity_types:
+  - type: "oe:aanvraag"          # your own ontology
+    cardinality: multiple
+    schema: "my_workflow.entities.Aanvraag"
+
+  - type: "foaf:Person"           # adopted from FOAF
+    cardinality: multiple
+    schema: "my_workflow.entities.Person"
+
+  - type: "dcterms:BibliographicResource"   # adopted from Dublin Core
+    cardinality: multiple
+    schema: "my_workflow.entities.Document"
+
+relations:
+  - type: "oe:betreft"
+    kind: domain
+  - type: "dcterms:isPartOf"      # Dublin Core relation
+    kind: domain
+    from_types: [entity]
+    to_types: [entity]
+```
+
+**What the engine does with this:**
+
+1. At plugin load, validates that every qualified type references a declared prefix. Typo `foa:Person` instead of `foaf:Person`? You get a clear error at startup, not a runtime surprise.
+2. PROV-JSON exports include a full `prefixes` block with all your declarations, so downstream consumers can expand `foaf:Person` → `http://xmlns.com/foaf/0.1/Person`.
+3. Reference refs like `foaf:Person/e1@v1` parse correctly. Entity IRIs look like `https://{platform}/dossiers/{did}/entities/foaf:Person/{eid}/{vid}` — self-describing.
+
+**Important distinction:** using `foaf:Person` as an entity type means your engine *stores* `foaf:Person` instances (you own the data, you manage the versioning, the engine persists them). It doesn't mean you link to FOAF instances that live elsewhere — those are external URIs (`{"entity": "http://example.org/agents/bob"}`).
+
+Built-in prefixes (`prov`, `xsd`, `rdf`, `rdfs`) are always available; you don't need to declare them. Your plugin's own prefix (`oe` by default) is registered from `config.yaml`'s `iri_base.ontology`.
 
 ## What you don't need to think about
 

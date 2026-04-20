@@ -173,37 +173,20 @@ def register(
     ):
         return await _handle_batch(dossier_id, request, user)
 
-    # --- Workflow-scoped routes ---
+    # --- Workflow-scoped routes (registered per plugin so the
+    # workflow name appears literally in the URL, not as a
+    # {workflow} placeholder in the OpenAPI schema) ---
 
-    @app.put(
-        "/{workflow}/dossiers/{dossier_id}/activities/{activity_id}",
-        response_model=FullResponse,
-        tags=["activities"],
-        summary="Execute an activity (workflow-scoped)",
-    )
-    async def put_activity_scoped(
-        workflow: str,
-        dossier_id: UUID,
-        activity_id: UUID,
-        request: ActivityRequest,
-        user: User = Depends(get_user),
-    ):
-        return await _handle_single(dossier_id, activity_id, request, user, workflow_override=workflow)
+    for plugin in registry.all_plugins():
+        _register_workflow_scoped_generic(
+            app=app,
+            workflow_name=plugin.name,
+            handle_single=_handle_single,
+            handle_batch=_handle_batch,
+            get_user=get_user,
+        )
 
-    @app.put(
-        "/{workflow}/dossiers/{dossier_id}/activities",
-        tags=["activities"],
-        summary="Execute multiple activities atomically (workflow-scoped)",
-    )
-    async def execute_batch_scoped(
-        workflow: str,
-        dossier_id: UUID,
-        request: BatchActivityRequest,
-        user: User = Depends(get_user),
-    ):
-        return await _handle_batch(dossier_id, request, user, workflow_override=workflow)
-
-    # --- Per-workflow typed wrappers (workflow-scoped only) ---
+    # --- Per-workflow typed wrappers ---
 
     for plugin in registry.all_plugins():
         workflow_name = plugin.name
@@ -221,6 +204,61 @@ def register(
             )
 
 
+def _register_workflow_scoped_generic(
+    *,
+    app: FastAPI,
+    workflow_name: str,
+    handle_single,
+    handle_batch,
+    get_user,
+) -> None:
+    """Register generic single + batch activity routes for one workflow.
+
+    The workflow name is baked into the URL literally (not as a
+    path parameter) so the OpenAPI schema shows
+    ``/toelatingen/dossiers/...`` instead of
+    ``/{workflow}/dossiers/...``.
+    """
+
+    @app.put(
+        f"/{workflow_name}/dossiers/{{dossier_id}}/activities/{{activity_id}}",
+        response_model=FullResponse,
+        tags=[workflow_name],
+        summary="Execute an activity",
+    )
+    async def put_activity_scoped(
+        dossier_id: UUID,
+        activity_id: UUID,
+        request: ActivityRequest,
+        user: User = Depends(get_user),
+    ):
+        return await handle_single(
+            dossier_id, activity_id, request, user,
+            workflow_override=workflow_name,
+        )
+
+    put_activity_scoped.__name__ = f"put_activity_{workflow_name}"
+    put_activity_scoped.__qualname__ = f"put_activity_{workflow_name}"
+
+    @app.put(
+        f"/{workflow_name}/dossiers/{{dossier_id}}/activities",
+        tags=[workflow_name],
+        summary="Execute multiple activities atomically",
+    )
+    async def execute_batch_scoped(
+        dossier_id: UUID,
+        request: BatchActivityRequest,
+        user: User = Depends(get_user),
+    ):
+        return await handle_batch(
+            dossier_id, request, user,
+            workflow_override=workflow_name,
+        )
+
+    execute_batch_scoped.__name__ = f"batch_{workflow_name}"
+    execute_batch_scoped.__qualname__ = f"batch_{workflow_name}"
+
+
 def _register_typed_route(
     *,
     app: FastAPI,
@@ -233,32 +271,46 @@ def _register_typed_route(
 ) -> None:
     """Register one per-workflow typed route for `act_name`.
 
-    Uses the generic `ActivityRequest` model and bakes the activity
-    type into the URL. The response model and request shape are
-    identical to the generic single endpoint — only the OpenAPI
-    metadata (tag, summary, description) differs.
+    ``act_name`` is the *qualified* activity name (e.g.
+    ``oe:dienAanvraagIn``) and appears directly in the URL path
+    segment. This mirrors the entity URL convention where type
+    segments are also qualified (``/entities/oe:aanvraag/...``), so
+    the platform has one consistent rule: type-like path segments
+    always carry the full qualified name.
+
+    A URL with a qualified name looks like::
+
+        PUT /toelatingen/dossiers/{did}/activities/{aid}/oe:dienAanvraagIn
+
+    FastAPI accepts colons in path segments without issue. Clients
+    that would rather use bare names can use the generic endpoint
+    (``PUT /{workflow}/dossiers/{did}/activities/{aid}``) with
+    ``"type": "dienAanvraagIn"`` in the body — the engine qualifies
+    that to ``oe:dienAanvraagIn`` before resolution.
     """
 
     @app.put(
-        f"/{{workflow}}/dossiers/{{dossier_id}}/activities/{{activity_id}}/{act_name}",
+        f"/{workflow_name}/dossiers/{{dossier_id}}/activities/{{activity_id}}/{act_name}",
         response_model=FullResponse,
         tags=[workflow_name],
         summary=act_label,
         description=act_desc,
     )
     async def endpoint(
-        workflow: str,
         dossier_id: UUID,
         activity_id: UUID,
         request: ActivityRequest,
         user: User = Depends(get_user),
     ):
+        # Stamp the qualified activity type on the request, so the
+        # engine's resolve-plugin-and-def code sees the canonical
+        # form regardless of what (if anything) the client supplied.
         request.type = act_name
         if not request.workflow:
-            request.workflow = workflow
+            request.workflow = workflow_name
 
         plugin, act_def = _resolve_plugin_and_def(
-            registry, act_name, workflow,
+            registry, act_name, workflow_name,
         )
 
         session_factory = get_session_factory()
@@ -281,10 +333,11 @@ def _register_typed_route(
                     informed_by=request.informed_by,
                 )
 
-    # FastAPI uses function name for route uniqueness — without this,
-    # every typed wrapper would collide on `endpoint`.
-    endpoint.__name__ = f"typed_{act_name}"
-    endpoint.__qualname__ = f"typed_{act_name}"
+    # FastAPI uses function name for route uniqueness. Strip the
+    # colon from the name since it's invalid in Python identifiers.
+    safe_name = act_name.replace(":", "_")
+    endpoint.__name__ = f"typed_{workflow_name}_{safe_name}"
+    endpoint.__qualname__ = f"typed_{workflow_name}_{safe_name}"
 
 
 def _resolve_plugin_and_def(
@@ -293,6 +346,12 @@ def _resolve_plugin_and_def(
     workflow_name: str | None,
 ) -> tuple[Plugin, dict]:
     """Find the plugin and activity definition for `activity_type`.
+
+    ``activity_type`` can arrive in bare (``dienAanvraagIn``) or
+    qualified (``oe:dienAanvraagIn``) form — both resolve to the
+    same activity. The registry stores activities by their qualified
+    name (guaranteed by ``_normalize_activity_names`` at plugin
+    load), so we qualify the incoming value before lookup.
 
     Two paths:
 
@@ -306,7 +365,11 @@ def _resolve_plugin_and_def(
 
     Raises 404 if neither path resolves.
     """
-    result = registry.get_for_activity(activity_type)
+    from ..activity_names import qualify
+
+    qualified_type = qualify(activity_type)
+
+    result = registry.get_for_activity(qualified_type)
     if result is not None:
         return result
 
@@ -322,7 +385,7 @@ def _resolve_plugin_and_def(
         )
 
     for a in plugin.workflow.get("activities", []):
-        if a["name"] == activity_type:
+        if a["name"] == qualified_type:
             return plugin, a
     raise HTTPException(
         404, detail=f"Unknown activity: {activity_type}",

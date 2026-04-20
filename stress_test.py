@@ -109,7 +109,7 @@ def make_d2_flow(dossier_idx: int) -> list[dict]:
 
     # Step 1: dienAanvraagIn
     steps.append({
-        "path": f"/dossiers/{did}/activities/a0{dossier_idx:06d}-0001-0000-0000-000000000001/dienAanvraagIn",
+        "path": f"/toelatingen/dossiers/{did}/activities/a0{dossier_idx:06d}-0001-0000-0000-000000000001/oe:dienAanvraagIn",
         "user": user,
         "body": {
             "workflow": "toelatingen",
@@ -130,7 +130,7 @@ def make_d2_flow(dossier_idx: int) -> list[dict]:
 
     # Step 2: doeVoorstelBeslissing (onvolledig)
     steps.append({
-        "path": f"/dossiers/{did}/activities/a0{dossier_idx:06d}-0002-0000-0000-000000000001/doeVoorstelBeslissing",
+        "path": f"/toelatingen/dossiers/{did}/activities/a0{dossier_idx:06d}-0002-0000-0000-000000000001/oe:doeVoorstelBeslissing",
         "user": behandelaar,
         "body": {
             "used": [{"entity": f"oe:aanvraag/{eid_aanvraag}@{v[0]}"}],
@@ -148,7 +148,7 @@ def make_d2_flow(dossier_idx: int) -> list[dict]:
 
     # Step 3: tekenBeslissing (sophie signs → onvolledig)
     steps.append({
-        "path": f"/dossiers/{did}/activities/a0{dossier_idx:06d}-0003-0000-0000-000000000001/tekenBeslissing",
+        "path": f"/toelatingen/dossiers/{did}/activities/a0{dossier_idx:06d}-0003-0000-0000-000000000001/oe:tekenBeslissing",
         "user": "sophie.tekent",
         "body": {
             "used": [{"entity": f"oe:beslissing/{eid_beslissing}@{v[1]}"}],
@@ -161,7 +161,7 @@ def make_d2_flow(dossier_idx: int) -> list[dict]:
 
     # Step 4: vervolledigAanvraag
     steps.append({
-        "path": f"/dossiers/{did}/activities/a0{dossier_idx:06d}-0004-0000-0000-000000000001/vervolledigAanvraag",
+        "path": f"/toelatingen/dossiers/{did}/activities/a0{dossier_idx:06d}-0004-0000-0000-000000000001/oe:vervolledigAanvraag",
         "user": user,
         "body": {
             "used": [{"entity": obj_uri}],
@@ -182,7 +182,7 @@ def make_d2_flow(dossier_idx: int) -> list[dict]:
 
     # Step 5: bewerkAanvraag
     steps.append({
-        "path": f"/dossiers/{did}/activities/a0{dossier_idx:06d}-0005-0000-0000-000000000001/bewerkAanvraag",
+        "path": f"/toelatingen/dossiers/{did}/activities/a0{dossier_idx:06d}-0005-0000-0000-000000000001/oe:bewerkAanvraag",
         "user": behandelaar,
         "body": {
             "used": [{"entity": obj_uri}],
@@ -203,7 +203,7 @@ def make_d2_flow(dossier_idx: int) -> list[dict]:
 
     # Step 6: doeVoorstelBeslissing (goedgekeurd)
     steps.append({
-        "path": f"/dossiers/{did}/activities/a0{dossier_idx:06d}-0006-0000-0000-000000000001/doeVoorstelBeslissing",
+        "path": f"/toelatingen/dossiers/{did}/activities/a0{dossier_idx:06d}-0006-0000-0000-000000000001/oe:doeVoorstelBeslissing",
         "user": behandelaar,
         "body": {
             "used": [{"entity": f"oe:aanvraag/{eid_aanvraag}@{v[4]}"}],
@@ -222,7 +222,7 @@ def make_d2_flow(dossier_idx: int) -> list[dict]:
 
     # Step 7: tekenBeslissing (sophie declines)
     steps.append({
-        "path": f"/dossiers/{did}/activities/a0{dossier_idx:06d}-0007-0000-0000-000000000001/tekenBeslissing",
+        "path": f"/toelatingen/dossiers/{did}/activities/a0{dossier_idx:06d}-0007-0000-0000-000000000001/oe:tekenBeslissing",
         "user": "sophie.tekent",
         "body": {
             "used": [{"entity": f"oe:beslissing/{eid_beslissing}@{v[5]}"}],
@@ -236,7 +236,7 @@ def make_d2_flow(dossier_idx: int) -> list[dict]:
 
     # Step 8: doeVoorstelBeslissing (goedgekeurd again)
     steps.append({
-        "path": f"/dossiers/{did}/activities/a0{dossier_idx:06d}-0008-0000-0000-000000000001/doeVoorstelBeslissing",
+        "path": f"/toelatingen/dossiers/{did}/activities/a0{dossier_idx:06d}-0008-0000-0000-000000000001/oe:doeVoorstelBeslissing",
         "user": behandelaar,
         "body": {
             "used": [{"entity": f"oe:aanvraag/{eid_aanvraag}@{v[4]}"}],
@@ -255,7 +255,7 @@ def make_d2_flow(dossier_idx: int) -> list[dict]:
 
     # Step 9: tekenBeslissing (sophie signs → goedgekeurd)
     steps.append({
-        "path": f"/dossiers/{did}/activities/a0{dossier_idx:06d}-0009-0000-0000-000000000001/tekenBeslissing",
+        "path": f"/toelatingen/dossiers/{did}/activities/a0{dossier_idx:06d}-0009-0000-0000-000000000001/oe:tekenBeslissing",
         "user": "sophie.tekent",
         "body": {
             "used": [{"entity": f"oe:beslissing/{eid_beslissing}@{v[7]}"}],
@@ -492,8 +492,10 @@ async def seed_dossiers(count: int, config_path: str):
 
                     for step_idx, step in enumerate(steps):
                         path_parts = step["path"].split("/")
-                        activity_id = UUID(path_parts[4])
-                        activity_type = path_parts[5] if len(path_parts) > 5 else step["body"].get("type")
+                        # Path: /toelatingen/dossiers/{did}/activities/{aid}/{type}
+                        #        [1]         [2]       [3]   [4]        [5]   [6]
+                        activity_id = UUID(path_parts[5])
+                        activity_type = path_parts[6] if len(path_parts) > 6 else step["body"].get("type")
 
                         act_def = act_def_map.get(activity_type)
                         if not act_def:

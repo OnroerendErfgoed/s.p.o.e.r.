@@ -62,7 +62,11 @@ async def validate_tombstone(state: ActivityState) -> None:
     Writes: state.tombstone_version_ids
     Raises: 422 with a structured payload on every shape violation.
     """
-    if state.activity_def.get("name") != "tombstone":
+    # Match by local name so the built-in activity resolves whether
+    # stored as bare ``tombstone`` (old YAML) or qualified
+    # ``oe:tombstone`` (after normalization in PluginRegistry.register).
+    from ...activity_names import local_name
+    if local_name(state.activity_def.get("name", "")) != "tombstone":
         return
 
     used_entity_rows = list(state.used_rows_by_ref.values())

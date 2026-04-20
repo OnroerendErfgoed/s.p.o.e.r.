@@ -1,12 +1,16 @@
-"""add domain_relations table
+"""add domain_relations table (no-op, folded into initial_schema)
 
 Revision ID: a3c1e7d4f890
 Revises: 6226f68ae484
 Create Date: 2026-04-16
+
+This migration is a no-op. The ``domain_relations`` table was added
+to the initial_schema migration when the models were regenerated,
+which caused this migration to fail on fresh databases ("table
+already exists"). The file is kept as the tip of the migration chain
+so Alembic's revision graph stays intact.
 """
 from alembic import op
-import sqlalchemy as sa
-from sqlalchemy.dialects.postgresql import UUID
 
 revision = "a3c1e7d4f890"
 down_revision = "6226f68ae484"
@@ -15,24 +19,9 @@ depends_on = None
 
 
 def upgrade():
-    op.create_table(
-        "domain_relations",
-        sa.Column("id", UUID(as_uuid=True), primary_key=True),
-        sa.Column("dossier_id", UUID(as_uuid=True), sa.ForeignKey("dossiers.id"), nullable=False),
-        sa.Column("relation_type", sa.Text(), nullable=False),
-        sa.Column("from_ref", sa.Text(), nullable=False),
-        sa.Column("to_ref", sa.Text(), nullable=False),
-        sa.Column("created_by_activity_id", UUID(as_uuid=True), sa.ForeignKey("activities.id"), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
-        sa.Column("superseded_by_activity_id", UUID(as_uuid=True), sa.ForeignKey("activities.id"), nullable=True),
-        sa.Column("superseded_at", sa.DateTime(timezone=True), nullable=True),
-    )
-    op.create_index("ix_domain_rel_dossier", "domain_relations", ["dossier_id"])
-    op.create_index("ix_domain_rel_type", "domain_relations", ["relation_type"])
-    op.create_index("ix_domain_rel_from", "domain_relations", ["from_ref"])
-    op.create_index("ix_domain_rel_to", "domain_relations", ["to_ref"])
-    op.create_index("ix_domain_rel_active", "domain_relations", ["dossier_id", "superseded_at"])
+    # Folded into initial_schema. No-op.
+    pass
 
 
 def downgrade():
-    op.drop_table("domain_relations")
+    pass

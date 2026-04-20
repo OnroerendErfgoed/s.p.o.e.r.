@@ -41,19 +41,63 @@ from __future__ import annotations
 
 from uuid import UUID
 
-# Base URI templates
+# Base URI templates.
+#
+# These default to the Flemish heritage agency's namespace. Call
+# ``configure_iri_base()`` at app startup (from config.yaml) to
+# override for a different organisation. The values must end with
+# the separator expected by the templates below:
+#
+#   dossier:  ".../dossiers/"  (trailing slash; dossier_id appended)
+#   ontology: ".../ontology#"  (trailing hash; local name appended)
 DOSSIER_BASE = "https://id.erfgoed.net/dossiers/{dossier_id}/"
 OE_NS = "https://id.erfgoed.net/vocab/ontology#"
 
 
+def configure_iri_base(dossier_prefix: str, ontology_ns: str) -> None:
+    """Override the default IRI base and ontology namespace.
+
+    Called once at app startup from the loaded config. Subsequent
+    calls replace the values again; this is fine for tests but
+    shouldn't happen in production.
+
+    `dossier_prefix` should end with a trailing slash, e.g.
+    ``https://city.example.com/dossiers/``. The engine appends
+    ``{dossier_id}/entities/...`` etc. to build full IRIs.
+
+    `ontology_ns` should end with ``#``, e.g.
+    ``https://city.example.com/vocab/ontology#``.
+    """
+    global DOSSIER_BASE, OE_NS
+    if not dossier_prefix.endswith("/"):
+        dossier_prefix = dossier_prefix + "/"
+    if not ontology_ns.endswith("#"):
+        ontology_ns = ontology_ns + "#"
+    DOSSIER_BASE = dossier_prefix + "{dossier_id}/"
+    OE_NS = ontology_ns
+
+
 def prov_prefixes(dossier_id: UUID | str) -> dict:
-    """Standard PROV-JSON prefix block for a dossier."""
-    return {
-        "prov": "http://www.w3.org/ns/prov#",
-        "xsd": "http://www.w3.org/2001/XMLSchema#",
-        "oe": OE_NS,
-        "dossier": DOSSIER_BASE.format(dossier_id=dossier_id),
-    }
+    """Standard PROV-JSON prefix block for a dossier.
+
+    Pulls from the global namespace registry, always adding the
+    per-dossier ``dossier:`` prefix. If the registry isn't yet
+    configured (e.g. running outside create_app), falls back to the
+    pre-registry static set.
+    """
+    try:
+        from .namespaces import namespaces
+        reg = namespaces()
+        prefixes = reg.as_dict()
+    except RuntimeError:
+        # Registry not configured — legacy fallback.
+        prefixes = {
+            "prov": "http://www.w3.org/ns/prov#",
+            "xsd": "http://www.w3.org/2001/XMLSchema#",
+            "oe": OE_NS,
+        }
+    prefixes["dossier"] = DOSSIER_BASE.format(dossier_id=dossier_id)
+    return prefixes
 
 
 def _strip_ns(entity_type: str) -> str:
@@ -68,16 +112,30 @@ def _strip_ns(entity_type: str) -> str:
     return entity_type
 
 
+def _default_prefix() -> str:
+    """Return the workflow's default prefix (``oe`` by default).
+
+    Reads from the namespace registry; falls back to ``oe`` if the
+    registry isn't yet configured (tests, ad-hoc usage).
+    """
+    try:
+        from .namespaces import namespaces
+        return namespaces().default_workflow_prefix
+    except RuntimeError:
+        return "oe"
+
+
 def _type_ns(entity_type: str) -> str:
     """Return the namespace prefix for a type.
 
     'oe:aanvraag'   → 'oe'
     'system:task'    → 'system'
-    'external'       → 'oe'  (default)
+    'foaf:Person'    → 'foaf'
+    'external'       → default workflow prefix (from registry)
     """
     if ":" in entity_type:
         return entity_type.split(":", 1)[0]
-    return "oe"
+    return _default_prefix()
 
 
 def entity_qname(entity_type: str, entity_id: UUID | str, version_id: UUID | str) -> str:
@@ -128,13 +186,16 @@ def prov_type_value(entity_type: str) -> dict:
     """Build a prov:type value with proper QName.
 
     'oe:aanvraag' → {"$": "oe:aanvraag", "type": "xsd:QName"}
-    'system:task'  → {"$": "oe:task", "type": "xsd:QName"}
+    'system:task' → {"$": "oe:task", "type": "xsd:QName"}   (system is
+                    engine-internal; surface as the workflow's default
+                    prefix in PROV output)
+    'foaf:Person' → {"$": "foaf:Person", "type": "xsd:QName"}
     """
-    # Normalise: system: types get oe: prefix for the ontology
     ns = _type_ns(entity_type)
     bare = _strip_ns(entity_type)
     if ns == "system":
-        qname = f"oe:{bare}"
+        # Engine-internal namespace; surface as workflow's default.
+        qname = f"{_default_prefix()}:{bare}"
     else:
         qname = f"{ns}:{bare}"
     return {"$": qname, "type": "xsd:QName"}
@@ -143,14 +204,16 @@ def prov_type_value(entity_type: str) -> dict:
 def agent_type_value(agent_type: str) -> dict:
     """Build a prov:type value for an agent.
 
+    Already-qualified types pass through. Bare types get the workflow's
+    default prefix applied (``oe`` by default).
+
     'persoon'               → {"$": "oe:persoon", "type": "xsd:QName"}
-    'natuurlijk_persoon'    → {"$": "oe:natuurlijk_persoon", "type": "xsd:QName"}
-    'systeem'               → {"$": "oe:systeem", "type": "xsd:QName"}
+    'foaf:Person'           → {"$": "foaf:Person", "type": "xsd:QName"}
     """
     if ":" in agent_type:
         qname = agent_type  # already prefixed
     else:
-        qname = f"oe:{agent_type}"
+        qname = f"{_default_prefix()}:{agent_type}"
     return {"$": qname, "type": "xsd:QName"}
 
 
@@ -267,7 +330,9 @@ def classify_ref(ref: str) -> str:
         return "entity" if "/" in remainder else "dossier"
 
     # Full IRIs.
-    _DOSSIER_PREFIX = "https://id.erfgoed.net/dossiers/"
+    # Derive from DOSSIER_BASE template — strip the trailing `{dossier_id}/`
+    # to get the bare prefix all platform IRIs share.
+    _DOSSIER_PREFIX = DOSSIER_BASE.split("{dossier_id}")[0]
     if ref.startswith(_DOSSIER_PREFIX):
         return "entity" if "/entities/" in ref else "dossier"
 

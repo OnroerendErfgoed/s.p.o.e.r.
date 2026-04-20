@@ -23,71 +23,21 @@ def register(
     *,
     registry: PluginRegistry,
 ) -> None:
-    """Register reference-data and validation endpoints."""
+    """Register reference-data and validation endpoints.
 
-    @app.get(
-        "/{workflow}/reference",
-        tags=["reference"],
-        summary="All reference data for a workflow",
-        description=(
-            "Returns every reference-data list defined in the "
-            "workflow's YAML. One HTTP call populates all dropdowns."
-        ),
-    )
-    async def get_all_reference_data(workflow: str):
-        plugin = registry.get(workflow)
-        if not plugin:
-            raise HTTPException(404, detail=f"Unknown workflow: {workflow}")
-        ref_data = plugin.workflow.get("reference_data", {})
-        return ref_data
+    All routes are registered per-workflow so the workflow name
+    appears literally in the URL (e.g. ``/toelatingen/reference``)
+    rather than as a ``{workflow}`` placeholder.
+    """
 
-    @app.get(
-        "/{workflow}/reference/{list_name}",
-        tags=["reference"],
-        summary="Reference data list",
-        description=(
-            "Returns a single reference-data list by name. "
-            "Served from in-memory plugin config — sub-millisecond, "
-            "no DB query."
-        ),
-    )
-    async def get_reference_list(workflow: str, list_name: str):
-        plugin = registry.get(workflow)
-        if not plugin:
-            raise HTTPException(404, detail=f"Unknown workflow: {workflow}")
-        ref_data = plugin.workflow.get("reference_data", {})
-        items = ref_data.get(list_name)
-        if items is None:
-            available = sorted(ref_data.keys()) if ref_data else []
-            raise HTTPException(
-                404,
-                detail=f"No reference list '{list_name}' in workflow "
-                       f"'{workflow}'. Available: {available}",
-            )
-        return {"items": items}
+    for plugin in registry.all_plugins():
+        _register_reference_routes(
+            app=app,
+            workflow_name=plugin.name,
+            plugin=plugin,
+        )
 
-    # --- Validation endpoints ---
-
-    # List endpoint (always generic — returns names).
-    @app.get(
-        "/{workflow}/validate",
-        tags=["validation"],
-        summary="List available validators",
-        description=(
-            "Returns the names of all field-level validators "
-            "registered by this workflow's plugin."
-        ),
-    )
-    async def list_validators(workflow: str):
-        plugin = registry.get(workflow)
-        if not plugin:
-            raise HTTPException(404, detail=f"Unknown workflow: {workflow}")
-        names = sorted(plugin.field_validators.keys())
-        return {"validators": names}
-
-    # Per-validator typed routes — registered at startup so each
-    # validator gets its own OpenAPI schema with request/response
-    # models, summary, and description.
+    # Per-validator typed routes.
     for plugin in registry.all_plugins():
         workflow_name = plugin.name
         for validator_name, validator_entry in plugin.field_validators.items():
@@ -97,6 +47,71 @@ def register(
                 validator_name=validator_name,
                 validator_entry=validator_entry,
             )
+
+
+def _register_reference_routes(
+    *,
+    app: FastAPI,
+    workflow_name: str,
+    plugin,
+) -> None:
+    """Register GET reference + GET validate list endpoints for one workflow."""
+    ref_data = plugin.workflow.get("reference_data", {})
+
+    @app.get(
+        f"/{workflow_name}/reference",
+        tags=[workflow_name],
+        summary="All reference data",
+        description=(
+            "Returns every reference-data list defined in the "
+            "workflow's YAML. One HTTP call populates all dropdowns."
+        ),
+    )
+    async def get_all_reference_data():
+        return ref_data
+
+    get_all_reference_data.__name__ = f"reference_all_{workflow_name}"
+    get_all_reference_data.__qualname__ = f"reference_all_{workflow_name}"
+
+    @app.get(
+        f"/{workflow_name}/reference/{{list_name}}",
+        tags=[workflow_name],
+        summary="Single reference data list",
+        description=(
+            "Returns a single reference-data list by name. "
+            "Served from in-memory plugin config — sub-millisecond, "
+            "no DB query."
+        ),
+    )
+    async def get_reference_list(list_name: str):
+        items = ref_data.get(list_name)
+        if items is None:
+            available = sorted(ref_data.keys()) if ref_data else []
+            raise HTTPException(
+                404,
+                detail=f"No reference list '{list_name}' in workflow "
+                       f"'{workflow_name}'. Available: {available}",
+            )
+        return {"items": items}
+
+    get_reference_list.__name__ = f"reference_one_{workflow_name}"
+    get_reference_list.__qualname__ = f"reference_one_{workflow_name}"
+
+    @app.get(
+        f"/{workflow_name}/validate",
+        tags=[workflow_name],
+        summary="List available validators",
+        description=(
+            "Returns the names of all field-level validators "
+            "registered by this workflow's plugin."
+        ),
+    )
+    async def list_validators():
+        names = sorted(plugin.field_validators.keys())
+        return {"validators": names}
+
+    list_validators.__name__ = f"validators_{workflow_name}"
+    list_validators.__qualname__ = f"validators_{workflow_name}"
 
 
 def _register_validator_route(
