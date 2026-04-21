@@ -236,11 +236,14 @@ class ArchivePDF(FPDF):
         self._dossier_id = dossier_id
         self._workflow = workflow
         self.set_auto_page_break(auto=True, margin=20)
-        # Unicode font for full character support
-        self.add_font("DejaVu", "", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
-        self.add_font("DejaVu", "B", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
-        self.add_font("DejaVu", "I", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf")
-        self.add_font("DejaVuMono", "", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
+        # Unicode font for full character support. Paths resolved via
+        # dossier_engine.fonts.find_font so the archive works on any
+        # distro that has DejaVu installed (or DOSSIER_FONT_DIR set).
+        from .fonts import find_font
+        self.add_font("DejaVu", "", str(find_font("regular")))
+        self.add_font("DejaVu", "B", str(find_font("bold")))
+        self.add_font("DejaVu", "I", str(find_font("italic")))
+        self.add_font("DejaVuMono", "", str(find_font("mono")))
 
     def header(self):
         self.set_font("DejaVu", "I", 8)

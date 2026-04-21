@@ -73,26 +73,17 @@ def register_columns_graph(
                 repo, dossier_id, user, global_audit_access,
             )
 
-            activities = await repo.get_activities_for_dossier(dossier_id)
-            all_entities_result = await session.execute(
-                select(EntityRow).where(EntityRow.dossier_id == dossier_id).order_by(EntityRow.created_at)
-            )
-            all_entities = list(all_entities_result.scalars().all())
-
-            activity_ids = [a.id for a in activities]
-            assoc_result = await session.execute(
-                select(AssociationRow).where(AssociationRow.activity_id.in_(activity_ids))
-            )
-            assoc_by_activity = {}
-            for a in assoc_result.scalars().all():
-                assoc_by_activity.setdefault(a.activity_id, []).append(a)
-
-            used_result = await session.execute(
-                select(UsedRow).where(UsedRow.activity_id.in_(activity_ids))
-            )
-            used_by_activity = {}
-            for u in used_result.scalars().all():
-                used_by_activity.setdefault(u.activity_id, []).append(u)
+            # Load the graph rowsets via the shared loader. Same four
+            # selects the /prov endpoint and /archive use, and same
+            # pre-built indexes. Layout-specific processing happens
+            # below on the returned rows; the SQL concern is owned
+            # by ``load_dossier_graph_rows``.
+            from ..prov_json import load_dossier_graph_rows
+            graph_rows = await load_dossier_graph_rows(session, dossier_id)
+            activities = graph_rows.activities
+            all_entities = graph_rows.entities
+            assoc_by_activity = graph_rows.assoc_by_activity
+            used_by_activity = graph_rows.used_by_activity
 
             system_activity_types = set()
             if plugin:
