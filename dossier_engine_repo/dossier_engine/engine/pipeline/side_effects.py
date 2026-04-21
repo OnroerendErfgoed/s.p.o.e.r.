@@ -135,7 +135,13 @@ async def _execute_one_side_effect(
     if not se_activity_name:
         return
 
-    # Skip if the conditional gate fails.
+    # Skip if the conditional gate fails. Two forms:
+    #   * `condition: {entity_type, field, value}` — dict form,
+    #     equality on an entity's content field.
+    #   * `condition_fn: "name"` — references a named predicate
+    #     registered on the plugin; receives ActivityContext, returns
+    #     bool. Mutually exclusive with `condition` (enforced at
+    #     plugin load).
     if not await _condition_met(
         plugin=plugin,
         repo=repo,
@@ -143,6 +149,7 @@ async def _execute_one_side_effect(
         trigger_generated=trigger_generated,
         trigger_used=trigger_used,
         condition=side_effect.get("condition"),
+        condition_fn_name=side_effect.get("condition_fn"),
     ):
         return
 
@@ -240,13 +247,65 @@ async def _condition_met(
     trigger_generated: list,
     trigger_used: list,
     condition: dict | None,
+    condition_fn_name: str | None = None,
 ) -> bool:
-    """Check a side effect's `condition: {entity_type, field, value}` gate.
+    """Check a side effect's conditional gate.
 
-    Returns True if no condition is declared, or if the condition
-    entity exists in the trigger's scope (or as a dossier-wide
-    singleton fallback) and its field matches the expected value.
+    Two forms, mutually exclusive (enforced at plugin load):
+
+    * Dict form — ``condition: {entity_type, field, value}``. Looks
+      up the named entity (in trigger scope, falling back to dossier
+      singleton), reads the field via dot-notation, compares to
+      ``value``. Returns True iff equal.
+
+    * Function form — ``condition_fn: "name"``. Invokes the named
+      predicate registered on ``plugin.side_effect_conditions`` with
+      a fresh ``ActivityContext`` scoped to the triggering activity.
+      The function returns bool verbatim; no fallback semantics.
+
+    Returns True if neither form is declared (no gate).
     """
+    # Function form takes precedence if the validator let both through
+    # somehow — but normally the load-time check rules that out.
+    if condition_fn_name:
+        fn = plugin.side_effect_conditions.get(condition_fn_name)
+        if fn is None:
+            # Defensive: load-time validation should prevent this.
+            # Failing closed (False) is safer than raising inside the
+            # pipeline, which would abort the parent activity for a
+            # configuration mistake downstream.
+            import logging
+            logging.getLogger(__name__).error(
+                "Side-effect condition_fn %r is not registered on plugin "
+                "%r. Skipping side effect.",
+                condition_fn_name, plugin.name,
+            )
+            return False
+
+        # Build a context matching what handlers see. used_entities
+        # is the trigger's scope (generated + used), keyed by type —
+        # the predicate can look up "oe:beslissing" the same way a
+        # handler would. Both trigger_generated and trigger_used are
+        # lists of EntityRow at this point.
+        from ..context import ActivityContext
+        resolved = {}
+        for row in trigger_generated or []:
+            if row.type and row.type not in resolved:
+                resolved[row.type] = row
+        for row in trigger_used or []:
+            if row.type and row.type not in resolved:
+                resolved[row.type] = row
+
+        ctx = ActivityContext(
+            repo=repo,
+            dossier_id=dossier_id,
+            used_entities=resolved,
+            entity_models=plugin.entity_models,
+            plugin=plugin,
+        )
+        result = await fn(ctx)
+        return bool(result)
+
     if not condition:
         return True
 

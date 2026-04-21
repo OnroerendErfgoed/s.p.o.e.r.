@@ -141,6 +141,133 @@ def validate_workflow_version_references(
                 )
 
 
+# Accepted keys on a side-effect condition block. Enforced at plugin
+# load so a typo (e.g. ``from_entity:`` borrowed from the status-rule
+# or authorization-scope shape) fails fast with a clear error instead
+# of silently blocking the side effect at runtime.
+_SIDE_EFFECT_CONDITION_REQUIRED = frozenset({"entity_type", "field", "value"})
+
+
+def validate_side_effect_condition_fn_registrations(
+    workflow: dict,
+    side_effect_conditions: dict,
+) -> None:
+    """Cross-check every ``side_effects[*].condition_fn`` name against
+    the plugin's registered predicates. Runs after the Plugin
+    constructor assembles its registries so we can verify names
+    resolve. Fails fast with ValueError on any unknown name.
+
+    Kept separate from ``validate_side_effect_conditions`` because
+    that one runs earlier (on the raw workflow dict, before the
+    plugin is built) and can only shape-check. This one does the
+    cross-registry check once both halves are available.
+    """
+    for act in workflow.get("activities", []):
+        if not isinstance(act, dict):
+            continue
+        for se in act.get("side_effects") or []:
+            if not isinstance(se, dict):
+                continue
+            name = se.get("condition_fn")
+            if not name:
+                continue
+            if name not in (side_effect_conditions or {}):
+                known = sorted((side_effect_conditions or {}).keys()) or "(none registered)"
+                raise ValueError(
+                    f"Activity {act.get('name')!r}: side-effect "
+                    f"{se.get('activity')!r} references "
+                    f"condition_fn={name!r} but no predicate by that "
+                    f"name is registered on the plugin. Registered: "
+                    f"{known}."
+                )
+
+
+def validate_side_effect_conditions(workflow: dict) -> None:
+    """Validate every ``side_effects[*]`` gating entry.
+
+    Two forms are accepted, mutually exclusive per entry:
+
+    * ``condition: {entity_type, field, value}`` — dict shape. The
+      runtime gate reads ``entity_type`` and returns False when it's
+      missing, so a typo like ``from_entity:`` (borrowed from the
+      status-rule or authorization-scope shape) would silently block
+      every invocation. We reject it at load instead.
+
+    * ``condition_fn: "name"`` — references a predicate registered on
+      ``plugin.side_effect_conditions``. We can't validate that the
+      name resolves at the workflow layer (the plugin object isn't
+      built yet when this runs) — the Plugin constructor should
+      cross-check that every ``condition_fn:`` name has a registered
+      function. Here we just validate the shape is a non-empty string
+      and that ``condition`` isn't also set on the same entry.
+
+    Fails fast with ValueError when a shape is wrong.
+    """
+    for act in workflow.get("activities", []):
+        if not isinstance(act, dict):
+            continue
+        for se in act.get("side_effects") or []:
+            if not isinstance(se, dict):
+                continue
+
+            cond = se.get("condition")
+            cond_fn = se.get("condition_fn")
+
+            # Mutex: each side-effect entry picks one form, not both.
+            if cond is not None and cond_fn is not None:
+                raise ValueError(
+                    f"Activity {act.get('name')!r}: side-effect "
+                    f"{se.get('activity')!r} declares both "
+                    f"``condition:`` and ``condition_fn:``. Choose "
+                    f"one — the dict form for simple field equality, "
+                    f"the function form for anything else."
+                )
+
+            # Function form: just shape-check the name. Registration
+            # is verified by the Plugin constructor once all the
+            # function registries are available.
+            if cond_fn is not None:
+                if not isinstance(cond_fn, str) or not cond_fn.strip():
+                    raise ValueError(
+                        f"Activity {act.get('name')!r}: side-effect "
+                        f"{se.get('activity')!r} has a non-string "
+                        f"``condition_fn:`` value: {cond_fn!r}"
+                    )
+                continue
+
+            # Dict form: validate shape.
+            if cond is None:
+                continue
+            if not isinstance(cond, dict):
+                raise ValueError(
+                    f"Activity {act.get('name')!r}: side-effect "
+                    f"condition must be a dict with keys "
+                    f"{sorted(_SIDE_EFFECT_CONDITION_REQUIRED)} or "
+                    f"a ``condition_fn:`` string, "
+                    f"got {type(cond).__name__}: {cond!r}"
+                )
+            keys = set(cond.keys())
+            missing = _SIDE_EFFECT_CONDITION_REQUIRED - keys
+            extra = keys - _SIDE_EFFECT_CONDITION_REQUIRED
+            if missing or extra:
+                parts = []
+                if missing:
+                    parts.append(f"missing keys: {sorted(missing)}")
+                if extra:
+                    parts.append(f"unknown keys: {sorted(extra)}")
+                raise ValueError(
+                    f"Activity {act.get('name')!r}: side-effect "
+                    f"condition on {se.get('activity')!r} has "
+                    f"{'; '.join(parts)}. Accepted shape: "
+                    f"{{entity_type, field, value}}, or use "
+                    f"``condition_fn: \"name\"`` for non-equality "
+                    f"gates. (Common confusion: {{from_entity, field, "
+                    f"mapping}} is for activity `status:` rules; "
+                    f"{{from_entity, field}} is for authorization "
+                    f"scopes.)"
+                )
+
+
 @dataclass
 class FieldValidator:
     """A field-level validator with optional request/response models
@@ -206,6 +333,21 @@ class Plugin:
     # guidebook for the decision criteria ("when to split").
     status_resolvers: dict[str, Callable] = field(default_factory=dict)
     task_builders: dict[str, Callable] = field(default_factory=dict)
+
+    # Named predicates for gating side-effect execution. YAML-declared
+    # side effects can reference these via ``condition_fn: "name"`` as
+    # an alternative to the inline ``condition: {entity_type, field,
+    # value}`` dict form. The function receives the same
+    # ``ActivityContext`` that handlers see and returns a bool: True
+    # means "run the side effect," False means skip.
+    #
+    # ``condition`` and ``condition_fn`` are mutually exclusive per
+    # side-effect entry — the engine raises at plugin load if both
+    # are set. Choose the dict form for simple ``field == value``
+    # checks (reads at a glance in YAML); the function form for
+    # anything else (entity existence, date comparisons, value-in-set,
+    # boolean combinations, anything testable as a pure function).
+    side_effect_conditions: dict[str, Callable] = field(default_factory=dict)
 
     # Validators for custom PROV-extension relations (e.g. oe:neemtAkteVan).
     # Keyed by relation type string. Each validator receives the full

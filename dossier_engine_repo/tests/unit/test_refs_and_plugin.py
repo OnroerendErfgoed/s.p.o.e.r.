@@ -455,7 +455,120 @@ class TestPluginRegistry:
         assert len(registry.all_plugins()) == 1
 
 
-class TestSideEffectsNormalization:
+class TestSideEffectConditionValidation:
+    """``validate_side_effect_conditions`` fails fast on malformed
+    condition blocks at plugin load time. Prevents the silent-fail
+    footgun where a ``from_entity:`` typo (borrowed from the status
+    rule or auth scope shape) would block every invocation of the
+    side effect at runtime with no warning.
+    """
+
+    def test_valid_condition_accepted(self):
+        from dossier_engine.plugin import validate_side_effect_conditions
+
+        # Valid shape passes silently.
+        validate_side_effect_conditions({
+            "activities": [{
+                "name": "dienAanvraagIn",
+                "side_effects": [{
+                    "activity": "sendNotification",
+                    "condition": {
+                        "entity_type": "oe:beslissing",
+                        "field": "content.beslissing",
+                        "value": "goedgekeurd",
+                    },
+                }],
+            }],
+        })
+
+    def test_no_condition_ignored(self):
+        from dossier_engine.plugin import validate_side_effect_conditions
+
+        # Side effect without a condition is fine.
+        validate_side_effect_conditions({
+            "activities": [{
+                "name": "a",
+                "side_effects": [{"activity": "b"}],
+            }],
+        })
+
+    def test_from_entity_typo_rejected(self):
+        """The classic mistake: using ``from_entity`` (the status /
+        auth key) on a side-effect condition. Must fail loudly, not
+        silently block the side effect at runtime."""
+        from dossier_engine.plugin import validate_side_effect_conditions
+
+        with pytest.raises(ValueError) as exc_info:
+            validate_side_effect_conditions({
+                "activities": [{
+                    "name": "dienAanvraagIn",
+                    "side_effects": [{
+                        "activity": "sendNotification",
+                        "condition": {
+                            "from_entity": "oe:beslissing",
+                            "field": "content.beslissing",
+                            "value": "goedgekeurd",
+                        },
+                    }],
+                }],
+            })
+        msg = str(exc_info.value)
+        assert "dienAanvraagIn" in msg
+        assert "sendNotification" in msg
+        assert "from_entity" in msg
+        assert "entity_type" in msg
+
+    def test_missing_keys_rejected(self):
+        from dossier_engine.plugin import validate_side_effect_conditions
+
+        with pytest.raises(ValueError) as exc_info:
+            validate_side_effect_conditions({
+                "activities": [{
+                    "name": "a",
+                    "side_effects": [{
+                        "activity": "b",
+                        "condition": {"entity_type": "oe:x"},
+                    }],
+                }],
+            })
+        msg = str(exc_info.value)
+        assert "missing keys" in msg
+        assert "field" in msg and "value" in msg
+
+    def test_non_dict_condition_rejected(self):
+        """YAML-mistake case: someone wrote ``condition: some_string``
+        instead of a dict. Fail with a clear type message."""
+        from dossier_engine.plugin import validate_side_effect_conditions
+
+        with pytest.raises(ValueError) as exc_info:
+            validate_side_effect_conditions({
+                "activities": [{
+                    "name": "a",
+                    "side_effects": [{
+                        "activity": "b",
+                        "condition": "goedgekeurd",  # bogus
+                    }],
+                }],
+            })
+        assert "must be a dict" in str(exc_info.value)
+
+    def test_legacy_string_side_effects_skipped(self):
+        """Plugins that still use list-of-strings for side_effects
+        have no condition block to validate. Don't crash on them."""
+        from dossier_engine.plugin import validate_side_effect_conditions
+
+        validate_side_effect_conditions({
+            "activities": [{
+                "name": "a",
+                "side_effects": ["foo", "bar"],
+            }],
+        })
+
+    def test_empty_activities_list_ok(self):
+        from dossier_engine.plugin import validate_side_effect_conditions
+
+        validate_side_effect_conditions({"activities": []})
+        validate_side_effect_conditions({})
     """Regression tests: ``side_effects:`` in workflow YAML is a
     list of dicts (``{"activity": "foo", "condition": ...}``), not
     a list of strings. The normalizer has to qualify the ``activity``
@@ -494,7 +607,10 @@ class TestSideEffectsNormalization:
 
     def test_dict_form_preserves_other_keys(self):
         """Qualifying ``activity`` must not drop the ``condition``
-        key (or any other metadata carried on the entry)."""
+        key (or any other metadata carried on the entry). The
+        engine's side-effect pipeline reads ``condition:
+        {entity_type, field, value}`` to decide whether to run the
+        entry — the normalizer must leave that block untouched."""
         registry = PluginRegistry()
         p = _make_plugin(workflow={
             "activities": [
@@ -503,7 +619,11 @@ class TestSideEffectsNormalization:
                     "side_effects": [
                         {
                             "activity": "followup",
-                            "condition": {"from_entity": "oe:beslissing"},
+                            "condition": {
+                                "entity_type": "oe:beslissing",
+                                "field": "content.beslissing",
+                                "value": "goedgekeurd",
+                            },
                         },
                     ],
                 },
@@ -514,7 +634,11 @@ class TestSideEffectsNormalization:
 
         se = p.workflow["activities"][0]["side_effects"][0]
         assert se["activity"] == "oe:followup"
-        assert se["condition"] == {"from_entity": "oe:beslissing"}
+        assert se["condition"] == {
+            "entity_type": "oe:beslissing",
+            "field": "content.beslissing",
+            "value": "goedgekeurd",
+        }
 
     def test_already_qualified_activity_is_idempotent(self):
         """Running the normalizer over YAML that already has

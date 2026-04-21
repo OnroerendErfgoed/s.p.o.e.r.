@@ -20,9 +20,11 @@ from dossier_engine.plugin import (
     Plugin,
     build_entity_registries_from_workflow,
     validate_workflow_version_references,
+    validate_side_effect_conditions,
+    validate_side_effect_condition_fn_registrations,
 )
 
-from .handlers import HANDLERS, STATUS_RESOLVERS, TASK_BUILDERS
+from .handlers import HANDLERS, STATUS_RESOLVERS, TASK_BUILDERS, SIDE_EFFECT_CONDITIONS
 from .validators import VALIDATORS
 from .relation_validators import RELATION_VALIDATORS
 from .field_validators import FIELD_VALIDATORS
@@ -209,6 +211,10 @@ def create_plugin() -> Plugin:
 
     entity_models, entity_schemas = build_entity_registries_from_workflow(workflow)
     validate_workflow_version_references(workflow, entity_schemas)
+    validate_side_effect_conditions(workflow)
+    validate_side_effect_condition_fn_registrations(
+        workflow, SIDE_EFFECT_CONDITIONS,
+    )
 
     # Build the constants object. Precedence: env vars (via
     # BaseSettings) > workflow.yaml's constants.values > class defaults.
@@ -228,6 +234,7 @@ def create_plugin() -> Plugin:
         handlers=HANDLERS,
         status_resolvers=STATUS_RESOLVERS,
         task_builders=TASK_BUILDERS,
+        side_effect_conditions=SIDE_EFFECT_CONDITIONS,
         validators=VALIDATORS,
         relation_validators=RELATION_VALIDATORS,
         field_validators=FIELD_VALIDATORS,

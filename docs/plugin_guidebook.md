@@ -274,6 +274,58 @@ same activity cannot have status come from both sources.
 
 This keeps "who decides X" unambiguous per activity. Mixing styles within one activity is always a bug (usually a half-finished migration); the engine catches it loudly instead of silently picking a winner.
 
+### Side effects and conditional execution
+
+Side effects are activities that fire automatically after a parent activity succeeds. They're composable (one side effect can declare its own `side_effects:`) and attributed to the system user, so they're recorded as their own activity rows in PROV.
+
+```yaml
+- name: "dienAanvraagIn"
+  side_effects:
+    - activity: "duidVerantwoordelijkeOrganisatieAan"
+    - activity: "setSystemFields"
+```
+
+Each entry may carry a `condition:` block to gate execution on entity state:
+
+```yaml
+side_effects:
+  - activity: "publishToPortal"
+    condition:
+      entity_type: "oe:beslissing"
+      field: "content.beslissing"
+      value: "goedgekeurd"
+```
+
+Accepted keys: exactly `{entity_type, field, value}`. The engine validates this at plugin load — typos like `from_entity:` (borrowed from status-rule syntax) or `mapping:` (also from status rules) fail with an explicit error pointing at the right shape.
+
+#### When to use `condition:` vs an empty-result handler
+
+Since a handler can also just return `HandlerResult()` with nothing, there's a choice. They're **not equivalent** — they produce different PROV graphs:
+
+| Approach | Activity row written? | Visible in PROV | Meaning |
+|---|---|---|---|
+| `condition:` blocks execution | No | No trace | "This activity doesn't apply here." |
+| Handler returns empty | Yes | Activity appears, produced nothing | "Activity ran, chose not to produce output." |
+
+Two concrete examples that cut opposite ways:
+
+**`setSystemFields` once per dossier.** You want this activity to run on `dienAanvraagIn` but not again on `bewerkAanvraag` edits. Gating with `condition: {entity_type: "oe:system_fields", field: ..., value: ...}` means PROV shows it ran once, cleanly. Using an empty handler on re-edits would show `setSystemFields` firing on every edit and producing nothing — noise in the audit trail.
+
+**`publishToPortal` with a legitimate "decline to publish".** The parent activity took a decision; publishing was considered, but policy says don't publish in this case. If you gate with `condition:`, the audit record silently lacks any mention that publication was considered. An empty-result handler preserves the trace: "publication was attempted, produced no output." That's the truthful record.
+
+Rule of thumb: use `condition:` when the side effect genuinely **doesn't apply** (re-runs, wrong kind of entity, out-of-scope state). Use an empty-result handler when the side effect **applies but decided not to produce anything** (a reviewed case that needs to be visible in audit).
+
+#### Why `condition:` isn't replaced by the split-style pattern
+
+For tasks, we rejected YAML conditions in favor of `task_builders: ["fn_name"]` — full Python power, no DSL. For side effects we kept the YAML `condition:` form. The reasons are different:
+
+- **Tasks can be built programmatically.** A `task_builder` function decides whether to schedule and the return list can be empty. The task entity either exists or it doesn't — there's no "task activity ran and did nothing" residue in PROV.
+- **Side effects cannot.** A handler cannot decide "don't run this activity at all" — the activity row is created before the handler is invoked. Only the YAML `condition:` can actually prevent the activity.
+
+So the YAML `condition:` is the *only* way to express "this side effect shouldn't apply here" without leaving a PROV residue. Removing it would force authors to either fire side effects unconditionally (wrong) or write empty-handler side effects (audit noise).
+
+The `{entity_type, field, value}` surface is intentionally narrow. If a future case needs richer conditions (counts, comparisons, config lookups), the right extension is a `condition_fn:` escape hatch that names a Python function returning `bool` — matching the pattern already used for status and tasks. Don't grow the condition shape itself with `value_in`, `value_not`, boolean combinators and so on; that's the DSL-creep path we rejected for tasks.
+
 ### Reference data — static lists for the frontend
 
 Dropdowns, type lists, municipality codes — anything the frontend needs to render forms. Declared in the YAML, served from memory, sub-millisecond.

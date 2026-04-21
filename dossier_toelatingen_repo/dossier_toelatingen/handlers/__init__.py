@@ -320,3 +320,16 @@ STATUS_RESOLVERS = {
 TASK_BUILDERS = {
     "schedule_trekAanvraag_if_onvolledig": schedule_trekAanvraag_if_onvolledig,
 }
+
+
+# Named predicates for gating side-effect execution. YAML references
+# these via ``condition_fn: "name"`` on a side-effect entry. Each is
+# an async function taking an ActivityContext and returning bool:
+# True means "run the side effect," False means skip.
+#
+# Choose this form when the gate is more than simple field equality
+# (for which ``condition: {entity_type, field, value}`` is clearer
+# inline in YAML). Empty by default — no workflow currently needs a
+# non-equality gate; the registry exists so plugins can add one
+# without engine changes.
+SIDE_EFFECT_CONDITIONS = {}
