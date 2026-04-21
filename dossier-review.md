@@ -17,7 +17,8 @@
 | 🏃 `test_requests.sh` | **25/25 OK, exit 0, zero deadlocks, zero worker crashes** | D1–D9 green |
 | ✂️ Duplication closed | **D1, D2, D25** | Graph-loader consolidation |
 | 🧰 Harnesses installed | **3** | Guidebook YAML lint + phase-docstring lint + CI shell-spec wrapper |
-| 📦 Pending | ~59 bugs + 57 obs + 24 dups + 6 meta (partial relief) | See below |
+| 🤖 CI wired | **GitHub Actions** | `.github/workflows/ci.yml` — 4 jobs: pytest, shell-spec, doc-harnesses, migrations-append-only |
+| 📦 Pending | ~59 bugs + 57 obs + 24 dups + 5 meta (partial relief) | See below |
 
 Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfaced and fixed in the same session as the harness that surfaced it.
 
@@ -129,7 +130,9 @@ Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfac
 
 **M4. Documentation drift across README, plugin guidebook, dossiertype template, pipeline architecture doc.** ✅ **Partial relief shipped.** `tests/integration/test_guidebook_yaml.py` (harness 1) validates every ```yaml block in the guidebook against canonical key sets derived from production `workflow.yaml`. Bugs 64 and 65 were surfaced and fixed in the same session. A sibling check keeps the allowed-key set honest: if production adds a new field, the test fails and forces the allowlist update.
 
-**M5. Executable specs that don't execute.** ✅ **Partial relief shipped.** `scripts/ci_run_shell_spec.sh` (harness 2) is a self-contained wrapper that stands up file_service + app + worker, waits for readiness, runs `test_requests.sh`, reports OK count / summary count / traceback count, exits 0/1/2/3 for pass/fail/stack-never-up/env-missing. Intended to be wired into whatever CI system the team uses (GitHub Actions, GitLab, etc.) with a single job step. End-to-end tested; surfaced Bug 75 as a side benefit. Partial because the guidebook's *Python* code blocks still aren't validated (each references dotted-import paths for fictional classes; full relief would need a fixture-module approach we haven't attempted).
+**M5. Executable specs that don't execute.** ✅ **Full relief shipped.** Two pieces:
+- `scripts/ci_run_shell_spec.sh` — self-contained wrapper that stands up file_service + app + worker, waits for readiness, runs `test_requests.sh`, reports OK count / summary count / traceback count, exits 0/1/2/3 for pass/fail/stack-never-up/env-missing. Surfaced Bug 75 on first run.
+- `.github/workflows/ci.yml` — the wrapper is now invoked by the `shell-spec` job on every PR and every push to `main`. The guidebook's Python code blocks still aren't validated (each references dotted-import paths for fictional classes; full relief there would need a fixture-module approach we haven't attempted), but the much higher-value shell-spec M5 target is now fully covered.
 
 **M6. "Test" is a namespace, not a load-time gate.** Bug 71 accepted — deploy-time checklist keeps test activities out of production.
 
@@ -183,15 +186,27 @@ Dropped from must-fix — `ensure_external_entity` handles cross-dossier cases, 
 - `tests/unit/test_worker_startup_resilience.py` — 5 tests for Bug 75's detector function.
 - Worker resilience logic in `worker._worker_loop_body` — tolerates `UndefinedTableError` during startup window, logs and retries until schema ready.
 
+### Round 9 — CI wiring (GitHub Actions)
+`.github/workflows/ci.yml` — four parallel jobs:
+- **pytest** — runs all three test suites (common, engine, file_service) against a Postgres service container with health check. Pip cache keyed on `pyproject.toml` hash.
+- **shell-spec** — installs the five repos, stages `/tmp/dossier_run/config.yaml` inline, invokes `scripts/ci_run_shell_spec.sh`. Uploads service logs as artifact on failure (`if: failure()`, 7-day retention).
+- **doc-harnesses** — runs harness 1 + harness 3 in a separate job. No Postgres needed; clean signal for doc-drift failures.
+- **migrations-append-only** — runs `scripts/check_migrations_append_only.py` with `fetch-depth: 0` so `origin/main` is available for the diff comparison.
+
+Good GHA idioms applied: `concurrency:` group with `cancel-in-progress: true`, `actions/setup-python@v5` with built-in pip cache, service-container `pg_isready` health check, service logs uploaded only on failure. Runs on every `push` to main and every `pull_request` targeting main.
+
+Verified: workflow YAML parses cleanly (four jobs, all steps listed); the migrations-check script round-trips correctly (exit 0 on clean tree, exit 1 with a clear named-file error when a migration is modified, reverts cleanly); CI config shape matches the dev `config.yaml` (same database URL, iri_base, plugins, auth mode).
+
 ### Verification performed
 - **Test suite:** **720/720** (engine 683, signing 18, file_service 19). Grew by 47 tests across the engagement.
 - **Shell spec via harness 2:** `bash scripts/ci_run_shell_spec.sh` → 25 OK assertions, 5 summary-pass lines, exit 0, zero tracebacks, zero worker crashes.
 - **Harness 1, 2, 3** all green, all have synthetic-drift tests confirming they catch the bug shape they claim to catch.
+- **CI workflow** authored and statically validated; will run on the first commit pushed to GitHub.
 
 ### Where to go next (in priority order)
 
-1. **Wire harness 2 into CI** — the script is ready; the step is infrastructure-team work. Adds `test_requests.sh` coverage to every PR. Would have caught Bug 70 already.
-2. **Bug 63 — enumeration via 404-before-access-check.** Security, low effort.
-3. **Duplication D4 + D22** — `emit_audit` boilerplate (~15 sites). Mechanical.
-4. **Observations cluster around `set_dossier_access`** — 6 copies of the view list, write-on-change opportunity. Improves performance and reduces D9.
-5. **Meta M2 — "silent skip" review.** Survey all `logger.error` + `pass` patterns, decide which should propagate.
+1. **Bug 63 — enumeration via 404-before-access-check.** Security, low effort. Two endpoints (`routes/dossiers.py:79-81`, `routes/entities.py:203-205`) currently distinguish "doesn't exist" from "exists but forbidden" through differential responses. Fix: access check before existence check; return the same response for both (404 or 403, decide once globally). Half a day including regression tests.
+2. **Duplication D4 + D22** — `emit_audit` boilerplate (~15 sites). Mechanical extract-helper refactor.
+3. **Observations cluster around `set_dossier_access`** — 6 copies of the view list, write-on-change opportunity. Improves performance and reduces D9.
+4. **Bug 70** — dead `/prov/graph` URL in `test_requests.sh`. Would have been caught by the harness-2 CI job on the first run, but since no CI-provoked failure has happened yet, still sits open. One-line fix.
+5. **Meta M2 — "silent skip" review.** Survey all `logger.error` + `pass` patterns, decide case-by-case which should propagate.

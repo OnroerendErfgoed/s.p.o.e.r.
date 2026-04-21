@@ -1,0 +1,260 @@
+# CI for the dossier platform.
+#
+# Two parallel jobs:
+#
+# * pytest      — runs the ~705-test Python suite across all five
+#                 repos (common, file_service, engine, toelatingen,
+#                 app). Most coverage lives here. ~2 min on standard
+#                 runners.
+#
+# * shell-spec  — stands up file_service + dossier_app + worker and
+#                 runs test_requests.sh against the live stack via
+#                 scripts/ci_run_shell_spec.sh. This is the
+#                 end-to-end acceptance test (D1-D9 covering
+#                 aanvraag / beslissing / tombstone / anchor /
+#                 schema-versioning / lineage). Takes slightly
+#                 longer because of service startup. ~3 min.
+#
+# Both jobs use a Postgres service container provisioned by the
+# GitHub Actions runner. No external services required.
+#
+# On shell-spec failure, service logs are uploaded as an artifact
+# so CI debugging doesn't require re-running locally.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight runs when a new commit lands on the same branch.
+# Saves runner-minutes on rapid-fire pushes; the latest commit is
+# the only one whose result we actually care about.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (all repos)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: dossier
+          POSTGRES_PASSWORD: dossier
+          POSTGRES_DB: dossiers
+        ports:
+          - 5432:5432
+        # The health check gate is what lets the job's `steps`
+        # start without a race. GitHub polls this until ready
+        # before running any step, so no manual `wait-for-pg`
+        # dance is needed below.
+        options: >-
+          --health-cmd "pg_isready -U dossier -d dossiers"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          # Caches the pip download directory keyed on a hash of
+          # every pyproject.toml. Subsequent runs with unchanged
+          # deps skip the network, typically saving ~45 seconds.
+          cache: "pip"
+          cache-dependency-path: "**/pyproject.toml"
+
+      - name: Create the `dossiers_test` database
+        # The pytest suite uses a separate DB from the one the app
+        # uses. The postgres service container only creates the
+        # one in POSTGRES_DB; we add the second here.
+        env:
+          PGPASSWORD: dossier
+        run: |
+          psql -h 127.0.0.1 -U dossier -d postgres \
+               -c "CREATE DATABASE dossiers_test"
+
+      - name: Install all five projects in editable mode
+        # Install order matters: common first (others depend on
+        # it), then the leaves. This mirrors the README's
+        # documented install order.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e dossier_common_repo/ \
+                      -e file_service_repo/ \
+                      -e dossier_engine_repo/ \
+                      -e dossier_toelatingen_repo/ \
+                      -e dossier_app_repo/
+          pip install pytest pytest-asyncio
+
+      - name: pytest — dossier_common_repo
+        working-directory: dossier_common_repo
+        run: python -m pytest tests/ -v
+
+      - name: pytest — dossier_engine_repo
+        working-directory: dossier_engine_repo
+        # The engine suite is the bulk of coverage (~680 tests,
+        # mostly integration against the dossiers_test DB). If
+        # it fails, the test output tells us the row — the -v
+        # is for signal, not noise.
+        run: python -m pytest tests/ -v
+
+      - name: pytest — file_service_repo
+        working-directory: file_service_repo
+        run: python -m pytest tests/ -v
+
+  shell-spec:
+    name: test_requests.sh (end-to-end)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: dossier
+          POSTGRES_PASSWORD: dossier
+          POSTGRES_DB: dossiers
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dossier -d dossiers"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: "**/pyproject.toml"
+
+      - name: Install all five projects
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e dossier_common_repo/ \
+                      -e file_service_repo/ \
+                      -e dossier_engine_repo/ \
+                      -e dossier_toelatingen_repo/ \
+                      -e dossier_app_repo/
+
+      - name: Stage run directory and config
+        # The harness script expects /tmp/dossier_run/config.yaml
+        # to exist. In dev this is created by hand; in CI we copy
+        # a checked-in fixture. The config itself is the same
+        # shape as the app's dev config — the only runtime-
+        # sensitive values (db url, storage root) are set here.
+        run: |
+          mkdir -p /tmp/dossier_run/file_storage
+          cat > /tmp/dossier_run/config.yaml <<'EOF'
+          database:
+            url: "postgresql+asyncpg://dossier:dossier@127.0.0.1:5432/dossiers"
+          iri_base:
+            dossier: "https://id.erfgoed.net/dossiers/"
+            ontology: "https://id.erfgoed.net/vocab/ontology#"
+          plugins:
+            - dossier_toelatingen
+          auth:
+            mode: "poc"
+          file_service:
+            signing_key: "ci-signing-key"
+            url: "http://127.0.0.1:8001"
+            storage_root: "/tmp/dossier_run/file_storage"
+          EOF
+
+      - name: Run the shell spec
+        run: bash scripts/ci_run_shell_spec.sh
+
+      - name: Upload service logs on failure
+        # The harness leaves fs.log, app.log, worker.log, and
+        # test_run.log in /tmp/dossier_run. These are the entire
+        # story of a failed run — upload them as an artifact so
+        # debugging doesn't require reproducing locally.
+        #
+        # `if: failure()` only uploads on a red job. Green runs
+        # don't waste storage.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shell-spec-logs
+          path: /tmp/dossier_run/*.log
+          # 7 days is long enough to investigate a failing PR
+          # across a weekend; longer would just cost quota.
+          retention-days: 7
+
+  doc-harnesses:
+    # Harnesses 1 and 3 don't need Postgres — they're pure static
+    # analysis of docs and source. Running them in a separate job
+    # keeps the signal clean: if only this job fails, the problem
+    # is doc drift, not a test or integration issue.
+    name: doc harnesses (guidebook YAML + phase docstrings)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: "**/pyproject.toml"
+
+      - name: Install the engine repo
+        # Harness 3 imports ActivityState to introspect dataclass
+        # fields; harness 1 imports yaml. Installing the engine
+        # repo in editable mode gets both.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e dossier_common_repo/ \
+                      -e dossier_engine_repo/ \
+                      -e dossier_toelatingen_repo/
+          pip install pytest pyyaml
+
+      - name: Harness 1 — guidebook YAML lint
+        working-directory: dossier_engine_repo
+        run: python -m pytest tests/integration/test_guidebook_yaml.py -v
+
+      - name: Harness 3 — phase docstring lint
+        working-directory: dossier_engine_repo
+        run: python -m pytest tests/unit/test_phase_docstrings.py -v
+
+  migrations-append-only:
+    # Guard against retroactive edits to Alembic migrations. The
+    # script fails non-zero if any commit in this PR modifies or
+    # deletes files under alembic/versions/. See Bug 68's fix for
+    # context.
+    #
+    # Runs on every PR regardless of file set — the script is
+    # nearly instant, and limiting it by paths would require
+    # tracking the alembic directory location across the five
+    # repos. Not worth the config bloat.
+    name: migrations append-only
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The script diffs against origin/main. Fetch full
+          # history so that ref is available on PR branches.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check migrations append-only
+        run: python scripts/check_migrations_append_only.py
