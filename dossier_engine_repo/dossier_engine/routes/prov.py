@@ -1,8 +1,10 @@
 """
 PROV export and visualization endpoints.
 
-- GET /dossiers/{id}/prov          → PROV-JSON export
-- GET /dossiers/{id}/prov/graph    → Interactive HTML visualization
+- GET /dossiers/{id}/prov                  → PROV-JSON export (audit-level)
+- GET /dossiers/{id}/prov/graph/timeline   → Timeline graph (honours per-user visibility)
+- GET /dossiers/{id}/prov/graph/columns    → Column-layout graph (audit-level, in prov_columns.py)
+- GET /dossiers/{id}/archive               → PDF/A archive export (audit-level)
 """
 
 from __future__ import annotations

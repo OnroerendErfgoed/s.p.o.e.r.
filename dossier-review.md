@@ -10,7 +10,7 @@
 
 | Status | Count | Items |
 |---|---|---|
-| ✅ Fixed & verified | 14 | Bugs 1, 2, 15, 16, 17, 32, 44, 47, 64, 65, 68, 72 (coverage), 73, 74, 75 |
+| ✅ Fixed & verified | 16 | Bugs 1, 2, 15, 16, 17, 32, 44, 47, 64, 65, 68, 70, 72 (coverage), 73, 74, 75 + Obs-2 (duplicate "external") |
 | 🔍 Investigated, not a bug | 1 | Bug 14 — cross-dossier refs are `type=external` rows |
 | 🛑 Deferred / accepted | 4 | Bug 31 (RRN acceptable), Bug 45 (MinIO migration), Bug 63 (403 is correct HTTP), Bug 71 (test activities, deploy-time removal) |
 | 🧪 Test suite | **740/740** passing | engine 687, toelatingen 16, file_service 19, common/signing 18 |
@@ -48,7 +48,7 @@ Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfac
 | 57 | 6 | `routes/entities.py` three endpoints skip `inject_download_urls`. |  |
 | 58 | 6 | `POST /{workflow}/validate/{name}` has no authentication. |  |
 | 62 | 6 | `/entities/{type}/{eid}/{vid}` doesn't verify `entity_id` matches. |  |
-| 📝 63 | 7 | **Accepted — keep 403.** Enumeration via 403-vs-404 response-code differential flagged as a security concern. For this deployment the tradeoff falls on semantic correctness: dossier UUIDs are cryptographically random (128 bits of entropy), the system runs behind SSO, `dossier.denied` audit events fire on every 403 so probing shows up in SIEM, and HTTP-client tooling relies on correct status codes for caching / routing / retries. Collapsing 403 to 404 would break that contract to close a leak with negligible real-world impact in this environment. RFC 9110 §15.5.5 permits 404-for-hidden-existence but it's not the right default here. Follow-up worth considering separately: SIEM alert on high-frequency `dossier.denied` events from a single actor — makes enumeration *observable* rather than *impossible*. | Decided. |
+| 📝 63 | 7 | **Accepted — keep 403.** Enumeration via 403-vs-404 response-code differential flagged as a security concern. For this deployment the tradeoff falls on semantic correctness: dossier UUIDs are cryptographically random (128 bits of entropy), the system runs behind SSO, `dossier.denied` audit events fire on every 403 so probing shows up in SIEM, and HTTP-client tooling relies on correct status codes for caching / routing / retries. Collapsing 403 to 404 would break that contract to close a leak with negligible real-world impact in this environment. RFC 9110 §15.5.5 permits 404-for-hidden-existence but it's not the right default here. Enumeration detection is a Wazuh dashboard + alert-rule concern, not an application concern — the `dossier.denied` stream already carries everything Wazuh needs (actor, dossier, reason, timestamp). | Decided. |
 | ~~68~~ | 7 | ~~Initial-schema Alembic migration mutated retroactively.~~ | ✅ |
 | 🛑 71 | 8 | **Accepted** — deploy-time checklist removes test activities from `workflow.yaml`. |  |
 | ~~72~~ | 8 | ~~`bewerkRelaties` zero test coverage.~~ | ✅ |
@@ -92,7 +92,7 @@ Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfac
 | 66 | 7 | Relation validator keying rules undocumented. |  |
 | 67 | 7 | `_errors.py` payload key collision. |  |
 | 69 | 7 | Tombstone role shape inconsistent between dossiertype template and workflow.yaml. |  |
-| 70 | 8 | `test_requests.sh` outputs dead `/prov/graph` URL. | Harness 2 in CI would flag this on the next run; fix is a one-liner once CI is wired. |
+| ~~70~~ | 8 | ~~`test_requests.sh` outputs dead `/prov/graph` URL.~~ | ✅ **Fixed** — four echo sites updated to `/prov/graph/timeline` (the user-visible visualization route). `prov.py` module docstring also corrected — it documented a `/prov/graph` endpoint that doesn't exist; now lists the four real ones. Verified end-to-end: `/prov/graph/timeline` returns 401 without auth (route registered), the old `/prov/graph` returns 404 (proves the URL was dead). |
 | ~~73~~ | (impl) | ~~`conftest.py` TRUNCATE list omits `domain_relations`.~~ | ✅ |
 | ~~74~~ | (impl) | ~~Worker/route deadlock on `system:task` rows.~~ | ✅ **Fixed.** Structural (worker takes dossier lock first, matching user-activity order) + defence-in-depth (`run_with_deadlock_retry` on routes). |
 | ~~75~~ | (impl) | ~~Worker crashes on cold start if the app hasn't finished Alembic migrations yet — `UndefinedTableError` propagates to top-level crash handler.~~ | ✅ **Fixed.** Surfaced by harness 2. Worker now tolerates SQLSTATE 42P01 during pre-ready window, logs a warning and retries; real missing-table errors after first successful poll still propagate. |
@@ -222,9 +222,15 @@ D4 and D22 both closed — they turned out to be the same pattern (audit emissio
 - **Harness 1, 2, 3** all green, all have synthetic-drift tests confirming they catch the bug shape they claim to catch.
 - **CI workflow** authored, statically validated, and [dev]-extras fix applied so pytest-asyncio + httpx install in CI.
 
+### Round 12 — Bug 70 + doc-drift on prov routes
+- **Bug 70 fixed.** `test_requests.sh` had four echo lines pointing at a bare `/prov/graph` URL that doesn't exist on the server. Fixed to `/prov/graph/timeline` (the user-visible, visibility-filtered route). Verified end-to-end: timeline returns 401 without auth (route registered), the old bare URL returns 404 (proves the original URL was dead).
+- **Incidental doc-drift fixed.** `prov.py`'s module docstring claimed the module exposed `/prov` and `/prov/graph` — the second endpoint doesn't exist. Docstring rewritten to list the four real endpoints (`/prov`, `/prov/graph/timeline`, `/prov/graph/columns`, `/archive`), so future readers don't build on the same wrong mental model. This is M4 territory but surfaces again here; a harness to lint module docstrings against the endpoint router is a possible future addition, not done this round.
+
 ### Where to go next (in priority order)
 
-1. **Bug 70** — dead `/prov/graph` URL in `test_requests.sh`. Would have been caught by the harness-2 CI job on its first run, but since no CI-provoked failure has happened yet, still sits open. One-line fix.
-2. **Meta M2 — "silent skip" review.** Survey all `logger.error` + `pass` patterns (unregistered validators, audit emission failures, bijlage move per-file failures, etc.), decide case-by-case which should propagate vs swallow. Mostly a design discussion with targeted fixes at the end.
-3. **`set_dossier_access` Obs-3 follow-up (optional)** — write-on-change optimization, if prov-graph churn ever becomes a problem. Needs a new `skip_write` contract on `HandlerResult` and engine-pipeline support. One day if/when wanted.
-4. **Bug 63 follow-up (optional)** — SIEM alert rule on high-frequency `dossier.denied` from a single actor. Makes enumeration observable in the security stream rather than architecturally impossible. Small scope, defence-in-depth.
+1. **Meta M2 — "silent skip" review.** Survey all `logger.error` + `pass` patterns (unregistered validators, audit emission failures, bijlage move per-file failures, etc.), decide case-by-case which should propagate vs swallow. Mostly a design discussion with targeted fixes at the end.
+2. **Any of the open "must-fix" bugs worth taking on** — Bugs 5, 6, 7, 30, 55, 57, 58, 62 all still open. Priority depends on deployment context; 5 (access-check docstring/code drift at a security boundary) and 58 (unauthenticated `/validate` endpoint) are the most user-visible.
+
+The two "optional" items previously on this list are now closed out:
+- **Obs-3** (write-on-change for `set_dossier_access`) — deferred by product decision. Keeping the full provenance graph is intended behaviour, not a pending optimization. Filed alongside Bugs 31/45/71 under deferred/accepted.
+- **Bug 63 follow-up** (enumeration alerting) — not an application concern. The `dossier.denied` stream already carries everything needed; dashboard + alert rule is a Wazuh config task, owned by SIEM operators.

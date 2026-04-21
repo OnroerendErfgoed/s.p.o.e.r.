@@ -226,7 +226,7 @@ curl -s "$BASE_URL/dossiers/d1000000-0000-0000-0000-000000000001" \
   -H "X-POC-User: marie.brugge" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Status: {d[\"status\"]}')"
 echo ""
 
-echo "D1 Graph: $BASE_URL/dossiers/d1000000-0000-0000-0000-000000000001/prov/graph"
+echo "D1 Graph: $BASE_URL/dossiers/d1000000-0000-0000-0000-000000000001/prov/graph/timeline"
 echo ""
 echo ""
 
@@ -449,7 +449,7 @@ curl -s "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001" \
   -H "X-POC-User: benjamma" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Status: {d[\"status\"]}')"
 echo ""
 
-echo "D2 Graph: $BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/prov/graph"
+echo "D2 Graph: $BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/prov/graph/timeline"
 echo ""
 echo ""
 
@@ -544,7 +544,7 @@ curl -s "$BASE_URL/dossiers/d3000000-0000-0000-0000-000000000001" \
   -H "X-POC-User: marie.brugge" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Status: {d[\"status\"]}')"
 echo ""
 
-echo "D3 Graph: $BASE_URL/dossiers/d3000000-0000-0000-0000-000000000001/prov/graph"
+echo "D3 Graph: $BASE_URL/dossiers/d3000000-0000-0000-0000-000000000001/prov/graph/timeline"
 echo ""
 echo ""
 
@@ -634,7 +634,7 @@ curl -s "$BASE_URL/dossiers/d4000000-0000-0000-0000-000000000001" \
   -H "X-POC-User: marie.brugge" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Status: {d[\"status\"]}')"
 echo ""
 
-echo "D4 Graph: $BASE_URL/dossiers/d4000000-0000-0000-0000-000000000001/prov/graph"
+echo "D4 Graph: $BASE_URL/dossiers/d4000000-0000-0000-0000-000000000001/prov/graph/timeline"
 echo ""
 echo ""
 
