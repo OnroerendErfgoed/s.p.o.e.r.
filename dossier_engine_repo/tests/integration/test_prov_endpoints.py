@@ -120,6 +120,12 @@ async def prov_client():
 
 async def _bootstrap_with_entity(repo: Repository) -> tuple[UUID, UUID, UUID]:
     """Create D1 with one activity that generates one oe:aanvraag.
+    Also seeds an ``oe:dossier_access`` entity granting ``alice``,
+    mirroring the production invariant that every dossier gets its
+    access entity committed atomically with its creating activity
+    (via the ``setDossierAccess`` side-effect chain in
+    ``workflow.yaml``). Without this seed, ``check_dossier_access``
+    correctly default-denies the user-facing timeline endpoint.
     Returns (activity_id, entity_id, version_id).
     Caller must commit."""
     await repo.create_dossier(D1, "test")
@@ -144,6 +150,21 @@ async def _bootstrap_with_entity(repo: Repository) -> tuple[UUID, UUID, UUID]:
         version_id=vid, entity_id=eid, dossier_id=D1,
         type="oe:aanvraag", generated_by=act_id,
         content={"titel": "Test"}, attributed_to="alice",
+    )
+
+    # Access entity: alice-as-agent grant with activity_view="all",
+    # so the timeline endpoint shows her the full picture. In
+    # production this is written by ``setDossierAccess`` as a
+    # side-effect of ``dienAanvraagIn``; inlining it here keeps the
+    # fixture honest to the default-deny invariant without having to
+    # spin up the full pipeline.
+    await repo.create_entity(
+        version_id=uuid4(), entity_id=uuid4(), dossier_id=D1,
+        type="oe:dossier_access", generated_by=act_id,
+        content={"access": [
+            {"agents": ["alice"], "view": "all", "activity_view": "all"},
+        ]},
+        attributed_to="system",
     )
     await repo.session.flush()
     return act_id, eid, vid
@@ -857,7 +878,11 @@ class TestSharedGraphLoader:
 
         rows = await load_dossier_graph_rows(repo.session, D1)
         assert len(rows.activities) == 1
-        assert len(rows.entities) == 1
+        # _bootstrap_with_entity now creates two entities: the
+        # oe:aanvraag and the oe:dossier_access that grants alice
+        # (the latter is required because check_dossier_access is
+        # default-deny — see the fixture's docstring).
+        assert len(rows.entities) == 2
         assert act_id in rows.assoc_by_activity
         assert ver_id in rows.entity_by_id
         # The agent referenced in the fixture's association should

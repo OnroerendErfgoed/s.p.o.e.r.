@@ -59,6 +59,7 @@ from __future__ import annotations
 
 from uuid import UUID
 from fastapi import HTTPException
+from ..audit import emit_dossier_audit
 from ..db.models import Repository
 from ..auth import User
 
@@ -72,12 +73,19 @@ async def check_dossier_access(
     Checks global_access first (applies to all dossiers), then
     dossier-specific access via the ``oe:dossier_access`` entity.
 
+    Default-deny: an un-provisioned dossier (no ``oe:dossier_access``
+    entity, or one with empty content) raises 403 rather than
+    falling through to permit. See the module docstring for the
+    design principle; the atomic-provisioning guarantee that makes
+    this safe lives in ``workflow.yaml``'s side-effect chain.
+
     Returns:
         dict — the matched access entry (with role, view,
         activity_view).
 
     Raises:
-        HTTPException 403 if no entry matches (default-deny).
+        HTTPException 403 if no entry matches, or if the dossier has
+        no access entity configured (default-deny).
     """
     # Global access entries (from config.yaml) apply to every
     # dossier regardless of the dossier-level access entity.
@@ -92,10 +100,23 @@ async def check_dossier_access(
         dossier_id, "oe:dossier_access",
     )
     if not access_entity or not access_entity.content:
-        # No access entity on this dossier → no restrictions apply.
-        # Every authenticated user gets through. This is the normal
-        # state for new dossiers before access rules are provisioned.
-        return None
+        # No access entity (or empty content) → default-deny, per the
+        # module-level design principle. In this platform every dossier
+        # gets an ``oe:dossier_access`` entity committed atomically with
+        # its creating activity (``dienAanvraagIn`` chains into
+        # ``setDossierAccess`` as a transactional side effect; see
+        # ``workflow.yaml`` and ``engine/pipeline/side_effects.py``), so
+        # an un-provisioned dossier is an anomaly — migration half-apply,
+        # manual DB edit, plugin mis-wire. Safe default is reject, not
+        # permit; global_access holders already bypassed above.
+        emit_dossier_audit(
+            action="dossier.denied",
+            user=user,
+            dossier_id=dossier_id,
+            outcome="denied",
+            reason="Dossier has no access entity configured",
+        )
+        raise HTTPException(403, detail="No access to this dossier")
 
     for entry in access_entity.content.get("access", []):
         entry_role = entry.get("role")
@@ -106,7 +127,6 @@ async def check_dossier_access(
             return entry
 
     # Access entity exists but no entry matches → deny.
-    from ..audit import emit_dossier_audit
     emit_dossier_audit(
         action="dossier.denied",
         user=user,
@@ -215,7 +235,6 @@ async def check_audit_access(
         if audit_roles and any(r in user.roles for r in audit_roles):
             return
 
-    from ..audit import emit_dossier_audit
     emit_dossier_audit(
         action="dossier.audit_denied",
         user=user,

@@ -332,13 +332,22 @@ async def _seed_access_entity(
 
 class TestCheckDossierAccess:
 
-    async def test_no_access_entity_returns_none(self, repo):
+    async def test_no_access_entity_raises_403(self, repo):
         """If there's no oe:dossier_access entity in the dossier,
-        no access restrictions apply — every authenticated user
-        gets through with entry=None."""
+        default-deny applies — an authenticated user with no global
+        role match gets 403. The alternate entry point is
+        ``global_access`` (see ``test_global_access_role_match``);
+        on this platform every dossier is expected to get its
+        ``oe:dossier_access`` entity provisioned atomically by the
+        ``setDossierAccess`` side effect of its creating activity,
+        so reaching this branch means something is wrong (migration
+        half-applied, dossier created outside the pipeline, etc.).
+        Default-deny is the safe floor.
+        """
         await _bootstrap(repo)
-        result = await check_dossier_access(repo, D1, _user())
-        assert result is None
+        with pytest.raises(HTTPException) as exc:
+            await check_dossier_access(repo, D1, _user())
+        assert exc.value.status_code == 403
 
     async def test_global_access_role_match(self, repo):
         """global_access matches first — before any dossier-
@@ -412,10 +421,13 @@ class TestCheckDossierAccess:
             await check_dossier_access(repo, D1, _user("stranger"))
         assert exc.value.status_code == 403
 
-    async def test_empty_access_entity_content_returns_none(self, repo):
-        """An oe:dossier_access row exists but its content is
-        null or empty. Treated as 'no restrictions' — same as
-        having no access entity at all."""
+    async def test_empty_access_entity_content_raises_403(self, repo):
+        """An oe:dossier_access row exists but its content is null
+        or empty. Treated as 'no access configured' — same default-
+        deny floor as missing-entity. An empty-content row cannot
+        authorize anyone (there are no entries to match against),
+        so the operational meaning is identical to having no row at
+        all."""
         boot = await _bootstrap(repo)
         await repo.create_entity(
             version_id=uuid4(), entity_id=uuid4(), dossier_id=D1,
@@ -424,8 +436,77 @@ class TestCheckDossierAccess:
         )
         await repo.session.flush()
 
-        result = await check_dossier_access(repo, D1, _user())
-        assert result is None
+        with pytest.raises(HTTPException) as exc:
+            await check_dossier_access(repo, D1, _user())
+        assert exc.value.status_code == 403
+
+    async def test_denial_reasons_distinguish_no_entity_vs_no_match(
+        self, repo, monkeypatch,
+    ):
+        """The two default-deny paths (no access entity configured
+        vs. entity exists but user matched nothing) emit different
+        ``reason`` strings on ``dossier.denied`` audit events. SIEM
+        triage depends on the distinction: the first indicates a
+        provisioning anomaly (migration, manual edit), the second
+        is the expected flow for an unauthorized user trying to hit
+        someone else's dossier. Pin the contract so a future
+        refactor that collapses both paths to a generic 'denied' is
+        caught here."""
+        boot = await _bootstrap(repo)
+        captured: list[dict] = []
+
+        def capture(**kwargs):
+            captured.append(kwargs)
+
+        monkeypatch.setattr(
+            "dossier_engine.routes.access.emit_dossier_audit",
+            capture,
+        )
+
+        # Path 1: no access entity at all — D1 is freshly bootstrapped
+        # without one.
+        with pytest.raises(HTTPException):
+            await check_dossier_access(repo, D1, _user("alice"))
+
+        # Path 2: seed an access entity on the same dossier with an
+        # entry that doesn't match the user, then retry. The singleton
+        # lookup returns the newly-seeded row.
+        await _seed_access_entity(repo, boot, [
+            {"role": "oe:admin", "activity_view": "all"},
+        ])
+        with pytest.raises(HTTPException):
+            await check_dossier_access(repo, D1, _user("stranger"))
+
+        assert len(captured) == 2
+        assert captured[0]["action"] == "dossier.denied"
+        assert captured[0]["outcome"] == "denied"
+        assert captured[0]["reason"] == (
+            "Dossier has no access entity configured"
+        )
+        assert captured[1]["action"] == "dossier.denied"
+        assert captured[1]["outcome"] == "denied"
+        assert captured[1]["reason"] == (
+            "User has no matching role or agent entry for this dossier"
+        )
+
+    async def test_global_access_bypasses_missing_entity_deny(self, repo):
+        """A user whose role matches ``global_access`` must pass
+        even on a dossier that has no ``oe:dossier_access`` entity.
+        This pins the bypass ordering: the global_access loop runs
+        *before* the access-entity lookup, so operators listed in
+        config.yaml remain functional against un-provisioned
+        dossiers (which is exactly the situation an admin might
+        need to investigate)."""
+        await _bootstrap(repo)
+        global_access = [
+            {"role": "beheerder", "view": "all", "activity_view": "all"},
+        ]
+        result = await check_dossier_access(
+            repo, D1, _user("admin", "beheerder"),
+            global_access=global_access,
+        )
+        assert result is not None
+        assert result["role"] == "beheerder"
 
 
 class TestGetVisibilityFromEntry:

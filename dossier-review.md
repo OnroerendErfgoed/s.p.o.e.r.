@@ -10,15 +10,15 @@
 
 | Status | Count | Items |
 |---|---|---|
-| ✅ Fixed & verified | 18 | Bugs 1, 2, 12, 15, 16, 17, 32, 44, 47, 64, 65, 68, 70, 72 (coverage), 73, 74, 75, 76 + Obs-2 (duplicate "external") |
+| ✅ Fixed & verified | 19 | Bugs 1, 2, 5, 12, 15, 16, 17, 32, 44, 47, 64, 65, 68, 70, 72 (coverage), 73, 74, 75, 76 + Obs-2 (duplicate "external") |
 | 🔍 Investigated, not a bug | 1 | Bug 14 — cross-dossier refs are `type=external` rows |
 | 🛑 Deferred / accepted | 4 | Bug 31 (RRN acceptable), Bug 45 (MinIO migration), Bug 63 (403 is correct HTTP), Bug 71 (test activities, deploy-time removal) |
-| 🧪 Test suite | **760/760** passing | engine 705, toelatingen 16, file_service 21, common/signing 18 |
+| 🧪 Test suite | **762/762** passing | engine 707, toelatingen 16, file_service 21, common/signing 18 |
 | 🏃 `test_requests.sh` | **25/25 OK, exit 0, zero deadlocks, zero worker crashes** | D1–D9 green |
 | ✂️ Duplication closed | **D1, D2, D4, D22, D25** | Graph-loader consolidation + audit-emit wrapper |
 | 🧰 Harnesses installed | **3** | Guidebook YAML lint + phase-docstring lint + CI shell-spec wrapper |
 | 🤖 CI wired | **GitHub Actions** | `.github/workflows/ci.yml` — 4 jobs: pytest, shell-spec, doc-harnesses, migrations-append-only |
-| 📦 Pending | ~59 bugs + 57 obs + 22 dups + 5 meta (partial relief) | See below |
+| 📦 Pending | ~58 bugs + 57 obs + 22 dups + 5 meta (partial relief) | See below |
 
 Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfaced and fixed in the same session as the harness that surfaced it.
 
@@ -32,7 +32,7 @@ Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfac
 |---|------|---------|--------|
 | ~~1~~ | 1 | ~~`remove_relations` — `r["relation_type"]` on frozen dataclass → `TypeError`.~~ | ✅ |
 | ~~2~~ | 1 | ~~Add-validator dispatch path also triggers on removes.~~ | ✅ |
-| 5 | 2 | `check_dossier_access` docstring claims default-deny but code asserts default-allow. |  |
+| ~~5~~ | 2 | ~~`check_dossier_access` docstring claims default-deny but code asserts default-allow.~~ | ✅ **Fixed in Round 15.** Code now matches the module docstring: an un-provisioned dossier (no `oe:dossier_access` entity, or one with empty content) raises 403 with `emit_dossier_audit(reason="Dossier has no access entity configured")` instead of falling through to permit. Drive-by consistency fix in the same file — three gratuitous in-function `from ..audit import emit_dossier_audit` hoisted to module level. Four tests updated + two regression tests added + `_bootstrap_with_entity` in `test_prov_endpoints.py` taught to seed the access entity that production's `setDossierAccess` side-effect writes. |
 | 6 | 2 | Alembic failure fallback runs `create_tables()` — half-migrated schema risk. |  |
 | 7 | 2 | Batch endpoint emits audit events per item before transaction commit. |  |
 | 🔍 14 | 3 | **Not a bug.** Cross-dossier refs persisted as local `type=external` rows via `ensure_external_entity`; raw-UUID cross-dossier refs rejected at `resolve_used:89-92` with 422. | Dropped from must-fix. |
@@ -389,11 +389,37 @@ Started this round aiming to fix Bug 12 (`_parse_scheduled_for` silently fires t
 
 **Process note.** This round revealed that the review's bookkeeping had gotten ahead of the code — two bugs were listed as open that had been fixed in earlier rounds but whose "fixed" state didn't survive transcript compaction. The harnesses and test suite caught this naturally: attempting to "fix" Bug 12 immediately showed `_parse_scheduled_for` already returning `datetime.max` with full test coverage, and the same pattern for Bug 76 revealed an adjacent real bug (the `UnicodeDecodeError` gap) that only got surfaced by writing the regression tests. Lesson: when context runs deep, verify claimed-open items against code before planning a fix.
 
+### Round 15 — Bug 5 (security-boundary docstring/code drift) + drive-by import cleanup
+
+Started with the usual "verify before planning" step — given Round 14's lesson about stale bookkeeping, the first question was whether the drift still existed. It did: `access.py` module docstring stated *default-deny* in three places (line 8, lines 23-31, line 80), and so did the function docstring, but the code at lines 94-98 returned `None` (treated downstream as unrestricted access) when the dossier had no `oe:dossier_access` entity — classic default-allow. The sibling `check_audit_access` in the same file was genuinely default-deny, underscoring that the intended contract was default-deny throughout.
+
+**Design question surfaced before coding.** Which side wins — docstrings or code? Evidence collected: (a) every dossier in production gets its access entity committed atomically with the creating activity via `workflow.yaml`'s `setDossierAccess` side-effect chain, which runs inside the same transaction as `dienAanvraagIn` per `engine/pipeline/side_effects.py:86-89`; (b) only two integration tests assumed default-allow (`test_no_access_entity_returns_none`, `test_empty_access_entity_content_returns_none`), with a third integration fixture `_bootstrap_with_entity` in `test_prov_endpoints.py` covertly depending on it; (c) the in-function comment rationalizing default-allow ("This is the normal state for new dossiers before access rules are provisioned") was factually wrong — no such committed state exists. User confirmed Option B (tighten code to default-deny, close the footgun).
+
+**Fix.**
+- `access.py:94-98` — replaced the `return None` default-allow branch with a 403-raise that mirrors the existing "no match" branch, using a *distinguishing* `reason="Dossier has no access entity configured"` to let SIEM rules differentiate provisioning anomalies from routine unauthorized-access attempts.
+- `access.py:70-88` — function docstring updated: added an explicit "Default-deny" paragraph and updated the Returns/Raises sections.
+- `access.py:58-64` — drive-by cleanup: three gratuitous `from ..audit import emit_dossier_audit` inside function branches consolidated into one module-level import. No circular-import risk (verified — `audit.py` doesn't import from `routes/`). This was not strictly necessary for the fix but made the monkeypatch-based regression test cleaner and removed a code smell that had been carrying forward.
+
+**Test impact.**
+- `test_no_access_entity_returns_none` → `test_no_access_entity_raises_403`. Assertion flipped from `result is None` to `pytest.raises(HTTPException, 403)`; docstring rewritten to explain the new default-deny contract and the atomic-provisioning invariant that makes it safe.
+- `test_empty_access_entity_content_returns_none` → `test_empty_access_entity_content_raises_403`. Same flip.
+- **Two new regression tests** in `TestCheckDossierAccess`:
+  - `test_denial_reasons_distinguish_no_entity_vs_no_match` — monkeypatches `emit_dossier_audit`, triggers both deny paths, asserts the two `reason` strings are distinct. Pins the SIEM-triage contract: a future refactor that collapses both paths to a generic "denied" fails at commit.
+  - `test_global_access_bypasses_missing_entity_deny` — asserts that a `global_access` role match short-circuits before the access-entity lookup. Operators listed in `config.yaml` retain access against un-provisioned dossiers (which is exactly when they'd need to investigate).
+- **Fixture invariant restored.** `tests/integration/test_prov_endpoints.py::_bootstrap_with_entity` now seeds an `oe:dossier_access` entity granting the test user, matching what production's `setDossierAccess` side-effect writes. The fixture was silently depending on default-allow; default-deny surfaces that dependency, so making the fixture faithful to production is the honest fix. One incidental `len(entities) == 1` assertion in `test_loader_returns_populated_indexes` became `== 2` with an inline comment (two entities now: aanvraag + dossier_access).
+
+**Verified.**
+- **Test suite:** 762/762 (engine 707, up from 705; toelatingen 16, signing 18, file_service 21). +2 matches the two new regression tests.
+- **Shell spec via harness 2:** exit 0, 25 OK, 5 summaries, D1–D9 green, zero tracebacks/5xx. The `dienAanvraagIn → duidVerantwoordelijkeOrganisatieAan → setDossierAccess` side-effect chain continues to provision access atomically under the new security floor — the happy path never hits the new 403.
+
+**Process note.** The kickoff's "verify before planning" discipline paid off here, but not in the Round 14 way (where the bug was already fixed). This time the drift was real, and verification mattered for the transition-cost question instead: tracing the provisioning chain through `workflow.yaml` and `side_effects.py:86-89` established that no committed-but-un-provisioned state exists in production, which is what makes default-deny safe to switch on without coordinating a data migration. Without that check, the conservative move would have been Option A (fix the docs) — which would have enshrined the footgun.
+
+**Follow-up observation** (not shipped, for consideration in a later round). `_bootstrap_with_entity` was carrying a hidden dependency on the bug it was supposed to be unrelated to. Other test fixtures across the suite likely have the same shape — create a dossier without provisioning access, and accidentally-pass because of default-allow. The engine sweep says no other tests hit `check_dossier_access` without seeding it (otherwise the full-suite run would have shown more failures), but a small harness that asserts "every committed test dossier has an `oe:dossier_access` entity" would catch this class of drift at commit time and pin the production invariant. Flagging as a candidate **M7 / harness 4** if useful — it's roughly the same shape as the existing docstring-lint harness (walk, inspect, assert).
+
 ### Where to go next (in priority order)
 
-1. **Bug 5 — `check_dossier_access` docstring/code drift.** Security-boundary concern: docstring claims default-deny, code reportedly asserts default-allow. Small scope (either code matches docstring or docstring matches code, one of the two), high-value — this is a literal doc-vs-code drift in authorization. Worth verifying first that the drift is still there, given what just happened with Bugs 12 and 76.
-2. **Bug 58 — unauthenticated `/validate` endpoint.** User-visible, not behind SSO.
-3. **Remaining open "must-fix" bugs** — Bugs 6, 7, 30, 55, 57, 62. Priority depends on deployment context.
+1. **Bug 58 — unauthenticated `/validate` endpoint.** User-visible, not behind SSO. Check the route registration in `dossier_engine_repo/dossier_engine/app.py` and wherever validate endpoints are mounted. As with Bugs 5/12/76, verify it's still open first — it's been on the list across multiple rounds and may already be wired.
+2. **Remaining open "must-fix" bugs** — Bugs 6, 7, 30, 55, 57, 62. Priority depends on deployment context.
 
 The two "optional" items previously on this list remain closed:
 - **Obs-3** (write-on-change for `set_dossier_access`) — deferred by product decision. Keeping the full provenance graph is intended behaviour, not a pending optimization. Filed alongside Bugs 31/45/71 under deferred/accepted.
