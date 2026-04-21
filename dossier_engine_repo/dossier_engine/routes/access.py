@@ -106,15 +106,12 @@ async def check_dossier_access(
             return entry
 
     # Access entity exists but no entry matches → deny.
-    from ..audit import emit_audit
-    emit_audit(
+    from ..audit import emit_dossier_audit
+    emit_dossier_audit(
         action="dossier.denied",
-        actor_id=user.id,
-        actor_name=user.name,
-        target_type="Dossier",
-        target_id=str(dossier_id),
+        user=user,
+        dossier_id=dossier_id,
         outcome="denied",
-        dossier_id=str(dossier_id),
         reason="User has no matching role or agent entry for this dossier",
     )
     raise HTTPException(403, detail="No access to this dossier")
@@ -218,15 +215,12 @@ async def check_audit_access(
         if audit_roles and any(r in user.roles for r in audit_roles):
             return
 
-    from ..audit import emit_audit
-    emit_audit(
+    from ..audit import emit_dossier_audit
+    emit_dossier_audit(
         action="dossier.audit_denied",
-        actor_id=user.id,
-        actor_name=user.name,
-        target_type="Dossier",
-        target_id=str(dossier_id),
+        user=user,
+        dossier_id=dossier_id,
         outcome="denied",
-        dossier_id=str(dossier_id),
         reason="User has no role in global_audit_access or dossier audit_access",
     )
     raise HTTPException(

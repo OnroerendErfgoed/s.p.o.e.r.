@@ -434,7 +434,7 @@ async def _run_activity(
     etc.) are not audited — those belong in the application log /
     Sentry, not the SIEM audit trail.
     """
-    from ..audit import emit_audit
+    from ..audit import emit_dossier_audit
 
     is_root = bool(act_def.get("can_create_dossier"))
     action = "dossier.created" if is_root else "dossier.updated"
@@ -463,14 +463,11 @@ async def _run_activity(
         # not security events.
         code = getattr(e, 'code', None)
         if code == 403:
-            emit_audit(
+            emit_dossier_audit(
                 action="dossier.denied",
-                actor_id=user.id,
-                actor_name=user.name,
-                target_type="Dossier",
-                target_id=str(dossier_id),
+                user=user,
+                dossier_id=dossier_id,
                 outcome="denied",
-                dossier_id=str(dossier_id),
                 reason=getattr(e, 'message', str(e)),
                 activity_type=act_def.get("name"),
                 activity_id=str(activity_id),
@@ -478,14 +475,11 @@ async def _run_activity(
         raise activity_error_to_http(e)
 
     # Success. One audit event per committed activity.
-    emit_audit(
+    emit_dossier_audit(
         action=action,
-        actor_id=user.id,
-        actor_name=user.name,
-        target_type="Dossier",
-        target_id=str(dossier_id),
+        user=user,
+        dossier_id=dossier_id,
         outcome="allowed",
-        dossier_id=str(dossier_id),
         activity_type=act_def.get("name"),
         activity_id=str(activity_id),
     )

@@ -30,17 +30,21 @@ Design:
 
 Usage from route handlers and pipeline code::
 
-    from dossier_engine.audit import emit_audit
+    from dossier_engine.audit import emit_dossier_audit
 
-    emit_audit(
+    emit_dossier_audit(
         action="dossier.read",
-        actor_id=user.id,
-        actor_name=user.name,
-        target_type="Dossier",
-        target_id=str(dossier_id),
+        user=user,
+        dossier_id=dossier_id,
         outcome="allowed",
-        dossier_id=str(dossier_id),
     )
+
+Use the lower-level ``emit_audit`` for events that aren't
+dossier-scoped (entity-scoped events, worker-level events with
+non-Dossier targets). For dossier-scoped events — the common
+case — ``emit_dossier_audit`` saves the repeated
+``actor_id=user.id``/``actor_name=user.name`` and the dossier-id
+double-pass.
 
 In dev and test environments the default path is unwritable, so
 `configure_audit_logging()` is a no-op unless explicitly called.
@@ -229,3 +233,66 @@ def emit_audit(
         # on; the underlying handler will have logged its own failure.
         # This path is hit e.g. if the disk fills up mid-request.
         pass
+
+
+def emit_dossier_audit(
+    *,
+    action: str,
+    user: Any,
+    dossier_id: Any,
+    outcome: str,
+    reason: str | None = None,
+    **extra: Any,
+) -> None:
+    """Convenience wrapper over ``emit_audit`` for dossier-scoped events.
+
+    Nearly every audit event in the platform is dossier-scoped: the
+    ``target`` is the dossier, ``target_id`` equals ``dossier_id``,
+    and actor identity comes straight off the ``User`` object from
+    the auth middleware. Seven call sites across four route modules
+    repeated the same 8-keyword ``emit_audit`` block, each with the
+    same ``target_type="Dossier"``, ``target_id=str(dossier_id)``,
+    ``dossier_id=str(dossier_id)``, ``actor_id=user.id``,
+    ``actor_name=user.name`` boilerplate. Five of the seven fields
+    on every call were identical.
+
+    This helper collapses that boilerplate. Use it for dossier-scoped
+    events:
+
+        emit_dossier_audit(
+            action="dossier.read",
+            user=user,
+            dossier_id=dossier_id,
+            outcome="allowed",
+            workflow=dossier.workflow,
+        )
+
+    Keep using the lower-level ``emit_audit`` for events where the
+    target isn't a dossier (entity-scoped events, system-level
+    worker events, or anything with a non-Dossier ``target_type``).
+
+    Parameters:
+    * ``user`` — any object with ``.id`` and ``.name`` string
+      attributes. The auth middleware's ``User`` dataclass is the
+      canonical shape, but duck-typed so test fixtures can pass in
+      a simple namespace.
+    * ``dossier_id`` — UUID or string. Stringified automatically —
+      both ``target_id`` and the top-level ``dossier_id`` field on
+      the emitted payload use the same value, which matches the
+      pre-refactor behaviour across all seven call sites.
+    * remaining parameters match ``emit_audit`` exactly. ``action``
+      and ``outcome`` are required; ``reason`` and ``**extra`` flow
+      through unchanged.
+    """
+    dossier_id_str = str(dossier_id)
+    emit_audit(
+        action=action,
+        actor_id=user.id,
+        actor_name=user.name,
+        target_type="Dossier",
+        target_id=dossier_id_str,
+        outcome=outcome,
+        dossier_id=dossier_id_str,
+        reason=reason,
+        **extra,
+    )

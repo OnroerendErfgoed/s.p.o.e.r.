@@ -12,13 +12,13 @@
 |---|---|---|
 | ✅ Fixed & verified | 14 | Bugs 1, 2, 15, 16, 17, 32, 44, 47, 64, 65, 68, 72 (coverage), 73, 74, 75 |
 | 🔍 Investigated, not a bug | 1 | Bug 14 — cross-dossier refs are `type=external` rows |
-| 🛑 Deferred / accepted | 3 | Bug 31 (RRN acceptable), Bug 45 (MinIO migration), Bug 71 (test activities, deploy-time removal) |
-| 🧪 Test suite | **720/720** passing | engine 683, file_service 19, common/signing 18 |
+| 🛑 Deferred / accepted | 4 | Bug 31 (RRN acceptable), Bug 45 (MinIO migration), Bug 63 (403 is correct HTTP), Bug 71 (test activities, deploy-time removal) |
+| 🧪 Test suite | **724/724** passing | engine 687, file_service 19, common/signing 18 |
 | 🏃 `test_requests.sh` | **25/25 OK, exit 0, zero deadlocks, zero worker crashes** | D1–D9 green |
-| ✂️ Duplication closed | **D1, D2, D25** | Graph-loader consolidation |
+| ✂️ Duplication closed | **D1, D2, D4, D22, D25** | Graph-loader consolidation + audit-emit wrapper |
 | 🧰 Harnesses installed | **3** | Guidebook YAML lint + phase-docstring lint + CI shell-spec wrapper |
 | 🤖 CI wired | **GitHub Actions** | `.github/workflows/ci.yml` — 4 jobs: pytest, shell-spec, doc-harnesses, migrations-append-only |
-| 📦 Pending | ~59 bugs + 57 obs + 24 dups + 5 meta (partial relief) | See below |
+| 📦 Pending | ~59 bugs + 57 obs + 22 dups + 5 meta (partial relief) | See below |
 
 Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfaced and fixed in the same session as the harness that surfaced it.
 
@@ -48,7 +48,7 @@ Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfac
 | 57 | 6 | `routes/entities.py` three endpoints skip `inject_download_urls`. |  |
 | 58 | 6 | `POST /{workflow}/validate/{name}` has no authentication. |  |
 | 62 | 6 | `/entities/{type}/{eid}/{vid}` doesn't verify `entity_id` matches. |  |
-| 63 | 7 | 404 before access check enables dossier-existence enumeration. |  |
+| 📝 63 | 7 | **Accepted — keep 403.** Enumeration via 403-vs-404 response-code differential flagged as a security concern. For this deployment the tradeoff falls on semantic correctness: dossier UUIDs are cryptographically random (128 bits of entropy), the system runs behind SSO, `dossier.denied` audit events fire on every 403 so probing shows up in SIEM, and HTTP-client tooling relies on correct status codes for caching / routing / retries. Collapsing 403 to 404 would break that contract to close a leak with negligible real-world impact in this environment. RFC 9110 §15.5.5 permits 404-for-hidden-existence but it's not the right default here. Follow-up worth considering separately: SIEM alert on high-frequency `dossier.denied` events from a single actor — makes enumeration *observable* rather than *impossible*. | Decided. |
 | ~~68~~ | 7 | ~~Initial-schema Alembic migration mutated retroactively.~~ | ✅ |
 | 🛑 71 | 8 | **Accepted** — deploy-time checklist removes test activities from `workflow.yaml`. |  |
 | ~~72~~ | 8 | ~~`bewerkRelaties` zero test coverage.~~ | ✅ |
@@ -146,7 +146,7 @@ Structural observations (57) unchanged from the 8-pass sweep; see earlier review
 - `prov.py` at 523 lines (was 792) — further splitting possible.
 - `prov_columns.py` layout algorithm (~280 lines inside `register_columns_graph`) wants extraction.
 
-Duplications (24 remaining; 3 closed): D1 (graph-rowset loader), D2 (PROV-JSON build), D25 (PROV-JSON prefix building) all closed via `dossier_engine/prov_json.py`. D3–D24, D26, D27 remain.
+Duplications (22 remaining; 5 closed): D1 (graph-rowset loader), D2 (PROV-JSON build), D4 (audit emission boilerplate), D22 (emit_audit 7-field repetition — merged with D4 since they were the same pattern), D25 (PROV-JSON prefix building). The audit pair closed via `emit_dossier_audit` in `audit.py`; the graph-rowset cluster via `dossier_engine/prov_json.py`. D3, D5–D21, D23–D24, D26, D27 remain.
 
 ---
 
@@ -197,16 +197,25 @@ Good GHA idioms applied: `concurrency:` group with `cancel-in-progress: true`, `
 
 Verified: workflow YAML parses cleanly (four jobs, all steps listed); the migrations-check script round-trips correctly (exit 0 on clean tree, exit 1 with a clear named-file error when a migration is modified, reverts cleanly); CI config shape matches the dev `config.yaml` (same database URL, iri_base, plugins, auth mode).
 
+### Round 10 — Bug 63 accepted + Duplication D4/D22 closure
+- **Bug 63 reclassified as 📝 accepted** (not a real bug for this deployment) with HTTP-semantics rationale captured: dossier UUIDs carry 128 bits of entropy, the system sits behind SSO, `dossier.denied` audit events already fire on every 403 so probing is SIEM-visible, and collapsing 403→404 would break client/proxy tooling that relies on proper status codes. RFC 9110 §15.5.5 permits 404-for-hidden but it's not the right default here. Follow-up recorded: SIEM alert on high-frequency `dossier.denied` from a single actor makes enumeration *observable* without obscuring the existence signal.
+- **`emit_dossier_audit` helper** added to `audit.py` — encapsulates the 5 fields that every dossier-scoped audit call repeated (`actor_id=user.id`, `actor_name=user.name`, `target_type="Dossier"`, `target_id=str(dossier_id)`, `dossier_id=str(dossier_id)`). Wraps the lower-level `emit_audit` which stays as the primitive for non-dossier-scoped events.
+- **7 call sites converted** across `routes/access.py` (×2), `routes/activities.py` (×2), `routes/dossiers.py`, `routes/prov.py`. Boilerplate per site dropped from ~9 lines to ~5.
+- **4 new tests** in `TestEmitDossierAudit`: wire-level equivalence with the long form (SIEM rule preservation), UUID stringification contract, reason+extra propagation, silent-when-unconfigured.
+- **audit.py docstring** updated to show the new preferred usage pattern.
+
+D4 and D22 both closed — they turned out to be the same pattern (audit emission boilerplate) under two review entries.
+
 ### Verification performed
-- **Test suite:** **720/720** (engine 683, signing 18, file_service 19). Grew by 47 tests across the engagement.
-- **Shell spec via harness 2:** `bash scripts/ci_run_shell_spec.sh` → 25 OK assertions, 5 summary-pass lines, exit 0, zero tracebacks, zero worker crashes.
+- **Test suite:** **724/724** (engine 687, signing 18, file_service 19). Grew by 51 tests across the engagement.
+- **Shell spec via harness 2:** `bash scripts/ci_run_shell_spec.sh` → 25 OK assertions, 5 summary-pass lines, exit 0, zero tracebacks, zero worker crashes, full audit emission through the wrapper verified end-to-end.
 - **Harness 1, 2, 3** all green, all have synthetic-drift tests confirming they catch the bug shape they claim to catch.
 - **CI workflow** authored and statically validated; will run on the first commit pushed to GitHub.
 
 ### Where to go next (in priority order)
 
-1. **Bug 63 — enumeration via 404-before-access-check.** Security, low effort. Two endpoints (`routes/dossiers.py:79-81`, `routes/entities.py:203-205`) currently distinguish "doesn't exist" from "exists but forbidden" through differential responses. Fix: access check before existence check; return the same response for both (404 or 403, decide once globally). Half a day including regression tests.
-2. **Duplication D4 + D22** — `emit_audit` boilerplate (~15 sites). Mechanical extract-helper refactor.
-3. **Observations cluster around `set_dossier_access`** — 6 copies of the view list, write-on-change opportunity. Improves performance and reduces D9.
-4. **Bug 70** — dead `/prov/graph` URL in `test_requests.sh`. Would have been caught by the harness-2 CI job on the first run, but since no CI-provoked failure has happened yet, still sits open. One-line fix.
-5. **Meta M2 — "silent skip" review.** Survey all `logger.error` + `pass` patterns, decide case-by-case which should propagate.
+1. **Observations cluster around `set_dossier_access`** — 6 copies of the behandelaar/beheerder view list, no write-on-change optimization. Extract the view list into a constant, make the handler compare-before-write. Reduces DB churn and closes Duplication D9 in one pass. One day.
+2. **Bug 70** — dead `/prov/graph` URL in `test_requests.sh`. Would have been caught by the harness-2 CI job on its first run, but since no CI-provoked failure has happened yet, still sits open. One-line fix.
+3. **Meta M2 — "silent skip" review.** Survey all `logger.error` + `pass` patterns (unregistered validators, audit emission failures, bijlage move per-file failures, etc.), decide case-by-case which should propagate vs swallow. Mostly a design discussion with targeted fixes at the end.
+4. **Bug 63 follow-up (optional)** — SIEM alert rule on high-frequency `dossier.denied` from a single actor. Makes enumeration observable in the security stream rather than architecturally impossible. Small scope, defence-in-depth.
+5. **Duplication D9** — may already be partly closed by the `set_dossier_access` refactor above; reassess after item 1.

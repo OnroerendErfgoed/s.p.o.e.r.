@@ -86,15 +86,18 @@ jobs:
       - name: Install all five projects in editable mode
         # Install order matters: common first (others depend on
         # it), then the leaves. This mirrors the README's
-        # documented install order.
+        # documented install order. The ``[dev]`` extras pull in
+        # test-only dependencies (pytest, pytest-asyncio, httpx)
+        # declared in each repo's pyproject.toml — keeps test deps
+        # co-located with the package that needs them rather than
+        # duplicated here.
         run: |
           python -m pip install --upgrade pip
-          pip install -e dossier_common_repo/ \
-                      -e file_service_repo/ \
-                      -e dossier_engine_repo/ \
-                      -e dossier_toelatingen_repo/ \
-                      -e dossier_app_repo/
-          pip install pytest pytest-asyncio
+          pip install -e "dossier_common_repo/[dev]" \
+                      -e "file_service_repo/[dev]" \
+                      -e "dossier_engine_repo/[dev]" \
+                      -e "dossier_toelatingen_repo/[dev]" \
+                      -e "dossier_app_repo/[dev]"
 
       - name: pytest — dossier_common_repo
         working-directory: dossier_common_repo
@@ -214,14 +217,17 @@ jobs:
 
       - name: Install the engine repo
         # Harness 3 imports ActivityState to introspect dataclass
-        # fields; harness 1 imports yaml. Installing the engine
-        # repo in editable mode gets both.
+        # fields; harness 1 imports yaml. The engine repo's ``[dev]``
+        # extra pulls in pytest + pytest-asyncio, which are needed
+        # even here because ``asyncio_mode = "auto"`` in the engine
+        # repo's pytest config makes the plugin a hard requirement
+        # at test-collection time — even for synchronous static-
+        # analysis harnesses that don't themselves use async.
         run: |
           python -m pip install --upgrade pip
-          pip install -e dossier_common_repo/ \
-                      -e dossier_engine_repo/ \
-                      -e dossier_toelatingen_repo/
-          pip install pytest pyyaml
+          pip install -e "dossier_common_repo/[dev]" \
+                      -e "dossier_engine_repo/[dev]" \
+                      -e "dossier_toelatingen_repo/[dev]"
 
       - name: Harness 1 — guidebook YAML lint
         working-directory: dossier_engine_repo

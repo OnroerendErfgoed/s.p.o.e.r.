@@ -200,15 +200,12 @@ def register(app: FastAPI, *, registry, get_user, global_access) -> None:
             # field names and can produce accidental rule matches
             # against built-in rules that key on the static `status`
             # slot.
-            from ..audit import emit_audit
-            emit_audit(
+            from ..audit import emit_dossier_audit
+            emit_dossier_audit(
                 action="dossier.read",
-                actor_id=user.id,
-                actor_name=user.name,
-                target_type="Dossier",
-                target_id=str(dossier_id),
+                user=user,
+                dossier_id=dossier_id,
                 outcome="allowed",
-                dossier_id=str(dossier_id),
                 workflow=dossier.workflow,
                 dossier_status=status,
             )

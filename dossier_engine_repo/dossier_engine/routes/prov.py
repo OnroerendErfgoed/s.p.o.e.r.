@@ -465,15 +465,12 @@ def register_prov_routes(
             # the dossier. Highest-priority event for compliance; a
             # dedicated action name so the SIEM can retain and alert
             # on exports separately from ordinary reads.
-            from ..audit import emit_audit
-            emit_audit(
+            from ..audit import emit_dossier_audit
+            emit_dossier_audit(
                 action="dossier.exported",
-                actor_id=user.id,
-                actor_name=user.name,
-                target_type="Dossier",
-                target_id=str(dossier_id),
+                user=user,
+                dossier_id=dossier_id,
                 outcome="allowed",
-                dossier_id=str(dossier_id),
                 export_format="pdfa3",
                 bytes_sent=len(pdf_body),
             )

@@ -208,3 +208,145 @@ class TestEmitAuditConfigured:
         # No record from dossier.audit in the root capture.
         audit_records = [r for r in caplog.records if r.name == "dossier.audit"]
         assert audit_records == []
+
+
+class TestEmitDossierAudit:
+    """The dossier-scoped convenience wrapper — D4/D22 refactor.
+
+    Seven route call sites repeated the same 8-keyword emit_audit
+    boilerplate (target_type="Dossier", target_id=str(dossier_id),
+    dossier_id=str(dossier_id), actor_id=user.id,
+    actor_name=user.name). The wrapper encapsulates that so the
+    callers don't have to. These tests pin down the wrapper's
+    contract so a future refactor can't silently change the wire
+    shape it produces — SIEM alert rules key on the exact payload
+    structure.
+    """
+
+    def test_produces_same_payload_as_long_form(self, tmp_path):
+        """Wire-level equivalence: a wrapper call must produce the
+        same payload as the equivalent emit_audit call. If this
+        ever diverges, existing SIEM rules break."""
+        audit = _reload_audit_module()
+        log_file = tmp_path / "audit.json"
+        audit.configure_audit_logging(path=str(log_file))
+
+        class FakeUser:
+            id = "alice"
+            name = "Alice"
+
+        # Emit one event via the wrapper, one via the long form.
+        # The payloads should match modulo the timestamp.
+        audit.emit_dossier_audit(
+            action="dossier.read",
+            user=FakeUser(),
+            dossier_id="d1-uuid",
+            outcome="allowed",
+            workflow="toelatingen",
+        )
+        audit.emit_audit(
+            action="dossier.read",
+            actor_id="alice", actor_name="Alice",
+            target_type="Dossier", target_id="d1-uuid",
+            outcome="allowed",
+            dossier_id="d1-uuid",
+            workflow="toelatingen",
+        )
+
+        import logging
+        for h in logging.getLogger("dossier.audit").handlers:
+            h.flush()
+
+        lines = log_file.read_text().splitlines()
+        assert len(lines) == 2
+        wrapper_event = json.loads(lines[0])
+        long_event = json.loads(lines[1])
+        # Strip timestamps — they differ by microseconds.
+        wrapper_event.pop("@timestamp")
+        long_event.pop("@timestamp")
+        assert wrapper_event == long_event
+
+    def test_stringifies_uuid_dossier_id(self, tmp_path):
+        """Callers pass UUIDs directly; the wrapper must stringify
+        once (for target_id) and propagate that same string as
+        dossier_id on the payload. Skipping the str() would leak a
+        UUID object into the JSON serializer, which works today
+        by accident but is brittle — pin the contract down."""
+        from uuid import UUID
+        audit = _reload_audit_module()
+        log_file = tmp_path / "audit.json"
+        audit.configure_audit_logging(path=str(log_file))
+
+        class FakeUser:
+            id = "alice"
+            name = "Alice"
+
+        did = UUID("12345678-1234-1234-1234-123456789abc")
+        audit.emit_dossier_audit(
+            action="dossier.read",
+            user=FakeUser(),
+            dossier_id=did,
+            outcome="allowed",
+        )
+        import logging
+        for h in logging.getLogger("dossier.audit").handlers:
+            h.flush()
+
+        event = json.loads(log_file.read_text().splitlines()[0])
+        assert event["target"]["id"] == str(did)
+        assert event["dossier_id"] == str(did)
+        # Same value in both slots — this is the invariant every
+        # route caller depended on when building the long-form
+        # emit_audit call.
+        assert event["target"]["id"] == event["dossier_id"]
+
+    def test_reason_and_extra_flow_through(self, tmp_path):
+        """denied events pass a `reason`; non-standard kwargs flow
+        into the payload's `extra` object. Both must survive the
+        wrapper's argument munging intact."""
+        audit = _reload_audit_module()
+        log_file = tmp_path / "audit.json"
+        audit.configure_audit_logging(path=str(log_file))
+
+        class FakeUser:
+            id = "alice"
+            name = "Alice"
+
+        audit.emit_dossier_audit(
+            action="dossier.denied",
+            user=FakeUser(),
+            dossier_id="d1-uuid",
+            outcome="denied",
+            reason="no role match",
+            activity_type="bewerkAanvraag",
+            activity_id="a1-uuid",
+        )
+        import logging
+        for h in logging.getLogger("dossier.audit").handlers:
+            h.flush()
+
+        event = json.loads(log_file.read_text().splitlines()[0])
+        assert event["reason"] == "no role match"
+        assert event["extra"] == {
+            "activity_type": "bewerkAanvraag",
+            "activity_id": "a1-uuid",
+        }
+
+    def test_silent_when_unconfigured(self, tmp_path):
+        """Unconfigured → no-op. Same contract as emit_audit; the
+        wrapper mustn't add a failure mode the base function
+        doesn't have."""
+        audit = _reload_audit_module()
+
+        class FakeUser:
+            id = "alice"
+            name = "Alice"
+
+        # Must not raise.
+        audit.emit_dossier_audit(
+            action="dossier.read",
+            user=FakeUser(),
+            dossier_id="d1-uuid",
+            outcome="allowed",
+        )
+        assert list(tmp_path.iterdir()) == []
