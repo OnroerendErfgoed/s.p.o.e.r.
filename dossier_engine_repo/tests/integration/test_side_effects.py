@@ -53,6 +53,7 @@ class _SidePlugin:
         activity_defs: dict | None = None,
         handlers: dict | None = None,
         singletons: set[str] | None = None,
+        side_effect_conditions: dict | None = None,
     ):
         self._defs = activity_defs or {}
         self.handlers = handlers or {}
@@ -61,6 +62,8 @@ class _SidePlugin:
         self.validators = {}
         self.task_handlers = {}
         self.relation_validators = {}
+        self.side_effect_conditions = side_effect_conditions or {}
+        self.name = "test"
         self.workflow = {"activities": list(self._defs.values()),
                          "relations": []}
 
@@ -472,3 +475,120 @@ class TestConditionMet:
             },
         )
         assert result is True
+
+
+class TestConditionFn:
+    """Runtime dispatch tests for ``condition_fn``. The validator
+    tests in ``test_refs_and_plugin.py`` cover shape checks at plugin
+    load; these cover actual invocation of the predicate by
+    ``_condition_met`` against real EntityRow instances.
+    """
+
+    async def test_condition_fn_returns_true_allows_side_effect(self, repo):
+        """Predicate returns True → gate opens, side effect runs."""
+        trigger = await _bootstrap(repo)
+        await _seed_generated(
+            repo, trigger, "oe:beslissing",
+            {"beslissing": "goedgekeurd"},
+        )
+
+        calls = []
+        async def should_publish(ctx):
+            calls.append("called")
+            # Real predicates read the trigger's generated entities via
+            # context.get_used_row — we verify that plumbing works.
+            beslissing_row = ctx.get_used_row("oe:beslissing")
+            assert beslissing_row is not None
+            return True
+
+        plugin = _SidePlugin(side_effect_conditions={
+            "should_publish": should_publish,
+        })
+
+        gen_rows = await repo.get_entities_by_type(D1, "oe:beslissing")
+        result = await _condition_met(
+            plugin=plugin, repo=repo, dossier_id=D1,
+            trigger_generated=gen_rows, trigger_used=[],
+            condition=None,
+            condition_fn_name="should_publish",
+        )
+        assert result is True
+        assert calls == ["called"]
+
+    async def test_condition_fn_returns_false_blocks_side_effect(self, repo):
+        """Predicate returns False → gate closed, side effect does not run."""
+        trigger = await _bootstrap(repo)
+        await _seed_generated(
+            repo, trigger, "oe:beslissing",
+            {"beslissing": "afgekeurd"},
+        )
+
+        async def should_publish(ctx):
+            beslissing_row = ctx.get_used_row("oe:beslissing")
+            if beslissing_row is None:
+                return False
+            return (beslissing_row.content or {}).get("beslissing") == "goedgekeurd"
+
+        plugin = _SidePlugin(side_effect_conditions={
+            "should_publish": should_publish,
+        })
+
+        gen_rows = await repo.get_entities_by_type(D1, "oe:beslissing")
+        result = await _condition_met(
+            plugin=plugin, repo=repo, dossier_id=D1,
+            trigger_generated=gen_rows, trigger_used=[],
+            condition=None,
+            condition_fn_name="should_publish",
+        )
+        assert result is False
+
+    async def test_unregistered_condition_fn_fails_closed(self, repo):
+        """Load-time validation should prevent this, but if it leaks
+        through, the runtime fails closed (returns False) rather than
+        raising mid-pipeline — raising would abort the parent activity
+        for a configuration bug in the side effect."""
+        await _bootstrap(repo)
+        plugin = _SidePlugin()  # empty conditions dict
+
+        result = await _condition_met(
+            plugin=plugin, repo=repo, dossier_id=D1,
+            trigger_generated=[], trigger_used=[],
+            condition=None,
+            condition_fn_name="does_not_exist",
+        )
+        assert result is False
+
+    async def test_condition_fn_wins_over_dict_form(self, repo):
+        """Mutex is enforced at load time, but the runtime also picks
+        condition_fn when both slip through. Guard against the edge
+        case where a future bug lets both reach the gate function."""
+        trigger = await _bootstrap(repo)
+        await _seed_generated(
+            repo, trigger, "oe:beslissing",
+            {"beslissing": "goedgekeurd"},
+        )
+
+        fn_called = []
+        async def always_false(ctx):
+            fn_called.append(True)
+            return False
+
+        plugin = _SidePlugin(side_effect_conditions={
+            "always_false": always_false,
+        })
+
+        gen_rows = await repo.get_entities_by_type(D1, "oe:beslissing")
+        result = await _condition_met(
+            plugin=plugin, repo=repo, dossier_id=D1,
+            trigger_generated=gen_rows, trigger_used=[],
+            # Dict form would return True (field matches), but the
+            # function form takes precedence and returns False.
+            condition={
+                "entity_type": "oe:beslissing",
+                "field": "beslissing",
+                "value": "goedgekeurd",
+            },
+            condition_fn_name="always_false",
+        )
+        assert result is False
+        assert fn_called == [True]

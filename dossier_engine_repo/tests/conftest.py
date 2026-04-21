@@ -180,6 +180,7 @@ async def db_session(db_session_factory):
     """
     tables = [
         "used",
+        "domain_relations",
         "activity_relations",
         "associations",
         "agents",

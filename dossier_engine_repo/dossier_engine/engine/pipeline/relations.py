@@ -436,10 +436,13 @@ async def _dispatch_validators(
 
         # Collect add-entries (from relations_by_type) and
         # remove-entries (from validated_remove_relations).
+        # Note: validated_remove_relations holds DomainRelationEntry
+        # frozen dataclasses — use attribute access, not dict subscript.
+        # Matches the persistence-phase reader at persistence.py:208-213.
         add_entries = state.relations_by_type.get(rel_type, [])
         remove_entries = [
             r for r in state.validated_remove_relations
-            if r["relation_type"] == rel_type
+            if r.relation_type == rel_type
         ]
 
         # Dispatch add validator. Fires even with empty entries —

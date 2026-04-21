@@ -698,3 +698,151 @@ class TestSideEffectConditionValidation:
             "oe:followup_a",
             {"activity": "oe:followup_b"},
         ]
+
+
+class TestConditionFnValidation:
+    """Validator coverage for the function-form side-effect gate
+    (``condition_fn:``). Separate from the dict-form validator class
+    because the rules are different — function form is just a
+    non-empty string at the shape layer; registration is cross-checked
+    by a separate validator that runs after the Plugin is assembled.
+    """
+
+    def test_condition_fn_string_accepted(self):
+        from dossier_engine.plugin import validate_side_effect_conditions
+
+        validate_side_effect_conditions({
+            "activities": [{
+                "name": "a",
+                "side_effects": [{
+                    "activity": "b",
+                    "condition_fn": "should_publish",
+                }],
+            }],
+        })
+
+    def test_condition_fn_non_string_rejected(self):
+        from dossier_engine.plugin import validate_side_effect_conditions
+
+        with pytest.raises(ValueError) as exc_info:
+            validate_side_effect_conditions({
+                "activities": [{
+                    "name": "a",
+                    "side_effects": [{
+                        "activity": "b",
+                        "condition_fn": {"name": "should_publish"},  # bogus
+                    }],
+                }],
+            })
+        assert "non-string" in str(exc_info.value)
+
+    def test_condition_fn_empty_string_rejected(self):
+        from dossier_engine.plugin import validate_side_effect_conditions
+
+        with pytest.raises(ValueError) as exc_info:
+            validate_side_effect_conditions({
+                "activities": [{
+                    "name": "a",
+                    "side_effects": [{
+                        "activity": "b",
+                        "condition_fn": "   ",
+                    }],
+                }],
+            })
+        assert "non-string" in str(exc_info.value)
+
+    def test_both_forms_on_same_entry_rejected(self):
+        """Declaring both ``condition:`` and ``condition_fn:`` on the
+        same side-effect entry is a configuration bug — the engine
+        can't tell which one the author meant as authoritative. Fail
+        loud at load."""
+        from dossier_engine.plugin import validate_side_effect_conditions
+
+        with pytest.raises(ValueError) as exc_info:
+            validate_side_effect_conditions({
+                "activities": [{
+                    "name": "a",
+                    "side_effects": [{
+                        "activity": "b",
+                        "condition": {
+                            "entity_type": "oe:x",
+                            "field": "content.y",
+                            "value": "z",
+                        },
+                        "condition_fn": "should_publish",
+                    }],
+                }],
+            })
+        msg = str(exc_info.value)
+        assert "condition" in msg and "condition_fn" in msg
+
+    def test_registration_cross_check_unknown_name_rejected(self):
+        from dossier_engine.plugin import (
+            validate_side_effect_condition_fn_registrations,
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            validate_side_effect_condition_fn_registrations(
+                workflow={
+                    "activities": [{
+                        "name": "a",
+                        "side_effects": [{
+                            "activity": "b",
+                            "condition_fn": "does_not_exist",
+                        }],
+                    }],
+                },
+                side_effect_conditions={},
+            )
+        msg = str(exc_info.value)
+        assert "does_not_exist" in msg
+        assert "no predicate" in msg or "not registered" in msg.lower()
+
+    def test_registration_cross_check_known_name_accepted(self):
+        from dossier_engine.plugin import (
+            validate_side_effect_condition_fn_registrations,
+        )
+
+        async def should_publish(ctx):
+            return True
+
+        # No raise — registration resolves.
+        validate_side_effect_condition_fn_registrations(
+            workflow={
+                "activities": [{
+                    "name": "a",
+                    "side_effects": [{
+                        "activity": "b",
+                        "condition_fn": "should_publish",
+                    }],
+                }],
+            },
+            side_effect_conditions={"should_publish": should_publish},
+        )
+
+    def test_registration_cross_check_lists_known_names_in_error(self):
+        """Unknown-name error lists what IS registered, so the
+        author can spot a typo quickly."""
+        from dossier_engine.plugin import (
+            validate_side_effect_condition_fn_registrations,
+        )
+
+        async def fn_a(ctx): return True
+        async def fn_b(ctx): return False
+
+        with pytest.raises(ValueError) as exc_info:
+            validate_side_effect_condition_fn_registrations(
+                workflow={
+                    "activities": [{
+                        "name": "a",
+                        "side_effects": [{
+                            "activity": "b",
+                            "condition_fn": "typo_here",
+                        }],
+                    }],
+                },
+                side_effect_conditions={"fn_a": fn_a, "fn_b": fn_b},
+            )
+        msg = str(exc_info.value)
+        # The known names should appear in the message, sorted.
+        assert "fn_a" in msg and "fn_b" in msg

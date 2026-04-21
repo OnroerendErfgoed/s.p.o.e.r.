@@ -30,7 +30,9 @@ from dossier_engine.engine.errors import ActivityError
 from dossier_engine.engine.pipeline.relations import process_relations
 from dossier_engine.engine.pipeline.tombstone import validate_tombstone
 from dossier_engine.engine.pipeline.validators import run_custom_validators
-from dossier_engine.engine.state import ActivityState, Caller
+from dossier_engine.engine.state import (
+    ActivityState, Caller, DomainRelationEntry,
+)
 
 
 D1 = UUID("11111111-1111-1111-1111-111111111111")
@@ -607,3 +609,379 @@ class TestProcessRelations:
         await process_relations(state)
         assert len(called) == 1
         assert called[0]["entries"] == []
+
+
+# --------------------------------------------------------------------
+# process_relations — remove operations (Bug 1/2 regression coverage)
+# --------------------------------------------------------------------
+#
+# Before the fix at relations.py:442-446, the dispatch loop used
+# ``r["relation_type"]`` to filter remove-entries by rel_type. But
+# ``validated_remove_relations`` holds ``DomainRelationEntry`` frozen
+# dataclasses, not dicts — so the subscript raised ``TypeError:
+# 'DomainRelationEntry' object is not subscriptable`` the moment any
+# activity submitted a non-empty ``remove_relations`` block with an
+# activity-level ``relations:`` opt-in declared.
+#
+# The feature (remove-operations, as used by ``bewerkRelaties``) was
+# dead on arrival: no test exercised this code path, the persistence
+# reader at persistence.py:208-213 already used attribute access
+# (so only the validator dispatcher was broken), and the guidebook
+# didn't document per-operation validators. These tests pin the fix
+# down and document the shape the validator receives.
+
+
+class TestProcessRemoveRelations:
+
+    async def test_remove_relation_populates_state(self, repo):
+        """Happy path: activity opts into ``[add, remove]``, client
+        sends a ``remove_relations`` item with valid from/to refs.
+        The phase should stage a ``DomainRelationEntry`` under
+        ``state.validated_remove_relations`` without raising."""
+        await _bootstrap_dossier(repo)
+
+        plugin = _RelationPlugin(
+            workflow_relations=[
+                {"type": "oe:betreft", "kind": "domain"},
+            ],
+        )
+        # Use full URIs as from/to so expand_ref passes them through
+        # unchanged — this keeps the assertion independent of the
+        # base-URI configuration.
+        from_uri = "https://id.erfgoed.net/dossiers/d1/entities/oe:aanvraag/e1/v1"
+        to_uri = "https://id.erfgoed.net/erfgoedobjecten/60001"
+
+        state = _state(
+            repo, plugin=plugin,
+            activity_def={
+                "name": "bewerkRelaties",
+                "relations": [
+                    {
+                        "type": "oe:betreft",
+                        "kind": "domain",
+                        "operations": ["add", "remove"],
+                    },
+                ],
+            },
+            relation_items=[],
+        )
+        state.remove_relation_items = [{
+            "type": "oe:betreft",
+            "from": from_uri,
+            "to": to_uri,
+        }]
+
+        await process_relations(state)
+
+        assert len(state.validated_remove_relations) == 1
+        entry = state.validated_remove_relations[0]
+        assert isinstance(entry, DomainRelationEntry)
+        assert entry.relation_type == "oe:betreft"
+        assert entry.from_ref == from_uri
+        assert entry.to_ref == to_uri
+
+    async def test_remove_validator_dispatched_with_remove_entries(
+        self, repo,
+    ):
+        """The Bug 1/2 regression test.
+
+        Activity opts into ``[add, remove]`` for ``oe:betreft`` and
+        declares a per-operation ``remove`` validator. The client
+        sends a ``remove_relations`` item. The phase must:
+
+        * Filter ``validated_remove_relations`` by rel_type (this is
+          the line that used to raise ``TypeError`` on dict subscript
+          of a frozen dataclass).
+        * Resolve the ``remove`` validator via Style 1 of
+          ``_resolve_validator`` (per-operation dict).
+        * Call the validator with ``entries=[<DomainRelationEntry>]``.
+
+        If this test ever raises ``TypeError``, the Bug 1/2 fix has
+        regressed and every ``bewerkRelaties`` call with a non-empty
+        ``remove_relations`` block in production will 500."""
+        await _bootstrap_dossier(repo)
+
+        called = []
+        async def remove_validator(**kwargs):
+            called.append(kwargs)
+
+        plugin = _RelationPlugin(
+            workflow_relations=[
+                {"type": "oe:betreft", "kind": "domain"},
+            ],
+            relation_validators={
+                "validate_betreft_removable": remove_validator,
+            },
+        )
+        from_uri = "https://id.erfgoed.net/dossiers/d1/entities/oe:aanvraag/e1/v1"
+        to_uri = "https://id.erfgoed.net/erfgoedobjecten/60001"
+
+        state = _state(
+            repo, plugin=plugin,
+            activity_def={
+                "name": "bewerkRelaties",
+                "relations": [
+                    {
+                        "type": "oe:betreft",
+                        "kind": "domain",
+                        "operations": ["add", "remove"],
+                        "validators": {
+                            "remove": "validate_betreft_removable",
+                        },
+                    },
+                ],
+            },
+            relation_items=[],
+        )
+        state.remove_relation_items = [{
+            "type": "oe:betreft",
+            "from": from_uri,
+            "to": to_uri,
+        }]
+
+        # Must not raise TypeError — this is the Bug 1/2 regression.
+        await process_relations(state)
+
+        assert len(called) == 1
+        entries = called[0]["entries"]
+        assert len(entries) == 1
+        # Validator receives the frozen dataclass directly, same shape
+        # as `validated_remove_relations`. This is the shape plugin
+        # authors will code their `remove` validators against.
+        assert isinstance(entries[0], DomainRelationEntry)
+        assert entries[0].relation_type == "oe:betreft"
+        assert entries[0].from_ref == from_uri
+        assert entries[0].to_ref == to_uri
+
+    async def test_remove_entries_filtered_by_relation_type(self, repo):
+        """Two remove-entries with different relation types. The
+        dispatch filters ``validated_remove_relations`` per rel_type
+        so each type's remove validator receives only its own
+        entries.
+
+        This is the list comprehension at relations.py:443-446 —
+        the exact line that used to crash. Filtering two types
+        simultaneously exercises both iterations of the dispatch
+        loop and confirms the filter's equality check works on the
+        dataclass's ``relation_type`` attribute.
+
+        Uses per-operation validators (Style 1 of ``_resolve_validator``)
+        so each remove validator is exclusive to its rel_type — this
+        is the declaration style the per-operation feature was
+        designed for."""
+        await _bootstrap_dossier(repo)
+
+        betreft_remove_calls = []
+        valt_onder_remove_calls = []
+        async def betreft_remove_validator(**kwargs):
+            betreft_remove_calls.append(kwargs)
+        async def valt_onder_remove_validator(**kwargs):
+            valt_onder_remove_calls.append(kwargs)
+
+        plugin = _RelationPlugin(
+            workflow_relations=[
+                {"type": "oe:betreft", "kind": "domain"},
+                {"type": "oe:valtOnder", "kind": "domain"},
+            ],
+            relation_validators={
+                "validate_betreft_remove": betreft_remove_validator,
+                "validate_valt_onder_remove": valt_onder_remove_validator,
+            },
+        )
+        from_uri = "https://id.erfgoed.net/dossiers/d1/entities/oe:aanvraag/e1/v1"
+
+        state = _state(
+            repo, plugin=plugin,
+            activity_def={
+                "name": "bewerkRelaties",
+                "relations": [
+                    {
+                        "type": "oe:betreft",
+                        "kind": "domain",
+                        "operations": ["add", "remove"],
+                        "validators": {
+                            "remove": "validate_betreft_remove",
+                        },
+                    },
+                    {
+                        "type": "oe:valtOnder",
+                        "kind": "domain",
+                        "operations": ["add", "remove"],
+                        "validators": {
+                            "remove": "validate_valt_onder_remove",
+                        },
+                    },
+                ],
+            },
+            relation_items=[],
+        )
+        state.remove_relation_items = [
+            {
+                "type": "oe:betreft",
+                "from": from_uri,
+                "to": "https://id.erfgoed.net/erfgoedobjecten/60001",
+            },
+            {
+                "type": "oe:valtOnder",
+                "from": from_uri,
+                "to": "https://id.erfgoed.net/dossiers/d2/",
+            },
+        ]
+
+        await process_relations(state)
+
+        # Each rel_type's remove validator fires exactly once, with
+        # exactly its own entry — not the other type's.
+        assert len(betreft_remove_calls) == 1
+        assert len(valt_onder_remove_calls) == 1
+        assert len(betreft_remove_calls[0]["entries"]) == 1
+        assert betreft_remove_calls[0]["entries"][0].relation_type == "oe:betreft"
+        assert len(valt_onder_remove_calls[0]["entries"]) == 1
+        assert valt_onder_remove_calls[0]["entries"][0].relation_type == "oe:valtOnder"
+
+    async def test_remove_without_operation_declared_rejected(self, repo):
+        """Activity declares ``oe:betreft`` but with default
+        ``operations`` (i.e. ``[add]`` only — see
+        ``_allowed_operations`` at relations.py:74-82). A
+        ``remove_relations`` item for that type must 422 with a
+        message naming the allowed operations.
+
+        Catching this at parse time (``_parse_remove_relations``)
+        matters because the dispatch loop only sees the filtered
+        types set — a typo in the workflow that omits ``remove``
+        from ``operations`` should fail loudly, not silently skip."""
+        plugin = _RelationPlugin(
+            workflow_relations=[
+                {"type": "oe:betreft", "kind": "domain"},
+            ],
+        )
+        state = _state(
+            repo, plugin=plugin,
+            activity_def={
+                "name": "bewerkRelaties",
+                "relations": [
+                    {
+                        "type": "oe:betreft",
+                        "kind": "domain",
+                        # operations omitted → defaults to {"add"}
+                    },
+                ],
+            },
+            relation_items=[],
+        )
+        state.remove_relation_items = [{
+            "type": "oe:betreft",
+            "from": "https://id.erfgoed.net/dossiers/d1/entities/oe:aanvraag/e1/v1",
+            "to": "https://id.erfgoed.net/erfgoedobjecten/60001",
+        }]
+
+        with pytest.raises(ActivityError) as exc:
+            await process_relations(state)
+        assert exc.value.status_code == 422
+        msg = str(exc.value).lower()
+        assert "remov" in msg
+        assert "oe:betreft" in str(exc.value)
+
+    async def test_remove_missing_from_or_to_rejected(self, repo):
+        """Remove items require both ``from`` and ``to`` —
+        supersession targets a specific edge, not an endpoint.
+        Missing either field is 422."""
+        plugin = _RelationPlugin(
+            workflow_relations=[
+                {"type": "oe:betreft", "kind": "domain"},
+            ],
+        )
+        state = _state(
+            repo, plugin=plugin,
+            activity_def={
+                "name": "bewerkRelaties",
+                "relations": [
+                    {
+                        "type": "oe:betreft",
+                        "kind": "domain",
+                        "operations": ["add", "remove"],
+                    },
+                ],
+            },
+            relation_items=[],
+        )
+        state.remove_relation_items = [{
+            "type": "oe:betreft",
+            "from": "https://id.erfgoed.net/dossiers/d1/entities/oe:aanvraag/e1/v1",
+            # `to` omitted
+        }]
+
+        with pytest.raises(ActivityError) as exc:
+            await process_relations(state)
+        assert exc.value.status_code == 422
+        assert "'from' and 'to'" in str(exc.value)
+
+    async def test_remove_missing_type_rejected(self, repo):
+        """Remove items must carry ``type`` so the dispatch can
+        resolve operation permissions and the per-operation
+        validator. 422 with an explicit message."""
+        plugin = _RelationPlugin(
+            workflow_relations=[
+                {"type": "oe:betreft", "kind": "domain"},
+            ],
+        )
+        state = _state(
+            repo, plugin=plugin,
+            activity_def={
+                "name": "bewerkRelaties",
+                "relations": [
+                    {
+                        "type": "oe:betreft",
+                        "kind": "domain",
+                        "operations": ["add", "remove"],
+                    },
+                ],
+            },
+            relation_items=[],
+        )
+        state.remove_relation_items = [{
+            # `type` omitted
+            "from": "https://id.erfgoed.net/dossiers/d1/entities/oe:aanvraag/e1/v1",
+            "to": "https://id.erfgoed.net/erfgoedobjecten/60001",
+        }]
+
+        with pytest.raises(ActivityError) as exc:
+            await process_relations(state)
+        assert exc.value.status_code == 422
+        assert "missing 'type'" in str(exc.value)
+
+    async def test_remove_disallowed_relation_type_rejected(self, repo):
+        """Remove item carries a type that the workflow doesn't
+        permit at all (not in ``workflow.relations``, not opted
+        into by the activity). 422, same gate as add-relations —
+        the permission check is operation-agnostic."""
+        plugin = _RelationPlugin(
+            workflow_relations=[
+                {"type": "oe:betreft", "kind": "domain"},
+            ],
+        )
+        state = _state(
+            repo, plugin=plugin,
+            activity_def={
+                "name": "bewerkRelaties",
+                "relations": [
+                    {
+                        "type": "oe:betreft",
+                        "kind": "domain",
+                        "operations": ["add", "remove"],
+                    },
+                ],
+            },
+            relation_items=[],
+        )
+        state.remove_relation_items = [{
+            "type": "oe:forbidden",
+            "from": "https://id.erfgoed.net/dossiers/d1/entities/oe:aanvraag/e1/v1",
+            "to": "https://id.erfgoed.net/erfgoedobjecten/60001",
+        }]
+
+        with pytest.raises(ActivityError) as exc:
+            await process_relations(state)
+        assert exc.value.status_code == 422
+        assert "oe:forbidden" in str(exc.value)
+        assert "does not allow" in str(exc.value)

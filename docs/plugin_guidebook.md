@@ -285,46 +285,69 @@ Side effects are activities that fire automatically after a parent activity succ
     - activity: "setSystemFields"
 ```
 
-Each entry may carry a `condition:` block to gate execution on entity state:
+Each entry may carry a conditional gate in one of two forms, mutually exclusive per entry:
 
 ```yaml
+# Dict form: field equality against a dossier entity.
 side_effects:
   - activity: "publishToPortal"
     condition:
       entity_type: "oe:beslissing"
       field: "content.beslissing"
       value: "goedgekeurd"
+
+# Function form: a named predicate in Python.
+side_effects:
+  - activity: "publishToPortal"
+    condition_fn: "should_publish"
 ```
 
-Accepted keys: exactly `{entity_type, field, value}`. The engine validates this at plugin load — typos like `from_entity:` (borrowed from status-rule syntax) or `mapping:` (also from status rules) fail with an explicit error pointing at the right shape.
+**Dict form — `condition: {entity_type, field, value}`.** The engine looks up the named entity (in the trigger's scope, falling back to dossier-wide singleton lookup), reads the field via dot-notation, and compares to `value`. All three keys are required. Shape is validated at plugin load — typos like `from_entity:` (borrowed from status-rule syntax) or `mapping:` fail with an explicit error pointing at the right shape.
 
-#### When to use `condition:` vs an empty-result handler
+**Function form — `condition_fn: "name"`.** References a predicate registered on `plugin.side_effect_conditions`. The function receives an `ActivityContext` scoped to the triggering activity (so it can read the trigger's used and generated entities via `ctx.get_typed(...)`) and returns `bool`. Use this for any gate that isn't simple equality — counts, date comparisons, boolean combinations, config lookups.
+
+```python
+async def should_publish(ctx: ActivityContext) -> bool:
+    beslissing = ctx.get_typed("oe:beslissing")
+    if not beslissing or beslissing.beslissing != "goedgekeurd":
+        return False
+    # Business rule: don't publish during freeze windows.
+    return not ctx.constants.publication_freeze_active
+
+SIDE_EFFECT_CONDITIONS = {"should_publish": should_publish}
+
+Plugin(..., side_effect_conditions=SIDE_EFFECT_CONDITIONS)
+```
+
+Both the YAML name and the registered function names are cross-checked at plugin load. An unknown `condition_fn` name fails fast with a list of registered names. Declaring both `condition:` and `condition_fn:` on the same entry also fails at load — pick one.
+
+**Choosing between the two forms.** Use the dict form when the gate is a single field equality — it's readable inline and one less indirection. Use `condition_fn:` as soon as the gate involves anything else. Don't grow the dict shape with `value_in`, `value_not`, boolean combinators — that's a DSL creep path. `condition_fn` is the escape hatch; use it.
+
+#### When to use `condition:` / `condition_fn:` vs an empty-result handler
 
 Since a handler can also just return `HandlerResult()` with nothing, there's a choice. They're **not equivalent** — they produce different PROV graphs:
 
 | Approach | Activity row written? | Visible in PROV | Meaning |
 |---|---|---|---|
-| `condition:` blocks execution | No | No trace | "This activity doesn't apply here." |
+| `condition:` or `condition_fn:` blocks execution | No | No trace | "This activity doesn't apply here." |
 | Handler returns empty | Yes | Activity appears, produced nothing | "Activity ran, chose not to produce output." |
 
 Two concrete examples that cut opposite ways:
 
 **`setSystemFields` once per dossier.** You want this activity to run on `dienAanvraagIn` but not again on `bewerkAanvraag` edits. Gating with `condition: {entity_type: "oe:system_fields", field: ..., value: ...}` means PROV shows it ran once, cleanly. Using an empty handler on re-edits would show `setSystemFields` firing on every edit and producing nothing — noise in the audit trail.
 
-**`publishToPortal` with a legitimate "decline to publish".** The parent activity took a decision; publishing was considered, but policy says don't publish in this case. If you gate with `condition:`, the audit record silently lacks any mention that publication was considered. An empty-result handler preserves the trace: "publication was attempted, produced no output." That's the truthful record.
+**`publishToPortal` with a legitimate "decline to publish".** The parent activity took a decision; publishing was considered, but policy says don't publish in this case. If you gate with a condition, the audit record silently lacks any mention that publication was considered. An empty-result handler preserves the trace: "publication was attempted, produced no output." That's the truthful record.
 
-Rule of thumb: use `condition:` when the side effect genuinely **doesn't apply** (re-runs, wrong kind of entity, out-of-scope state). Use an empty-result handler when the side effect **applies but decided not to produce anything** (a reviewed case that needs to be visible in audit).
+Rule of thumb: use a condition gate when the side effect genuinely **doesn't apply** (re-runs, wrong kind of entity, out-of-scope state). Use an empty-result handler when the side effect **applies but decided not to produce anything** (a reviewed case that needs to be visible in audit).
 
-#### Why `condition:` isn't replaced by the split-style pattern
+#### Why side effects have a condition mechanism at all
 
-For tasks, we rejected YAML conditions in favor of `task_builders: ["fn_name"]` — full Python power, no DSL. For side effects we kept the YAML `condition:` form. The reasons are different:
+For tasks, we rejected YAML conditions in favor of `task_builders: ["fn_name"]` — full Python power, no DSL. For side effects we kept a gating mechanism. The reasons are different:
 
 - **Tasks can be built programmatically.** A `task_builder` function decides whether to schedule and the return list can be empty. The task entity either exists or it doesn't — there's no "task activity ran and did nothing" residue in PROV.
-- **Side effects cannot.** A handler cannot decide "don't run this activity at all" — the activity row is created before the handler is invoked. Only the YAML `condition:` can actually prevent the activity.
+- **Side effects cannot.** A handler cannot decide "don't run this activity at all" — the activity row is created before the handler is invoked. Only a YAML-declared gate can actually prevent the activity from leaving a PROV trace.
 
-So the YAML `condition:` is the *only* way to express "this side effect shouldn't apply here" without leaving a PROV residue. Removing it would force authors to either fire side effects unconditionally (wrong) or write empty-handler side effects (audit noise).
-
-The `{entity_type, field, value}` surface is intentionally narrow. If a future case needs richer conditions (counts, comparisons, config lookups), the right extension is a `condition_fn:` escape hatch that names a Python function returning `bool` — matching the pattern already used for status and tasks. Don't grow the condition shape itself with `value_in`, `value_not`, boolean combinators and so on; that's the DSL-creep path we rejected for tasks.
+So the condition mechanism is the *only* way to express "this side effect shouldn't apply here" without leaving a PROV residue. The dict form handles the common case; `condition_fn:` covers everything else without inviting a DSL.
 
 ### Reference data — static lists for the frontend
 
