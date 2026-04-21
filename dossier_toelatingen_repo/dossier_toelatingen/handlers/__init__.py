@@ -18,6 +18,75 @@ from dossier_toelatingen.entities import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Access-view constants
+# ---------------------------------------------------------------------------
+# The set of entity types each role can see. Before this lived inline at
+# six separate ``access_entries.append(...)`` call sites — any new entity
+# type had to be added in six places, and a miss would silently hide the
+# type from a role. Extracting the shared lists gives one source of truth.
+#
+# When adding a new entity type to the platform, update here:
+#   * everyone sees ``external`` + their own document types → _AANVRAGER_VIEW
+#   * staff roles see the full platform surface            → _BEHANDELAAR_VIEW
+#   * beheerder additionally sees access entities themselves → _BEHEERDER_VIEW
+#
+# These are plain list literals rather than tuples — the access check
+# membership-tests them, and the content field of an ``oe:dossier_access``
+# entity is JSON-serialized for storage, which keeps lists and rejects
+# tuples.
+
+_AANVRAGER_VIEW = [
+    "oe:aanvraag",
+    "oe:beslissing",
+    "oe:handtekening",
+    "external",
+]
+
+_BEHANDELAAR_VIEW = [
+    "oe:aanvraag",
+    "oe:beslissing",
+    "oe:handtekening",
+    "external",
+    "oe:verantwoordelijke_organisatie",
+    "oe:behandelaar",
+    "oe:system_fields",
+    "system:task",
+]
+
+_BEHEERDER_VIEW = _BEHANDELAAR_VIEW + ["oe:dossier_access"]
+
+
+# ---------------------------------------------------------------------------
+# Role-name minting helpers
+# ---------------------------------------------------------------------------
+# Role strings were hardcoded f-strings at every production site. Extracting
+# them here gives a single place to rename the prefix if the identity model
+# changes, and a single place to grep for "where do kbo roles come from."
+# Consumers match against these strings in ``workflow.yaml`` (role: "...")
+# and in ``routes/access.py``; the set of prefixes here is the full
+# vocabulary of dossier-level role names.
+
+def _kbo_role(kbo: str) -> str:
+    """Role for a natural person acting on behalf of an enterprise."""
+    return f"kbo-toevoeger:{kbo}"
+
+
+def _rrn_role(rrn: str) -> str:
+    """Role for a natural person acting on their own behalf.
+
+    Currently the rrn itself is the role string (no prefix). Kept behind a
+    helper anyway so that if we need to add one — e.g. to namespace against
+    other citizen-identity schemes — it's a single-line change here, not a
+    hunt through the workflow yaml for every bare rrn."""
+    return rrn
+
+
+def _gemeente_role(uri: str) -> str:
+    """Role for a staff member of the responsible municipality."""
+    return f"gemeente-toevoeger:{uri}"
+
+
 async def set_dossier_access(context: ActivityContext, content: dict | None) -> HandlerResult:
     """
     Determines who can see this dossier based on the current state.
@@ -30,14 +99,14 @@ async def set_dossier_access(context: ActivityContext, content: dict | None) -> 
     if aanvraag:
         if aanvraag.aanvrager.kbo:
             access_entries.append({
-                "role": f"kbo-toevoeger:{aanvraag.aanvrager.kbo}",
-                "view": ["oe:aanvraag", "oe:beslissing", "oe:handtekening", "external", "external"],
+                "role": _kbo_role(aanvraag.aanvrager.kbo),
+                "view": _AANVRAGER_VIEW,
                 "activity_view": "own",
             })
         if aanvraag.aanvrager.rrn:
             access_entries.append({
-                "role": aanvraag.aanvrager.rrn,
-                "view": ["oe:aanvraag", "oe:beslissing", "oe:handtekening", "external", "external"],
+                "role": _rrn_role(aanvraag.aanvrager.rrn),
+                "view": _AANVRAGER_VIEW,
                 "activity_view": "own",
             })
 
@@ -45,20 +114,28 @@ async def set_dossier_access(context: ActivityContext, content: dict | None) -> 
     verantw: VerantwoordelijkeOrganisatie | None = await context.get_singleton_typed("oe:verantwoordelijke_organisatie")
     if verantw:
         access_entries.append({
-            "role": f"gemeente-toevoeger:{verantw.uri}",
-            "view": ["oe:aanvraag", "oe:beslissing", "oe:handtekening", "external",
-                      "oe:verantwoordelijke_organisatie", "oe:behandelaar",
-                      "oe:system_fields", "system:task"],
+            "role": _gemeente_role(verantw.uri),
+            "view": _BEHANDELAAR_VIEW,
             "activity_view": "all",
         })
 
-    # Behandelaar gets access — oe:behandelaar is cardinality=multiple, so
-    # we iterate all behandelaar entities currently on the dossier and grant
-    # each one its own access entry. Previously this singleton-looked-up
-    # the "latest" one which was incorrect for multi-cardinality types.
-    # Dedupe by URI so repeated handler invocations that each create a new
-    # behandelaar entity (phase 3 will formalize revisions) don't cause
-    # duplicate access entries.
+    # Behandelaar access is granted on two axes:
+    #
+    # 1. **Per-behandelaar URI** — each ``oe:behandelaar`` entity's URI is
+    #    itself a role. A user whose ``user.roles`` contains that URI can
+    #    see the dossier. This supports identity-scoped access: a specific
+    #    behandelaar can be granted access without giving the whole staff
+    #    pool the ``behandelaar`` role.
+    # 2. **Bare ``"behandelaar"``** — the global staff role. Users with the
+    #    generic ``behandelaar`` entry in their roles see every dossier
+    #    that has at least one behandelaar assigned.
+    #
+    # These are independent populations of users and the two kinds of
+    # access rules coexist. ``oe:behandelaar`` is cardinality=multiple, so
+    # we iterate all currently-attached behandelaars and emit one entry
+    # per URI. Dedup by URI because repeated handler invocations (e.g.
+    # the same behandelaar re-attached via a later activity) shouldn't
+    # produce multiple identical access entries.
     behandelaars = await context.get_entities_latest("oe:behandelaar")
     seen_uris: set[str] = set()
     for behandelaar_row in behandelaars:
@@ -67,31 +144,23 @@ async def set_dossier_access(context: ActivityContext, content: dict | None) -> 
             continue
         seen_uris.add(uri)
         access_entries.append({
-            "role": f"behandelaar:{uri}",
-            "view": ["oe:aanvraag", "oe:beslissing", "oe:handtekening", "external",
-                      "oe:verantwoordelijke_organisatie", "oe:behandelaar",
-                      "oe:system_fields", "system:task"],
+            "role": uri,
+            "view": _BEHANDELAAR_VIEW,
             "activity_view": "all",
         })
 
-    # Back-compat: also emit a generic "behandelaar" role so access rules
-    # that match by bare role-name (not by behandelaar URI) keep working.
-    # Remove once all downstream consumers match by URI.
     if behandelaars:
         access_entries.append({
             "role": "behandelaar",
-            "view": ["oe:aanvraag", "oe:beslissing", "oe:handtekening", "external",
-                      "oe:verantwoordelijke_organisatie", "oe:behandelaar",
-                      "oe:system_fields", "system:task"],
+            "view": _BEHANDELAAR_VIEW,
             "activity_view": "all",
         })
 
-    # Beheerder gets everything
+    # Beheerder gets everything, including the access entity itself — only
+    # beheerders can see who has access to what.
     access_entries.append({
         "role": "beheerder",
-        "view": ["oe:aanvraag", "oe:beslissing", "oe:handtekening", "external",
-                  "oe:verantwoordelijke_organisatie", "oe:behandelaar",
-                  "oe:system_fields", "oe:dossier_access", "system:task"],
+        "view": _BEHEERDER_VIEW,
         "activity_view": "all",
     })
 

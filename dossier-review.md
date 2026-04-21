@@ -13,7 +13,7 @@
 | ✅ Fixed & verified | 14 | Bugs 1, 2, 15, 16, 17, 32, 44, 47, 64, 65, 68, 72 (coverage), 73, 74, 75 |
 | 🔍 Investigated, not a bug | 1 | Bug 14 — cross-dossier refs are `type=external` rows |
 | 🛑 Deferred / accepted | 4 | Bug 31 (RRN acceptable), Bug 45 (MinIO migration), Bug 63 (403 is correct HTTP), Bug 71 (test activities, deploy-time removal) |
-| 🧪 Test suite | **724/724** passing | engine 687, file_service 19, common/signing 18 |
+| 🧪 Test suite | **740/740** passing | engine 687, toelatingen 16, file_service 19, common/signing 18 |
 | 🏃 `test_requests.sh` | **25/25 OK, exit 0, zero deadlocks, zero worker crashes** | D1–D9 green |
 | ✂️ Duplication closed | **D1, D2, D4, D22, D25** | Graph-loader consolidation + audit-emit wrapper |
 | 🧰 Harnesses installed | **3** | Guidebook YAML lint + phase-docstring lint + CI shell-spec wrapper |
@@ -206,16 +206,25 @@ Verified: workflow YAML parses cleanly (four jobs, all steps listed); the migrat
 
 D4 and D22 both closed — they turned out to be the same pattern (audit emission boilerplate) under two review entries.
 
+### Round 11 — `set_dossier_access` refactor (Obs-1, Obs-2, Obs-5 closed)
+- **Three view-list constants** extracted in `dossier_toelatingen_repo/dossier_toelatingen/handlers/__init__.py`: `_AANVRAGER_VIEW`, `_BEHANDELAAR_VIEW`, `_BEHEERDER_VIEW`. Before the refactor these were inline at six `access_entries.append(...)` call sites — adding a new entity type meant six edits, and a miss silently hid the type from a role.
+- **Three role-minting helpers** extracted: `_kbo_role`, `_rrn_role`, `_gemeente_role`. Encapsulates the role-string vocabulary; rename a prefix in one place rather than grepping across a file.
+- **Bug fixed: duplicate `"external"` in aanvrager view** (kbo + rrn entries each had `"external"` twice). Inert today because access check does membership testing, but confusing — now fixed as a side effect of the constant extraction.
+- **Behandelaar access restructured** on two axes: per-URI entries (each `oe:behandelaar`'s `uri` is itself a role on the access list for identity-scoped access) + one bare `"behandelaar"` entry for the global staff role. Dedup-by-URI preserved. The dual population is documented in a block comment at the call site so future readers don't have to reconstruct why both kinds of entries coexist.
+- **Handler body shrunk from 76 lines to 58** with no view-list repetition anywhere.
+- **Obs-3 (write-on-change) deliberately not done** — product decision to keep the full provenance graph means every activity run still produces a new `oe:dossier_access` version. The Observation stays open in the review as a possible future optimization if prov-graph churn ever becomes a problem.
+
+- **16 new unit tests** in a brand-new `dossier_toelatingen_repo/tests/unit/test_set_dossier_access.py` — the `dossier_toelatingen_repo` had no tests directory before this round. Also added a minimal `[tool.pytest.ini_options]` with `asyncio_mode = "auto"` so the suite runs under the same convention as the engine. Tests use a lightweight `_FakeContext` that provides only the three methods the handler actually calls (`get_typed`, `get_singleton_typed`, `get_entities_latest`), no DB. Coverage: beheerder always present, aanvrager kbo+rrn variants, duplicate-`external` bug regression, verantwoordelijke organisatie, behandelaar empty/single/multiple/duplicate-URI/missing-URI cases, full-dossier end-to-end, view-constant invariants (aanvrager ⊆ behandelaar ⊆ beheerder).
+
 ### Verification performed
-- **Test suite:** **724/724** (engine 687, signing 18, file_service 19). Grew by 51 tests across the engagement.
-- **Shell spec via harness 2:** `bash scripts/ci_run_shell_spec.sh` → 25 OK assertions, 5 summary-pass lines, exit 0, zero tracebacks, zero worker crashes, full audit emission through the wrapper verified end-to-end.
+- **Test suite:** **740/740** (engine 687, toelatingen 16, signing 18, file_service 19). Grew by 67 tests across the engagement.
+- **Shell spec via harness 2:** `bash scripts/ci_run_shell_spec.sh` → 25 OK assertions, 5 summary-pass lines, exit 0, zero tracebacks, zero worker crashes. D1–D9 green after the handler refactor, including the `wijsVerantwoordelijkeOrganisatieAan` side-effect path that calls `set_dossier_access`.
 - **Harness 1, 2, 3** all green, all have synthetic-drift tests confirming they catch the bug shape they claim to catch.
-- **CI workflow** authored and statically validated; will run on the first commit pushed to GitHub.
+- **CI workflow** authored, statically validated, and [dev]-extras fix applied so pytest-asyncio + httpx install in CI.
 
 ### Where to go next (in priority order)
 
-1. **Observations cluster around `set_dossier_access`** — 6 copies of the behandelaar/beheerder view list, no write-on-change optimization. Extract the view list into a constant, make the handler compare-before-write. Reduces DB churn and closes Duplication D9 in one pass. One day.
-2. **Bug 70** — dead `/prov/graph` URL in `test_requests.sh`. Would have been caught by the harness-2 CI job on its first run, but since no CI-provoked failure has happened yet, still sits open. One-line fix.
-3. **Meta M2 — "silent skip" review.** Survey all `logger.error` + `pass` patterns (unregistered validators, audit emission failures, bijlage move per-file failures, etc.), decide case-by-case which should propagate vs swallow. Mostly a design discussion with targeted fixes at the end.
+1. **Bug 70** — dead `/prov/graph` URL in `test_requests.sh`. Would have been caught by the harness-2 CI job on its first run, but since no CI-provoked failure has happened yet, still sits open. One-line fix.
+2. **Meta M2 — "silent skip" review.** Survey all `logger.error` + `pass` patterns (unregistered validators, audit emission failures, bijlage move per-file failures, etc.), decide case-by-case which should propagate vs swallow. Mostly a design discussion with targeted fixes at the end.
+3. **`set_dossier_access` Obs-3 follow-up (optional)** — write-on-change optimization, if prov-graph churn ever becomes a problem. Needs a new `skip_write` contract on `HandlerResult` and engine-pipeline support. One day if/when wanted.
 4. **Bug 63 follow-up (optional)** — SIEM alert rule on high-frequency `dossier.denied` from a single actor. Makes enumeration observable in the security stream rather than architecturally impossible. Small scope, defence-in-depth.
-5. **Duplication D9** — may already be partly closed by the `set_dossier_access` refactor above; reassess after item 1.

@@ -31,3 +31,7 @@ include = ["dossier_toelatingen*"]
 # be included as package data.
 [tool.setuptools.package-data]
 dossier_toelatingen = ["*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
