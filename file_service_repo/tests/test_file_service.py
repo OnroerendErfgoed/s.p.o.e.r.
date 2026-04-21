@@ -63,13 +63,24 @@ async def file_client(tmp_path):
         fs_module.get_config = original_get_config
 
 
-def _sign(file_id: str, action: str = "upload", user_id: str = "u1"):
-    """Produce a signed token dict for the given file_id + action."""
+def _sign(
+    file_id: str,
+    action: str = "upload",
+    user_id: str = "u1",
+    dossier_id: str = "",
+):
+    """Produce a signed token dict for the given file_id + action.
+
+    ``dossier_id`` defaults to empty (back-compat with tests written
+    before the dossier-binding check). Tests that exercise the
+    binding-check itself pass an explicit value.
+    """
     return sign_token(
         file_id=file_id,
         action=action,
         signing_key=SIGNING_KEY,
         user_id=user_id,
+        dossier_id=dossier_id,
     )
 
 
@@ -79,9 +90,18 @@ def _qs(token: dict) -> dict:
     return dict(pair.split("=", 1) for pair in qs.split("&"))
 
 
-async def _upload(client, file_id: str, content: bytes = b"test data"):
-    """Upload a file with a valid signature. Returns the response."""
-    token = _sign(file_id, "upload")
+async def _upload(
+    client, file_id: str,
+    content: bytes = b"test data",
+    dossier_id: str = "",
+):
+    """Upload a file with a valid signature. Returns the response.
+
+    ``dossier_id`` defaults to empty; tests that need the binding
+    stamped into the .meta file pass an explicit value (which also
+    gets signed into the upload token).
+    """
+    token = _sign(file_id, "upload", dossier_id=dossier_id)
     params = _qs(token)
     return await client.put(
         f"/upload/{file_id}",
@@ -396,101 +416,81 @@ class TestDownloadNoLongerFallsBackToTemp:
         assert r.content == b"downloadable after move"
 
 
-class TestMoveRejectsCrossUserAttach:
+class TestMoveEnforcesDossierBinding:
+    """The /internal/move endpoint enforces the dossier-binding
+    invariant: a file uploaded for dossier X can only be moved
+    into dossier X. The binding is established at upload time
+    (the engine's /files/upload/request requires dossier_id, signs
+    it into the token, and the upload handler writes it as
+    intended_dossier_id in the temp .meta). If the move target
+    doesn't match, the file_service returns 403 before bytes cross
+    dossier boundaries.
 
-    async def test_move_rejects_when_expected_uploader_mismatches(
-        self, file_client,
-    ):
-        """Alice uploads. Worker calls /internal/move with
-        expected_uploader_user_id=bob (simulating Bob's activity
-        trying to attach Alice's file). The file_service reads the
-        temp meta, sees uploaded_by=alice, rejects with 403.
+    This closes Bug 47 (cross-tenant graft via file_id reuse) at
+    the layer where the truth lives — no inline SQL in task code,
+    no separate uploader-identity tracking, no cross-service
+    compare of user identities. The binding is intrinsic to the
+    file."""
 
-        This is the core cross-user attach defense."""
+    async def test_move_rejects_when_dossier_mismatches(self, file_client):
+        """Alice uploads with dossier_id=D1 in the signed token.
+        The file_service writes intended_dossier_id=D1 into the
+        .meta. A move request targeting dossier_id=D2 triggers the
+        mismatch check → 403. This is the core attack path Bug 47
+        enabled; the fix prevents any bytes from crossing the
+        dossier boundary."""
         fid = str(uuid4())
-        did = str(uuid4())
-        # Sign the upload token as alice — that's what the file
-        # service stores as uploaded_by in the .meta file.
-        from dossier_common.signing import sign_token, token_to_query_string
-        import io
-        alice_token = sign_token(
-            file_id=fid, action="upload",
-            signing_key=SIGNING_KEY, user_id="alice",
-        )
-        alice_params = dict(
-            pair.split("=", 1)
-            for pair in token_to_query_string(alice_token).split("&")
-        )
-        await file_client.put(
-            f"/upload/{fid}",
-            params=alice_params,
-            files={"file": ("a.txt", io.BytesIO(b"alice's bytes"), "text/plain")},
-        )
+        d1 = str(uuid4())
+        d2 = str(uuid4())
 
-        # Worker attempts the move on behalf of Bob.
+        # Alice uploads bound to D1.
+        r_up = await _upload(file_client, fid, b"alice's bytes", dossier_id=d1)
+        assert r_up.status_code == 200
+
+        # Something (Bob's activity, via the worker) attempts to
+        # move into D2. The dossier binding says no.
         r = await file_client.post(
             "/internal/move",
-            params={
-                "file_id": fid,
-                "dossier_id": did,
-                "expected_uploader_user_id": "bob",
-            },
+            params={"file_id": fid, "dossier_id": d2},
         )
         assert r.status_code == 403
         body = r.json()
-        assert "uploader mismatch" in body["detail"].lower()
-        assert "alice" in body["detail"]
-        assert "bob" in body["detail"]
+        assert "dossier mismatch" in body["detail"].lower()
+        assert d1 in body["detail"]
+        assert d2 in body["detail"]
 
-    async def test_move_succeeds_when_expected_uploader_matches(
-        self, file_client,
-    ):
-        """Alice uploads, worker moves with
-        expected_uploader_user_id=alice → 200. Confirms the check
-        doesn't reject the legitimate same-user path."""
+    async def test_move_succeeds_when_dossier_matches(self, file_client):
+        """Alice uploads bound to D1 and moves into D1 → 200.
+        Same-dossier is the legitimate path and must keep working."""
         fid = str(uuid4())
-        did = str(uuid4())
-        from dossier_common.signing import sign_token, token_to_query_string
-        import io
-        alice_token = sign_token(
-            file_id=fid, action="upload",
-            signing_key=SIGNING_KEY, user_id="alice",
-        )
-        alice_params = dict(
-            pair.split("=", 1)
-            for pair in token_to_query_string(alice_token).split("&")
-        )
-        await file_client.put(
-            f"/upload/{fid}",
-            params=alice_params,
-            files={"file": ("a.txt", io.BytesIO(b"alice's bytes"), "text/plain")},
-        )
+        d1 = str(uuid4())
+
+        r_up = await _upload(file_client, fid, b"alice's bytes", dossier_id=d1)
+        assert r_up.status_code == 200
 
         r = await file_client.post(
             "/internal/move",
-            params={
-                "file_id": fid,
-                "dossier_id": did,
-                "expected_uploader_user_id": "alice",
-            },
+            params={"file_id": fid, "dossier_id": d1},
         )
         assert r.status_code == 200
         assert r.json()["moved"] is True
 
-    async def test_move_allows_missing_expected_uploader_for_backcompat(
+    async def test_move_allows_when_intended_dossier_not_set(
         self, file_client,
     ):
-        """When expected_uploader_user_id is omitted (empty string),
-        the check is skipped — preserves back-compat for any caller
-        that hasn't been updated to pass it yet. The toelatingen
-        worker DOES pass it; this path exists so a future caller
-        that genuinely doesn't know the user (e.g. an admin
-        bulk-move tool) isn't broken."""
+        """Back-compat path: if the temp .meta lacks
+        intended_dossier_id (empty string, legacy upload predating
+        the binding), the check is skipped. This door closes
+        naturally as old temp files drain — new uploads through
+        the engine always carry the binding because
+        /files/upload/request requires dossier_id and signs it in."""
         fid = str(uuid4())
         did = str(uuid4())
-        await _upload(file_client, fid, b"data")  # uploaded_by = u1 (the default)
+        # Upload without a dossier_id in the token → intended is empty.
+        r_up = await _upload(file_client, fid, b"legacy upload")
+        assert r_up.status_code == 200
 
-        # No expected_uploader_user_id passed.
+        # Move succeeds regardless of dossier choice.
         r = await file_client.post(
             "/internal/move",
             params={"file_id": fid, "dossier_id": did},
@@ -499,11 +499,10 @@ class TestMoveRejectsCrossUserAttach:
 
     async def test_move_allows_when_meta_missing(self, file_client, tmp_path):
         """A file in temp with no .meta file (legacy data, manual
-        placement, edge case) skips the uploader check rather than
-        erroring. The check is opportunistic: if we can't determine
-        the uploader, we fall back to the old permissive behavior
-        rather than blocking a legitimate operation."""
-        # Put a file directly in temp with no .meta companion.
+        placement, edge case) skips the binding check rather than
+        erroring. Opportunistic: if we can't determine the
+        intended dossier, fall back to permissive rather than
+        blocking a legitimate operation."""
         fid = str(uuid4())
         did = str(uuid4())
         temp_dir = tmp_path / "storage" / "temp"
@@ -512,10 +511,20 @@ class TestMoveRejectsCrossUserAttach:
 
         r = await file_client.post(
             "/internal/move",
-            params={
-                "file_id": fid,
-                "dossier_id": did,
-                "expected_uploader_user_id": "anybody",
-            },
+            params={"file_id": fid, "dossier_id": did},
         )
         assert r.status_code == 200
+
+    async def test_meta_records_intended_dossier_id(self, file_client, tmp_path):
+        """Verify the upload-time write of intended_dossier_id
+        into .meta — this is the invariant that makes the move
+        check possible. Direct disk inspection, since the field
+        is internal and not exposed on any read endpoint."""
+        fid = str(uuid4())
+        did = str(uuid4())
+        await _upload(file_client, fid, b"x", dossier_id=did)
+
+        meta_path = tmp_path / "storage" / "temp" / f"{fid}.meta"
+        assert meta_path.exists()
+        meta = json.loads(meta_path.read_text())
+        assert meta.get("intended_dossier_id") == did

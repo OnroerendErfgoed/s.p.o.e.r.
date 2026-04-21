@@ -132,13 +132,20 @@ async def upload_file(
         content = await file.read()
         f.write(content)
 
-    # Store metadata
+    # Store metadata. `intended_dossier_id` carries the dossier this
+    # upload was signed for — the /internal/move endpoint compares
+    # that binding against the move's target dossier and 403s on
+    # mismatch. This is what prevents Bob from grafting Alice's
+    # file_id onto his own dossier (Bug 47): Alice's .meta says
+    # d=D1, Bob's activity would schedule a move to d=D2, mismatch
+    # rejected before any bytes cross dossier boundaries.
     meta_path = temp_dir / f"{file_id}.meta"
     meta = {
         "filename": file.filename or file_id,
         "content_type": file.content_type or "application/octet-stream",
         "size": len(content),
         "uploaded_by": user_id,
+        "intended_dossier_id": dossier_id,
     }
     with open(meta_path, "w") as f:
         json.dump(meta, f)
@@ -219,23 +226,17 @@ async def download_file(
 async def move_file(
     file_id: str = Query(...),
     dossier_id: str = Query(...),
-    expected_uploader_user_id: str = Query(
-        "",
-        description=(
-            "If set, the move is rejected with 403 unless the file's "
-            "temp metadata reports this user as the uploader. Closes "
-            "the cross-tenant attach variant of Bug 47: without this "
-            "check, Bob could reference Alice's in-flight file_id in "
-            "his own activity and have the worker (running as "
-            "systeemgebruiker) obediently copy Alice's bytes into "
-            "Bob's dossier. Worker passes the scheduling activity's "
-            "attributing agent here. Empty = skip the check for "
-            "back-compat paths that don't know the user yet."
-        ),
-    ),
 ):
     """Move file from temp to permanent dossier location.
     Internal endpoint — should only be accessible from the worker on the internal network.
+
+    Enforces the dossier-binding invariant: a file uploaded for
+    dossier X can only be moved into dossier X. The binding is
+    established at upload time — the engine's /files/upload/request
+    endpoint requires ``dossier_id``, signs it into the token, and
+    the upload handler records it as ``intended_dossier_id`` in the
+    .meta file. If the move target disagrees, the bytes never
+    cross dossier boundaries (Bug 47).
     """
     root = get_storage_root()
     temp_path = root / "temp" / file_id
@@ -248,27 +249,30 @@ async def move_file(
             return {"moved": True, "already_permanent": True}
         raise HTTPException(404, detail="File not found in temp or permanent storage")
 
-    # Uploader consistency check. Reads the temp .meta (written at
-    # upload time) and compares its `uploaded_by` against the
-    # expected uploader. Catches the attach-someone-else's-upload
-    # attack at the point it would otherwise succeed — before any
-    # bytes move across dossier boundaries.
-    if expected_uploader_user_id and temp_meta.exists():
+    # Dossier-binding check. Compare the dossier the file was
+    # uploaded for against the dossier being moved into. Mismatch
+    # is an attempted cross-dossier graft — reject.
+    #
+    # Opportunistic-skip only when .meta is missing or lacks the
+    # intended_dossier_id field (legacy rows pre-dating this check).
+    # Any new upload written through the current upload handler
+    # always carries the field, so this back-compat door closes
+    # naturally as old temp files drain.
+    if temp_meta.exists():
         try:
             with open(temp_meta) as f:
                 meta = json.load(f)
         except (OSError, json.JSONDecodeError):
             meta = {}
-        actual_uploader = meta.get("uploaded_by", "")
-        if actual_uploader and actual_uploader != expected_uploader_user_id:
+        intended = meta.get("intended_dossier_id", "")
+        if intended and intended != dossier_id:
             raise HTTPException(
                 403,
                 detail=(
-                    f"Uploader mismatch: file {file_id} was uploaded by "
-                    f"'{actual_uploader}', but the activity attempting "
-                    f"to attach it is attributed to "
-                    f"'{expected_uploader_user_id}'. Cross-user attach "
-                    f"is not permitted."
+                    f"Dossier mismatch: file {file_id} was uploaded for "
+                    f"dossier '{intended}' but the move targets "
+                    f"'{dossier_id}'. A file is bound to one dossier at "
+                    f"upload time and cannot be grafted onto another."
                 ),
             )
 

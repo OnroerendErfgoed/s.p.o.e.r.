@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 
 from dossier_common.signing import sign_token, token_to_query_string
 
@@ -51,12 +51,40 @@ def register(app: FastAPI, *, get_user) -> None:
     ):
         """Request a signed URL for file upload. User must be
         authenticated. Returns a `file_id` and `upload_url` for the
-        client to POST the file bytes to."""
+        client to POST the file bytes to.
+
+        The caller must supply ``dossier_id`` — the dossier the file
+        is destined for. Because every client flow (including
+        dossier-creating activities like ``dienAanvraagIn``) mints
+        its dossier_id client-side before uploading attachments,
+        this value is always known at token-request time.
+
+        Binding ``dossier_id`` into the signed token, and threading
+        it through the file_service's upload .meta, closes Bug 47:
+        the file_service's ``/internal/move`` endpoint refuses to
+        move a file into any dossier other than the one its upload
+        was intended for. An attacker who learns another user's
+        file_id cannot graft it onto their own dossier, because the
+        move would cross the binding and be rejected.
+        """
         file_config = app.state.config.get("file_service", {})
         signing_key = file_config.get(
             "signing_key", "poc-signing-key-change-in-production",
         )
         file_service_url = file_config.get("url", "http://localhost:8001")
+
+        dossier_id = request_body.get("dossier_id", "")
+        if not dossier_id:
+            raise HTTPException(
+                422,
+                detail=(
+                    "dossier_id is required. Supply the UUID of the "
+                    "dossier this file will be attached to. For "
+                    "dossier-creating activities (e.g. dienAanvraagIn), "
+                    "use the client-generated dossier_id you will "
+                    "PUT the activity against."
+                ),
+            )
 
         file_id = str(uuid4())
         token = sign_token(
@@ -64,6 +92,7 @@ def register(app: FastAPI, *, get_user) -> None:
             action="upload",
             signing_key=signing_key,
             user_id=user.id,
+            dossier_id=dossier_id,
         )
         upload_url = (
             f"{file_service_url}/upload/{file_id}"
@@ -74,4 +103,5 @@ def register(app: FastAPI, *, get_user) -> None:
             "file_id": file_id,
             "upload_url": upload_url,
             "filename": request_body.get("filename", ""),
+            "dossier_id": dossier_id,
         }

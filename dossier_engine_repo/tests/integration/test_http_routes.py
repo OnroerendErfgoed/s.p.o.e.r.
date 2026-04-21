@@ -477,9 +477,10 @@ class TestFileUploadRequest:
 
     async def test_returns_signed_upload_url(self, client, repo):
         await _commit(repo)
+        did = str(uuid4())
         r = await client.post(
             "/files/upload/request",
-            json={"filename": "test.pdf"},
+            json={"filename": "test.pdf", "dossier_id": did},
             headers={"X-POC-User": "alice"},
         )
         assert r.status_code == 200
@@ -487,16 +488,39 @@ class TestFileUploadRequest:
         assert "file_id" in body
         assert "upload_url" in body
         assert body["filename"] == "test.pdf"
+        assert body["dossier_id"] == did
         assert body["file_id"] in body["upload_url"]
         # The signature query-string key is `signature=`, not `sig=`.
         assert "signature=" in body["upload_url"]
         assert "http://test.local:8001" in body["upload_url"]
+        # dossier_id is signed into the token; verify it appears in
+        # the upload_url's query string so the file_service can
+        # verify the signature and stamp intended_dossier_id into
+        # the .meta file.
+        assert f"dossier_id={did}" in body["upload_url"]
 
-    async def test_missing_filename_still_works(self, client, repo):
+    async def test_missing_dossier_id_returns_422(self, client, repo):
+        """Previously this was 'missing filename is fine'. Since
+        the Bug 47 fix, dossier_id is required — the binding
+        between upload and dossier is established at token mint
+        time. Missing dossier_id → 422 with a clear message."""
         await _commit(repo)
         r = await client.post(
             "/files/upload/request",
-            json={},
+            json={"filename": "test.pdf"},
+            headers={"X-POC-User": "alice"},
+        )
+        assert r.status_code == 422
+        assert "dossier_id is required" in r.json()["detail"]
+
+    async def test_filename_still_optional(self, client, repo):
+        """Filename is still optional — only dossier_id is required
+        for the token to be mintable."""
+        await _commit(repo)
+        did = str(uuid4())
+        r = await client.post(
+            "/files/upload/request",
+            json={"dossier_id": did},
             headers={"X-POC-User": "alice"},
         )
         assert r.status_code == 200
@@ -508,6 +532,6 @@ class TestFileUploadRequest:
         await _commit(repo)
         r = await client.post(
             "/files/upload/request",
-            json={"filename": "x"},
+            json={"filename": "x", "dossier_id": str(uuid4())},
         )
         assert r.status_code == 401

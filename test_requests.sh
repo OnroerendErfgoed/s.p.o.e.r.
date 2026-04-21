@@ -9,11 +9,18 @@ BASE_URL="http://localhost:8000"
 # ----------------------------------------------------------------------------
 # File upload helper
 # ----------------------------------------------------------------------------
-# Usage: FID=$(upload_file <user> <local_filename> <display_filename>)
+# Usage: FID=$(upload_file <user> <local_filename> <display_filename> <dossier_id>)
 #
 # Calls POST /files/upload/request to get a signed upload URL, then PUTs a
 # small synthetic payload to the File Service. Echoes the resulting file_id
 # (and only the file_id) on stdout so it can be captured.
+#
+# Since the Bug 47 fix, dossier_id is required at token-mint time — the
+# engine signs it into the upload token and the file_service writes it as
+# intended_dossier_id into the temp .meta. At move time the file_service
+# rejects any attempt to move the file into a different dossier. Every
+# caller in this script knows the dossier_id because they've already
+# decided on one (this is the client-generates-UUIDs model).
 #
 # Errors are written to stderr; on failure the function returns the empty
 # string and the caller's curl will produce a 422 from the engine.
@@ -21,12 +28,18 @@ upload_file() {
   local user="$1"
   local content="$2"
   local filename="$3"
+  local dossier_id="$4"
+
+  if [ -z "$dossier_id" ]; then
+    echo "upload_file: dossier_id (4th arg) is required" >&2
+    return 1
+  fi
 
   local resp
   resp=$(curl -s -X POST "$BASE_URL/files/upload/request" \
     -H "Content-Type: application/json" \
     -H "X-POC-User: $user" \
-    -d "{\"filename\": \"$filename\"}")
+    -d "{\"filename\": \"$filename\", \"dossier_id\": \"$dossier_id\"}")
 
   local file_id upload_url
   file_id=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['file_id'])" 2>/dev/null)
@@ -56,7 +69,7 @@ echo "============================================"
 echo ""
 
 echo "--- D1 Step 1: dienAanvraagIn (with bijlage) ---"
-D1_BIJLAGE_FID=$(upload_file "jan.aanvrager" "Detailplan voor de gevelrestauratie." "detailplan.pdf")
+D1_BIJLAGE_FID=$(upload_file "jan.aanvrager" "Detailplan voor de gevelrestauratie." "detailplan.pdf" "d1000000-0000-0000-0000-000000000001")
 echo "  uploaded bijlage file_id=$D1_BIJLAGE_FID"
 curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d1000000-0000-0000-0000-000000000001/activities/a1000000-0000-0000-0000-000000000001/oe:dienAanvraagIn" \
   -H "Content-Type: application/json" \
@@ -105,7 +118,7 @@ print('  OK: file_download_url was injected on Bijlage.file_id')
 echo ""
 
 echo "--- D1 Step 2: neemBeslissing (onvolledig, direct) ---"
-D1_BRIEF1_FID=$(upload_file "marie.brugge" "Beslissingsbrief: aanvraag onvolledig." "d1-brief-001.pdf")
+D1_BRIEF1_FID=$(upload_file "marie.brugge" "Beslissingsbrief: aanvraag onvolledig." "d1-brief-001.pdf" "d1000000-0000-0000-0000-000000000001")
 curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d1000000-0000-0000-0000-000000000001/activities/a1000000-0000-0000-0000-000000000002/oe:neemBeslissing" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
@@ -180,7 +193,7 @@ curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d1000000-0000-0000-0000-000000000
 echo ""
 
 echo "--- D1 Step 4: neemBeslissing (goedgekeurd, direct) ---"
-D1_BRIEF2_FID=$(upload_file "marie.brugge" "Beslissingsbrief: aanvraag goedgekeurd." "d1-brief-002.pdf")
+D1_BRIEF2_FID=$(upload_file "marie.brugge" "Beslissingsbrief: aanvraag goedgekeurd." "d1-brief-002.pdf" "d1000000-0000-0000-0000-000000000001")
 curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d1000000-0000-0000-0000-000000000001/activities/a1000000-0000-0000-0000-000000000005/oe:neemBeslissing" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
@@ -250,7 +263,7 @@ curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d2000000-0000-0000-0000-000000000
 echo ""
 
 echo "--- D2 Step 2: doeVoorstelBeslissing — onvolledig (benjamma) ---"
-D2_BRIEF1_FID=$(upload_file "benjamma" "Beslissingsbrief D2: voorstel onvolledig." "d2-brief-001.pdf")
+D2_BRIEF1_FID=$(upload_file "benjamma" "Beslissingsbrief D2: voorstel onvolledig." "d2-brief-001.pdf" "d2000000-0000-0000-0000-000000000001")
 curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000002/oe:doeVoorstelBeslissing" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: benjamma" \
@@ -343,7 +356,7 @@ curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d2000000-0000-0000-0000-000000000
 echo ""
 
 echo "--- D2 Step 6: doeVoorstelBeslissing — goedgekeurd (benjamma) ---"
-D2_BRIEF2_FID=$(upload_file "benjamma" "Beslissingsbrief D2: voorstel goedgekeurd." "d2-brief-002.pdf")
+D2_BRIEF2_FID=$(upload_file "benjamma" "Beslissingsbrief D2: voorstel goedgekeurd." "d2-brief-002.pdf" "d2000000-0000-0000-0000-000000000001")
 curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000006/oe:doeVoorstelBeslissing" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: benjamma" \
@@ -390,7 +403,7 @@ curl -s "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001" \
 echo ""
 
 echo "--- D2 Step 8: doeVoorstelBeslissing — goedgekeurd second attempt (benjamma) ---"
-D2_BRIEF3_FID=$(upload_file "benjamma" "Beslissingsbrief D2: tweede voorstel goedgekeurd." "d2-brief-003.pdf")
+D2_BRIEF3_FID=$(upload_file "benjamma" "Beslissingsbrief D2: tweede voorstel goedgekeurd." "d2-brief-003.pdf" "d2000000-0000-0000-0000-000000000001")
 curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000008/oe:doeVoorstelBeslissing" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: benjamma" \
@@ -477,7 +490,7 @@ curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d3000000-0000-0000-0000-000000000
 echo ""
 
 echo "--- D3 Step 2: BATCH bewerkAanvraag + doeVoorstelBeslissing ---"
-D3_BRIEF1_FID=$(upload_file "marie.brugge" "Beslissingsbrief D3: kapel renovatie." "d3-brief-001.pdf")
+D3_BRIEF1_FID=$(upload_file "marie.brugge" "Beslissingsbrief D3: kapel renovatie." "d3-brief-001.pdf" "d3000000-0000-0000-0000-000000000001")
 curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d3000000-0000-0000-0000-000000000001/activities" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
@@ -567,7 +580,7 @@ curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d4000000-0000-0000-0000-000000000
 echo ""
 
 echo "--- D4 Step 2: BATCH bewerkAanvraag + doeVoorstelBeslissing (explicit used ref) ---"
-D4_BRIEF1_FID=$(upload_file "marie.brugge" "Beslissingsbrief D4: torenrestauratie." "d4-brief-001.pdf")
+D4_BRIEF1_FID=$(upload_file "marie.brugge" "Beslissingsbrief D4: torenrestauratie." "d4-brief-001.pdf" "d4000000-0000-0000-0000-000000000001")
 curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d4000000-0000-0000-0000-000000000001/activities" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
@@ -639,7 +652,7 @@ echo "DOSSIER 5: derivation rules — negative tests"
 echo "============================================"
 echo ""
 
-D5_AANVRAAG_FID=$(upload_file "jan.aanvrager" "initiele aanvraag bijlage" "d5-initieel.pdf")
+D5_AANVRAAG_FID=$(upload_file "jan.aanvrager" "initiele aanvraag bijlage" "d5-initieel.pdf" "d5000000-0000-0000-0000-000000000001")
 
 echo "--- D5 Step 1: dienAanvraagIn (baseline v1) ---"
 curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000001/oe:dienAanvraagIn" \
@@ -929,7 +942,7 @@ echo "============================================"
 echo ""
 
 echo "--- D6 Step 1: dienAanvraagIn (aanvraag v1) ---"
-D6_FID=$(upload_file "jan.aanvrager" "D6 initieel" "d6.pdf")
+D6_FID=$(upload_file "jan.aanvrager" "D6 initieel" "d6.pdf" "d6000000-0000-0000-0000-000000000001")
 curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d6000000-0000-0000-0000-000000000001/activities/a6000000-0000-0000-0000-000000000001/oe:dienAanvraagIn" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: jan.aanvrager" \
@@ -973,7 +986,7 @@ echo "  aanvraag v2 created (now latest)"
 echo ""
 
 echo "--- D6 Step 3: NEGATIVE — doeVoorstelBeslissing reads stale v1, no ack (expect 409 stale_used_reference) ---"
-D6_BRIEF_FID=$(upload_file "marie.brugge" "D6 brief" "d6-brief.pdf")
+D6_BRIEF_FID=$(upload_file "marie.brugge" "D6 brief" "d6-brief.pdf" "d6000000-0000-0000-0000-000000000001")
 RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/toelatingen/dossiers/d6000000-0000-0000-0000-000000000001/activities/a6000000-0000-0000-0000-000000000003/oe:doeVoorstelBeslissing" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
@@ -1138,7 +1151,7 @@ echo "DOSSIER 8: entity schema versioning"
 echo "============================================"
 echo ""
 
-D8_BIJLAGE_FID=$(upload_file "jan.aanvrager" "D8 v2 bijlage" "d8.pdf")
+D8_BIJLAGE_FID=$(upload_file "jan.aanvrager" "D8 v2 bijlage" "d8.pdf" "d8000000-0000-0000-0000-000000000001")
 
 echo "--- D8 Step 1: testDienAanvraagInV2 (creates v2 aanvraag) ---"
 D8_STEP1=$(curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d8000000-0000-0000-0000-000000000001/activities/a8000000-0000-0000-0000-000000000001/oe:testDienAanvraagInV2" \
@@ -1311,7 +1324,7 @@ echo "DOSSIER 9: tombstone — irreversible redaction"
 echo "============================================"
 echo ""
 
-D9_BIJLAGE_FID=$(upload_file "jan.aanvrager" "D9 initial bijlage" "d9.pdf")
+D9_BIJLAGE_FID=$(upload_file "jan.aanvrager" "D9 initial bijlage" "d9.pdf" "d9000000-0000-0000-0000-000000000001")
 
 echo "--- D9 Step 1: dienAanvraagIn (creates v1) ---"
 curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d9000000-0000-0000-0000-000000000001/activities/a9000000-0000-0000-0000-000000000001/oe:dienAanvraagIn" \
