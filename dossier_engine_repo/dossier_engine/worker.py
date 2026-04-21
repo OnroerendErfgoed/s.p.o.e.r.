@@ -27,8 +27,9 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select
 
 from .app import load_config_and_registry, SYSTEM_USER
+from .auth import User
 from .db import init_db, get_session_factory
-from .db.models import EntityRow, Repository
+from .db.models import AssociationRow, EntityRow, Repository
 from .engine import ActivityContext, Caller, execute_activity
 from .engine.refs import EntityRef
 from .sentry import (
@@ -620,6 +621,55 @@ async def _refetch_task(
     return task
 
 
+async def _resolve_triggering_user(
+    repo: Repository,
+    activity_id: UUID | None,
+) -> User:
+    """Resolve the triggering-user attribution for a worker-run context.
+
+    The worker *executes as* the system (``SYSTEM_USER``), but audit
+    events emitted by task handlers should be attributed to the person
+    whose activity caused the task to be scheduled — the aanvrager whose
+    cross-dossier ``file_id`` triggered a 403, the behandelaar whose
+    decision scheduled a notification task, and so on. That's what
+    ``ActivityContext.triggering_user`` carries; this helper builds it
+    from the triggering activity's first association row.
+
+    Returns a skeletal ``User`` (id/type/name from the association,
+    empty roles/properties) because the audit emitter uses identity
+    only — it doesn't need a live permission view of the user's
+    current role set. See the "identity only" design note on
+    ``AssociationRow`` semantics: that row is the PROV record of
+    "who did this activity," and PROV is the source of truth for
+    attribution even if the user's current role set has drifted.
+
+    Falls back to ``SYSTEM_USER`` if:
+    * ``activity_id`` is ``None`` (no triggering activity — e.g. a task
+      synthesised by a bootstrap migration), or
+    * the activity has no association row (should not happen in
+      practice — every activity writes an association — but the
+      defensive fallback keeps task handlers running under a valid
+      User instead of crashing with AttributeError deep in emit code).
+    """
+    if activity_id is None:
+        return SYSTEM_USER
+    result = await repo.session.execute(
+        select(AssociationRow)
+        .where(AssociationRow.activity_id == activity_id)
+        .limit(1)
+    )
+    assoc = result.scalar_one_or_none()
+    if assoc is None:
+        return SYSTEM_USER
+    return User(
+        id=assoc.agent_id,
+        type=assoc.agent_type or "unknown",
+        name=assoc.agent_name or assoc.agent_id,
+        roles=[],
+        properties={},
+    )
+
+
 async def _process_recorded(
     repo: Repository,
     plugin,
@@ -637,9 +687,17 @@ async def _process_recorded(
     if fn:
         all_latest = await repo.get_all_latest_entities(dossier_id)
         resolved = {e.type: e for e in all_latest}
+        triggering_user = await _resolve_triggering_user(
+            repo, task.generated_by,
+        )
         ctx = ActivityContext(
             repo, dossier_id, resolved, plugin.entity_models, plugin=plugin,
             triggering_activity_id=task.generated_by,
+            # Worker-run task: executor is the system, attribution is
+            # the agent of the triggering activity. See
+            # ``ActivityContext`` for the two-field model.
+            user=SYSTEM_USER,
+            triggering_user=triggering_user,
         )
         await fn(ctx)
     else:
@@ -726,8 +784,14 @@ async def _process_cross_dossier(
     if not fn:
         raise ValueError(f"Task function not found: {fn_name}")
 
+    triggering_user = await _resolve_triggering_user(repo, task.generated_by)
     ctx = ActivityContext(
         repo, dossier_id, {}, plugin.entity_models, plugin=plugin,
+        # Cross-dossier task: same executor/attribution split as the
+        # recorded-task path. Source-dossier attribution survives the
+        # hop to the target dossier's activity.
+        user=SYSTEM_USER,
+        triggering_user=triggering_user,
     )
     task_result = await fn(ctx)
 

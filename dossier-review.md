@@ -10,15 +10,15 @@
 
 | Status | Count | Items |
 |---|---|---|
-| ✅ Fixed & verified | 22 | Bugs 1, 2, 5, 6, 7, 12, 15, 16, 17, 32, 44, 47, 64, 65, 68, 70, 72 (coverage), 73, 74, 75, 76, 77 + Obs-2 (duplicate "external") |
+| ✅ Fixed & verified | 23 | Bugs 1, 2, 5, 6, 7, 12, 15, 16, 17, 30, 32, 44, 47, 64, 65, 68, 70, 72 (coverage), 73, 74, 75, 76, 77 + Obs-2 (duplicate "external") |
 | 🔍 Investigated, not a bug | 1 | Bug 14 — cross-dossier refs are `type=external` rows |
 | 🛑 Deferred / accepted | 4 | Bug 31 (RRN acceptable), Bug 45 (MinIO migration), Bug 63 (403 is correct HTTP), Bug 71 (test activities, deploy-time removal) |
-| 🧪 Test suite | **771/771** passing | engine 716, toelatingen 16, file_service 21, common/signing 18 |
+| 🧪 Test suite | **783/783** passing | engine 722, toelatingen 22, file_service 21, common/signing 18 |
 | 🏃 `test_requests.sh` | **25/25 OK, exit 0, zero deadlocks, zero worker crashes** | D1–D9 green |
 | ✂️ Duplication closed | **D1, D2, D4, D22, D25** | Graph-loader consolidation + audit-emit wrapper |
 | 🧰 Harnesses installed | **3** | Guidebook YAML lint + phase-docstring lint + CI shell-spec wrapper |
 | 🤖 CI wired | **GitHub Actions** | `.github/workflows/ci.yml` — 4 jobs: pytest, shell-spec, doc-harnesses, migrations-append-only |
-| 📦 Pending | ~56 bugs + 57 obs + 22 dups + 5 meta (partial relief) | See below |
+| 📦 Pending | ~55 bugs + 57 obs + 22 dups + 5 meta (partial relief) | See below |
 
 Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfaced and fixed in the same session as the harness that surfaced it.
 
@@ -39,7 +39,7 @@ Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfac
 | ~~15~~ | 3 | ~~Archive tempfile leak fills `/tmp` on heavy use.~~ | ✅ |
 | ~~16~~ | 3 | ~~Duplicate PROV-JSON build between `/prov` and `/archive`.~~ | ✅ |
 | ~~17~~ | 3 | ~~Hardcoded font paths break on non-Debian.~~ | ✅ |
-| 30 | 4 | `move_bijlagen_to_permanent` silently swallows per-file exceptions. |  |
+| ~~30~~ | 4 | ~~`move_bijlagen_to_permanent` silently swallows per-file exceptions.~~ | ✅ **Fixed in Round 18.** Bundled with an `ActivityContext` attribution-plumbing refactor that landed alongside (see Round 18 writeup). The task handler now tracks per-file failures, emits `dossier.denied` via the newly-plumbed `context.triggering_user` on a 403 (cross-dossier graft attempt — the aanvrager whose activity referenced a cross-dossier file_id is now attributed in SIEM rather than "system"), logs infrastructure failures with `exc_info=True` (Sentry breadcrumb bridge), and raises `RuntimeError` at loop end so the worker's recorded-task retry machinery fires for transient outages. Persistent 403s surface as stuck tasks that operators can see, instead of silently leaving an aanvraag with broken file refs. |
 | 📝 31 | 4 | Closed by product decision (RRN in `role`/`dossier_access`/ES ACL acceptable). | Decided. |
 | ~~44~~ | 5 | ~~File service falls back to `temp/file_id` regardless of `dossier_id`.~~ | ✅ |
 | 🛑 45 | 5 | Deferred — MinIO migration handles it. |  |
@@ -479,10 +479,44 @@ Verify-before-plan confirmed Bug 7 was real. `routes/activities.py::_run_activit
 
 **Process note.** This round repeats the Round 14 pattern where regression-test authoring surfaced an adjacent bug (Round 14: `UnicodeDecodeError` gap in `.meta` parse; this round: dead denial-emit attribute access). The pattern is worth naming: **writing a test that exercises the path the fix claims to preserve is often the most productive scrutiny a fix gets.** In both cases the adjacent bug was older than the one being fixed, invisible under the old behavior, and not catchable by any of the live harnesses (guidebook lint, phase docstrings, shell spec). Only the act of constructing a test that said "the denial path still works the same way" forced the code to be exercised under a pinned contract.
 
+### Round 18 — Bug 30 (silent per-file swallow in `move_bijlagen_to_permanent`) + `ActivityContext` attribution plumbing
+
+Verify-before-plan confirmed Bug 30 was real: `move_bijlagen_to_permanent` ran a bare `except Exception` per file that logged without `exc_info`, and even the two explicit `resp.status != 200` branches just `logger.warning`'d and fell through. The task was marked completed regardless of outcome, so an aanvraag with failed bijlage moves persisted indefinitely with file_ids pointing at unmoved files in the file service's `temp/` area. Downloads returned 404 forever, invisibly.
+
+Three layered problems, as surveyed pre-fix:
+1. Bare except + `logger.error` without `exc_info` — lost the traceback, so Sentry's LoggingIntegration (Round 13) couldn't surface what actually failed.
+2. Loop continued on any per-file failure + task marked complete — classic fail-open.
+3. 403 (file service's dossier-binding mismatch) was rationalized as tolerated — but "tolerated" conflated two positions: "file service blocked the data leak" (correct, already done) and "no further action needed" (incorrect — a cross-dossier graft attempt is a security-relevant event, and the aanvraag is in a permanently broken state that operators should see).
+
+**User pushback in-round — "we shouldn't treat 403s as normal."** Original plan was "log + continue" for 403s per the existing product-decision framing. User correctly flagged that the framing was doing too much work: accepting the file service's block isn't the same as accepting the symptom. Revised plan: 403 emits a `dossier.denied` audit event *and* counts as a failure so the task retries-until-exhaustion, surfacing the stuck aanvraag to ops.
+
+**Scope blowup discovered mid-planning — audit emit needs a real user.** The 403 audit emit needed an actor, and task handlers run under the worker with no request user in scope. Three options considered: (A) plumb real user attribution through `ActivityContext`, (B) use `SYSTEM_USER` + a `rejected_agent` hint field, (C) skip the audit emit for this round. User picked A. Initial estimate was "contained change"; walking the 8 `ActivityContext` construction sites revealed ~12 production files touched and a design decision I'd missed: the executor of a worker-run task is the worker (system) but the *attributed agent* — who the denial is *about* — is the person whose activity caused the task to exist. Those diverge. User confirmed the two-field split as the right design.
+
+**The attribution model (new design, spelled out in `ActivityContext` docstring).**
+- `context.user` — the agent the current code is *executing as*. For direct handlers/validators/split-hooks/fire-and-forget tasks: the request user. For side-effect handlers and worker-run tasks: `SYSTEM_USER`.
+- `context.triggering_user` — the agent attributed with the activity that *caused* this context to be constructed. For direct request-path code: same as `user`. For side effects: the original request user whose activity started the pipeline, preserved through recursion. For worker tasks: resolved from the triggering activity's `AssociationRow` via a new `_resolve_triggering_user(repo, activity_id)` helper.
+
+Use `user` when asking "who is doing this thing right now?" Use `triggering_user` when attributing audit events, denial reasons, or any record that says "this happened because of so-and-so's action."
+
+**Plumbing shipped (7 code phases):**
+1. **`ActivityContext` surface** — two new kwarg-only fields, both default `None` for back-compat. Class docstring rewritten with the two-field model + the worker-task example that motivated the split.
+2. **Pipeline direct-execution sites** — 4 constructions (handlers, validators, split_hooks, fire-and-forget tasks) pass `user=state.user, triggering_user=state.user`.
+3. **Side-effect chain** — `execute_side_effects` / `_execute_one_side_effect` / `_condition_met` accept a `triggering_user: User` kwarg; both internal `ActivityContext` construction sites pass `user=SYSTEM_USER, triggering_user=triggering_user`; recursive call threads it through. Engine entry point at `engine/__init__.py` passes `triggering_user=state.user`. `SYSTEM_USER` moved to canonical home in `dossier_engine.auth` with back-compat re-export from `app.py`.
+4. **Worker** — new `_resolve_triggering_user(repo, activity_id) -> User` helper (straight `select(AssociationRow)` query, identity-only skeletal User construction per "roles/properties empty" design call, falls back to `SYSTEM_USER` on missing activity or missing association). Both worker `ActivityContext` sites use it.
+5. **Bug 30 core fix** — per-file failure tracking, 403 audit emit via `context.triggering_user`, 5xx/exception path with `exc_info=True`, raise at loop end.
+6. **Tests** — 6 new Bug 30 unit tests in `dossier_toelatingen_repo/tests/unit/test_move_bijlagen_to_permanent.py` (happy path, 403 emits + raises, 500 raises without audit, exception path carries `exc_info`, mixed batch counts failures correctly, triggering_user attribution end-to-end) + 6 new engine integration tests in `test_activity_context_users.py` pinning the two-field contract across direct/side-effect/worker paths including recursion preservation and resolver fallbacks.
+7. **Verification** — 715 engine (+6) + 22 toelatingen (+6) + 18 common + 21 file_service = 776 passed + 7 Sentry-skipped = **783/783 total**. Shell spec green, 25 OK, D1-D9, zero tracebacks.
+
+**Test-file collateral damage.** 17 call sites to `execute_side_effects` / `_condition_met` in `test_side_effects.py` needed the new required kwarg. Batch-edited via a Python script; one regex substitution collided with an embedded paren inside a code comment and produced a syntax error that I hand-repaired. Two other fixture stubs (`_StubState` in `test_split_hooks.py`, 4 `ActivityContext(...)` constructions in `test_toelatingen_plugin.py`) were unaffected — the former got a `user = None` attribute added, the latter relied on the defaulted-None back-compat and didn't need changes.
+
+**Operational implication worth flagging to ops.** Before Bug 30, failed bijlage moves were silent — task marked complete, aanvraag has broken refs, no audit trail. After Bug 30: persistent 403s and infrastructure failures raise, the worker retries via its existing recorded-task retry machinery (exponential backoff, max attempts per the worker config), and eventually the task lands in a failed state that ops can see. Cross-dossier graft attempts now land in SIEM via `dossier.denied`, attributed to the aanvrager. Historical silent failures are unrecoverable — the file service's `temp/` cleanup has probably already reaped the unmoved files and any aanvraag with broken refs will stay broken. Going forward: operators should expect occasional "move_bijlagen_to_permanent task failed after N retries" entries as the normal signal for a stuck aanvraag, not a regression.
+
+**Process note on scope discipline.** This round took 6 turns end-to-end — the bulkiest fix in the engagement, not because Bug 30 itself was hard (~30 lines in the end) but because the audit emit required a distributed plumbing refactor across the engine and worker. The lesson is that **when a bug fix's audit/attribution story requires user context, walk every `ActivityContext` construction site before estimating the scope** — that check would have told me up-front this was "fix + refactor", not just "fix", and the scope conversation would have happened earlier. I surfaced this after Phase 2 and the user made an informed call to ship the full plumbing; the surfacing was the right move but should have happened during verify-before-plan rather than mid-execution.
+
 ### Where to go next (in priority order)
 
-1. **Bug 30 — `move_bijlagen_to_permanent` silently swallows per-file exceptions.** Continues the severity-first walk through open must-fix bugs. Another M2 silent-skip pattern, though likely already partially visible via Round 13's Stage 1 logging additions — verify first.
-2. **Remaining open "must-fix" bugs** — 55, 57, 58, 62 in number order.
+1. **Bug 55 — `lineage.find_related_entity` doesn't filter by `dossier_id` defensively.** Continues the severity-first walk through open must-fix bugs. Security-adjacent (defense in depth against cross-dossier lineage leaks). Verify still open first.
+2. **Remaining open "must-fix" bugs** — 57, 58, 62 in number order.
 
 The two "optional" items previously on this list remain closed:
 - **Obs-3** (write-on-change for `set_dossier_access`) — deferred by product decision. Keeping the full provenance graph is intended behaviour, not a pending optimization. Filed alongside Bugs 31/45/71 under deferred/accepted.

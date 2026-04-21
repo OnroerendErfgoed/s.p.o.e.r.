@@ -73,6 +73,11 @@ async def run_handler(state: ActivityState) -> None:
         used_entities=state.resolved_entities,
         entity_models=state.plugin.entity_models,
         plugin=state.plugin,
+        # Direct handler: executor and trigger are the same person —
+        # the user who made the request. See ActivityContext docstring
+        # for the semantics.
+        user=state.user,
+        triggering_user=state.user,
     )
 
     # The handler receives "client content" for the primary generated

@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
+from ..auth import User
 from ..db.models import Repository, EntityRow
 from ..plugin import Plugin
 from .errors import CardinalityError
@@ -64,6 +65,31 @@ class ActivityContext:
     existed at the time the task was scheduled — rather than on the
     current latest versions — can use this to walk back via
     `repo.get_entities_generated_by_activity(...)`.
+
+    User attribution — two fields, always both populated in production::
+
+    * ``user`` — the agent the current code is *executing as*. For a
+      direct handler/validator/split-hook this is the request-making
+      user; for side effects and worker-run tasks this is the system
+      user (the engine / the worker is the executor). Use when asking
+      "who is doing this thing right now?".
+
+    * ``triggering_user`` — the agent attributed with the activity that
+      *caused* this context to be constructed. For a direct handler,
+      this is the same as ``user`` (the request-maker triggered
+      themselves). For a side effect, this is the original user whose
+      activity started the pipeline. For a worker-run task, this is
+      the agent resolved from the triggering activity's association
+      row. Use when attributing audit events, denial reasons, or any
+      record that says "this happened because of so-and-so's action."
+
+    The split matters most in worker tasks and side effects. Example:
+    a user submits an aanvraag with a cross-dossier ``file_id``; the
+    ``move_bijlagen_to_permanent`` task runs in the worker, gets a 403
+    from the file service, and emits a ``dossier.denied`` audit event.
+    The audit event's actor should be the aanvrager (``triggering_user``),
+    not the system worker (``user``) — otherwise the SIEM can't
+    attribute the rejected graft back to the person who caused it.
     """
 
     def __init__(
@@ -74,6 +100,9 @@ class ActivityContext:
         entity_models: dict[str, Any] | None = None,
         plugin: Plugin | None = None,
         triggering_activity_id: UUID | None = None,
+        *,
+        user: User | None = None,
+        triggering_user: User | None = None,
     ):
         self.repo = repo
         self.dossier_id = dossier_id
@@ -81,6 +110,14 @@ class ActivityContext:
         self._entity_models = entity_models or {}
         self._plugin = plugin
         self.triggering_activity_id = triggering_activity_id
+        # Executor identity. Default None is for test fixtures and
+        # adapter code that predates the two-field split; production
+        # pipeline and worker construction sites always pass both.
+        self.user = user
+        # Attribution identity. For direct user requests both fields
+        # hold the same User; for side effects and worker tasks they
+        # diverge — see the class docstring.
+        self.triggering_user = triggering_user
 
     def get_used_entity(self, entity_type: str) -> EntityRow | None:
         return self._used_entities.get(entity_type)

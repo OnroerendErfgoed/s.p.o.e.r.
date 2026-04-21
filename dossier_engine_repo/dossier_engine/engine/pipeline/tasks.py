@@ -120,6 +120,10 @@ async def _fire_and_forget(state: ActivityState, task_def: dict) -> None:
         used_entities=state.resolved_entities,
         entity_models=state.plugin.entity_models,
         plugin=state.plugin,
+        # fire_and_forget runs during the request pipeline (not in the
+        # worker) — executor and trigger are both the request-maker.
+        user=state.user,
+        triggering_user=state.user,
     )
     try:
         await fn(ctx)

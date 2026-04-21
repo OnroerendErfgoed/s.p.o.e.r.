@@ -64,6 +64,8 @@ async def run_split_hooks(state: ActivityState) -> None:
         used_entities=state.resolved_entities,
         entity_models=state.plugin.entity_models,
         plugin=state.plugin,
+        user=state.user,
+        triggering_user=state.user,
     )
 
     # --- status_resolver ---

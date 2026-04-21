@@ -224,6 +224,12 @@ async def execute_activity(
         dossier_id=dossier_id,
         trigger_activity_id=activity_id,
         side_effects=activity_def.get("side_effects", []),
+        # Side effects run as the system caller (see the two-field
+        # attribution model on ``ActivityContext``). The triggering
+        # user is the one who made the request that spawned the
+        # whole pipeline run; that attribution is preserved through
+        # the recursive side-effect chain.
+        triggering_user=state.user,
     )
 
     # Process all tasks the activity declared (YAML + handler-appended).

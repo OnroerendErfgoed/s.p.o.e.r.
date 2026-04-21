@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 
+from dossier_engine.audit import emit_dossier_audit
 from dossier_engine.engine import ActivityContext
 
 logger = logging.getLogger("toelatingen.tasks")
@@ -128,6 +129,20 @@ async def move_bijlagen_to_permanent(context: ActivityContext):
     import os
     file_service_url = os.environ.get("FILE_SERVICE_URL", "http://localhost:8001")
 
+    # Per-file failures accumulate here. After the loop, any non-empty
+    # list becomes a RuntimeError so the worker's recorded-task retry
+    # machinery kicks in — a transient file-service outage should
+    # recover on retry without human intervention, because
+    # /internal/move is idempotent (successfully-moved files are no-ops
+    # on subsequent calls).
+    #
+    # Before Bug 30's fix this list didn't exist: a per-file exception
+    # was caught with a bare `except Exception` and logged at ERROR
+    # without exc_info, the loop continued, and the task was marked
+    # completed even when half its work had failed. Downloads against
+    # the aanvraag would 404 forever, invisibly to operators.
+    failures: list[tuple[str, str]] = []
+
     import aiohttp
     async with aiohttp.ClientSession() as session:
         for bijlage in bijlagen:
@@ -142,28 +157,73 @@ async def move_bijlagen_to_permanent(context: ActivityContext):
                     params={"file_id": fid, "dossier_id": dossier_id},
                 ) as resp:
                     if resp.status == 200:
-                        logger.info(f"[TASK] Moved bijlage {fid} → {dossier_id}/bijlagen/")
-                    elif resp.status == 403:
-                        # The file service rejected the move because
-                        # the dossier this file was uploaded for
-                        # doesn't match where we're trying to place
-                        # it — an attempted cross-dossier graft. The
-                        # aanvraag entity persists with a broken
-                        # reference; downloads against it will 404.
-                        # The data leak is blocked; PROV pollution
-                        # remains for a possible future route-level
-                        # check at activity-submit time.
-                        error = await resp.text()
-                        logger.warning(
-                            f"[TASK] Refused to move bijlage {fid} → "
-                            f"{dossier_id}: dossier binding mismatch. "
-                            f"{error}"
+                        logger.info(
+                            f"[TASK] Moved bijlage {fid} → {dossier_id}/bijlagen/"
                         )
+                    elif resp.status == 403:
+                        # Dossier-binding mismatch: the file service
+                        # rejected a cross-dossier graft attempt. Three
+                        # possible causes — client bug (frontend reused a
+                        # file_id from a different dossier), stale token,
+                        # actual attack. All three deserve SIEM attention:
+                        # the file service blocked the data leak, but a
+                        # human (or Wazuh rule) should see that the
+                        # attempt happened.
+                        #
+                        # Emit dossier.denied attributed to the agent of
+                        # the triggering activity (via context.triggering_user,
+                        # plumbed through ActivityContext per the
+                        # two-field attribution model — worker runs AS
+                        # the system, but this denial is ABOUT the
+                        # person whose activity referenced the problematic
+                        # file_id). Then count as a failure so the task
+                        # fails loudly — persistent 403 means a corrupted
+                        # aanvraag that needs operator attention, not a
+                        # tolerated steady state.
+                        error = await resp.text()
+                        emit_dossier_audit(
+                            action="dossier.denied",
+                            user=context.triggering_user,
+                            dossier_id=context.dossier_id,
+                            outcome="denied",
+                            reason=(
+                                "bijlage move rejected: file uploaded "
+                                "for different dossier"
+                            ),
+                            file_id=fid,
+                        )
+                        logger.warning(
+                            "[TASK] Refused to move bijlage %s → %s: "
+                            "dossier binding mismatch. %s",
+                            fid, dossier_id, error,
+                        )
+                        failures.append((fid, f"HTTP 403: {error[:200]}"))
                     else:
                         error = await resp.text()
-                        logger.warning(f"[TASK] Failed to move bijlage {fid}: {error}")
+                        logger.error(
+                            "[TASK] Failed to move bijlage %s (HTTP %s): %s",
+                            fid, resp.status, error,
+                        )
+                        failures.append((fid, f"HTTP {resp.status}: {error[:200]}"))
             except Exception as e:
-                logger.error(f"[TASK] Error moving bijlage {fid}: {e}")
+                # Bug 30 / M2 pattern: log with exc_info=True so the
+                # Sentry LoggingIntegration (Round 13) surfaces the
+                # traceback. Also record the failure for the raise
+                # below — don't swallow.
+                logger.error(
+                    "[TASK] Error moving bijlage %s", fid, exc_info=True,
+                )
+                failures.append((fid, f"{type(e).__name__}: {e}"))
+
+    if failures:
+        # Raise so the worker's recorded-task retry machinery fires.
+        # File service /internal/move is idempotent, so files already
+        # moved successfully in this attempt are no-ops on retry.
+        summary = ", ".join(f"{fid}({reason})" for fid, reason in failures)
+        raise RuntimeError(
+            f"move_bijlagen_to_permanent: {len(failures)} of {len(to_move)} "
+            f"bijlage move(s) failed: {summary}"
+        )
 
 
 TASK_HANDLERS = {

@@ -49,6 +49,7 @@ from uuid import UUID, uuid4
 
 from ..context import ActivityContext, HandlerResult
 from ..lookups import lookup_singleton, resolve_from_prefetched
+from ...auth import User, SYSTEM_USER
 from ...db.models import Repository
 from ...plugin import Plugin
 from ._identity import resolve_handler_generated_identity
@@ -63,10 +64,19 @@ async def execute_side_effects(
     dossier_id: UUID,
     trigger_activity_id: UUID,
     side_effects: list[dict],
+    triggering_user: User,
     depth: int = 0,
     max_depth: int = 10,
 ) -> None:
     """Recursively execute side effect activities.
+
+    ``triggering_user`` is the agent attributed with the *original*
+    user-facing activity that started this pipeline run. It's passed
+    through unchanged during recursion — nested side effects still
+    attribute their work to the original request-maker, even though
+    the nested chain is entirely system-generated. See
+    ``ActivityContext`` for the two-field attribution model and why
+    this matters for task/side-effect audit emits.
 
     For each side effect entry:
     1. Check its condition (if any) — skip if condition not met.
@@ -114,6 +124,7 @@ async def execute_side_effects(
             side_effect=side_effect,
             depth=depth,
             max_depth=max_depth,
+            triggering_user=triggering_user,
         )
 
 
@@ -128,6 +139,7 @@ async def _execute_one_side_effect(
     side_effect: dict,
     depth: int,
     max_depth: int,
+    triggering_user: User,
 ) -> None:
     """Execute a single side effect entry. See `execute_side_effects`
     for the high-level contract."""
@@ -150,6 +162,7 @@ async def _execute_one_side_effect(
         trigger_used=trigger_used,
         condition=side_effect.get("condition"),
         condition_fn_name=side_effect.get("condition_fn"),
+        triggering_user=triggering_user,
     ):
         return
 
@@ -205,6 +218,11 @@ async def _execute_one_side_effect(
         used_entities=se_resolved,
         entity_models=plugin.entity_models,
         plugin=plugin,
+        # Side-effect handler: executor is the system, attribution is
+        # the user who initiated the pipeline run (whose activity's
+        # declared side_effects we're walking right now).
+        user=SYSTEM_USER,
+        triggering_user=triggering_user,
     )
     se_result = await se_handler_fn(se_ctx, None)
 
@@ -236,6 +254,11 @@ async def _execute_one_side_effect(
             side_effects=nested,
             depth=depth + 1,
             max_depth=max_depth,
+            # Pass-through: nested side effects are still attributed
+            # to the user whose original request started this chain,
+            # not to the immediate triggering side-effect activity
+            # (which ran as the system).
+            triggering_user=triggering_user,
         )
 
 
@@ -248,6 +271,7 @@ async def _condition_met(
     trigger_used: list,
     condition: dict | None,
     condition_fn_name: str | None = None,
+    triggering_user: User,
 ) -> bool:
     """Check a side effect's conditional gate.
 
@@ -302,6 +326,11 @@ async def _condition_met(
             used_entities=resolved,
             entity_models=plugin.entity_models,
             plugin=plugin,
+            # Side-effect condition: executor is the system, but
+            # attribution stays with the user who initiated the
+            # pipeline run.
+            user=SYSTEM_USER,
+            triggering_user=triggering_user,
         )
         result = await fn(ctx)
         return bool(result)

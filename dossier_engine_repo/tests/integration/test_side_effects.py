@@ -33,6 +33,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import text
 
+from dossier_engine.auth import SYSTEM_USER, User
 from dossier_engine.db.models import Repository, AssociationRow
 from dossier_engine.engine.context import HandlerResult
 from dossier_engine.engine.pipeline.side_effects import (
@@ -41,6 +42,15 @@ from dossier_engine.engine.pipeline.side_effects import (
 
 
 D1 = UUID("11111111-1111-1111-1111-111111111111")
+
+# Marker user for the triggering_user kwarg on execute_side_effects /
+# _condition_met. These tests exercise structural side-effect
+# behaviour (conditions, depth, etc.), not attribution, so passing
+# the canonical SYSTEM_USER keeps the tests focused while still
+# satisfying the required kwarg. A dedicated "triggering_user gets
+# threaded correctly" assertion lives in the round's integration
+# test — not here.
+_TRIGGERING_USER = SYSTEM_USER
 
 
 class _SidePlugin:
@@ -138,6 +148,7 @@ class TestExecuteSideEffects:
             plugin=plugin, repo=repo, dossier_id=D1,
             trigger_activity_id=trigger,
             side_effects=[],
+            triggering_user=_TRIGGERING_USER,
         )
 
         # No new activity rows beyond the trigger itself.
@@ -160,6 +171,7 @@ class TestExecuteSideEffects:
             trigger_activity_id=trigger,
             side_effects=[{"activity": "runMe"}],
             depth=10, max_depth=10,
+            triggering_user=_TRIGGERING_USER,
         )
 
         # No new activity rows written — depth gate fired.
@@ -181,6 +193,7 @@ class TestExecuteSideEffects:
             plugin=plugin, repo=repo, dossier_id=D1,
             trigger_activity_id=trigger,
             side_effects=[{"activity": "notInPlugin"}],
+            triggering_user=_TRIGGERING_USER,
         )
 
         # No side-effect activity row created.
@@ -206,6 +219,7 @@ class TestExecuteSideEffects:
             plugin=plugin, repo=repo, dossier_id=D1,
             trigger_activity_id=trigger,
             side_effects=[{"activity": "runMe"}],
+            triggering_user=_TRIGGERING_USER,
         )
 
         result = await repo.session.execute(
@@ -227,7 +241,8 @@ class TestExecuteSideEffects:
         await execute_side_effects(
             plugin=plugin, repo=repo, dossier_id=D1,
             trigger_activity_id=trigger,
-            side_effects=[{}],  # no activity field
+            side_effects=[{}],  # no activity field,
+            triggering_user=_TRIGGERING_USER,
         )
 
         result = await repo.session.execute(
@@ -263,6 +278,7 @@ class TestExecuteSideEffects:
             plugin=plugin, repo=repo, dossier_id=D1,
             trigger_activity_id=trigger,
             side_effects=[{"activity": "runMe"}],
+            triggering_user=_TRIGGERING_USER,
         )
         await repo.session.flush()
 
@@ -303,6 +319,7 @@ class TestExecuteSideEffects:
             plugin=plugin, repo=repo, dossier_id=D1,
             trigger_activity_id=trigger,
             side_effects=[{"activity": "runMe"}],
+            triggering_user=_TRIGGERING_USER,
         )
         await repo.session.flush()
 
@@ -344,6 +361,7 @@ class TestExecuteSideEffects:
             plugin=plugin, repo=repo, dossier_id=D1,
             trigger_activity_id=trigger,
             side_effects=[{"activity": "outer"}],
+            triggering_user=_TRIGGERING_USER,
         )
         await repo.session.flush()
 
@@ -374,6 +392,7 @@ class TestConditionMet:
             plugin=plugin, repo=repo, dossier_id=D1,
             trigger_generated=[], trigger_used=[],
             condition=None,
+            triggering_user=_TRIGGERING_USER,
         )
         assert result is True
 
@@ -391,6 +410,7 @@ class TestConditionMet:
                 "field": "type",
                 "value": "x",
             },
+            triggering_user=_TRIGGERING_USER,
         )
         assert result is False
 
@@ -415,6 +435,7 @@ class TestConditionMet:
                 "field": "type",
                 "value": "natuurlijk_persoon",
             },
+            triggering_user=_TRIGGERING_USER,
         )
         assert result is True
 
@@ -438,6 +459,7 @@ class TestConditionMet:
                 "field": "type",
                 "value": "natuurlijk_persoon",  # expected != stored
             },
+            triggering_user=_TRIGGERING_USER,
         )
         assert result is False
 
@@ -473,6 +495,7 @@ class TestConditionMet:
                 "field": "level",
                 "value": "owner",
             },
+            triggering_user=_TRIGGERING_USER,
         )
         assert result is True
 
@@ -511,6 +534,7 @@ class TestConditionFn:
             trigger_generated=gen_rows, trigger_used=[],
             condition=None,
             condition_fn_name="should_publish",
+            triggering_user=_TRIGGERING_USER,
         )
         assert result is True
         assert calls == ["called"]
@@ -539,6 +563,7 @@ class TestConditionFn:
             trigger_generated=gen_rows, trigger_used=[],
             condition=None,
             condition_fn_name="should_publish",
+            triggering_user=_TRIGGERING_USER,
         )
         assert result is False
 
@@ -555,6 +580,7 @@ class TestConditionFn:
             trigger_generated=[], trigger_used=[],
             condition=None,
             condition_fn_name="does_not_exist",
+            triggering_user=_TRIGGERING_USER,
         )
         assert result is False
 
@@ -589,6 +615,7 @@ class TestConditionFn:
                 "value": "goedgekeurd",
             },
             condition_fn_name="always_false",
+            triggering_user=_TRIGGERING_USER,
         )
         assert result is False
         assert fn_called == [True]

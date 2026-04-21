@@ -19,7 +19,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .plugin import PluginRegistry
-from .auth import POCAuthMiddleware, User
+from .auth import POCAuthMiddleware, User, SYSTEM_USER
 from .db import init_db, get_session_factory
 from .routes import register_routes
 from .routes.prov import register_prov_routes
@@ -93,15 +93,10 @@ def _run_alembic_migrations(db_url: str) -> None:
     _log.info("Alembic migrations applied successfully")
 
 
-# System user used by the worker and side effects
-SYSTEM_USER = User(
-    id="system",
-    type="systeem",
-    name="Systeem",
-    roles=["systeemgebruiker"],
-    properties={},
-    uri="https://id.erfgoed.net/agenten/system",
-)
+# System user used by the worker and side effects.
+# Canonical definition lives in ``dossier_engine.auth``; re-imported
+# above so existing ``from dossier_engine.app import SYSTEM_USER``
+# callers keep working.
 
 
 def load_config_and_registry(config_path: str = "config.yaml") -> tuple[dict, PluginRegistry]:

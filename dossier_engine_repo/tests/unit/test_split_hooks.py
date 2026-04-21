@@ -58,6 +58,11 @@ class _StubState:
         self.resolved_entities = resolved_entities or {}
         self.repo = None
         self.dossier_id = D1
+        # user / triggering_user — split-hook phase builds an
+        # ActivityContext from state.user (see the two-field attribution
+        # model on ``ActivityContext`` docstring). For these unit tests
+        # the ctx isn't used for audit emission so None is fine.
+        self.user = None
 
 
 class TestNoOpForLegacyActivities:
