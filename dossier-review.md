@@ -10,15 +10,15 @@
 
 | Status | Count | Items |
 |---|---|---|
-| ✅ Fixed & verified | 20 | Bugs 1, 2, 5, 6, 12, 15, 16, 17, 32, 44, 47, 64, 65, 68, 70, 72 (coverage), 73, 74, 75, 76 + Obs-2 (duplicate "external") |
+| ✅ Fixed & verified | 22 | Bugs 1, 2, 5, 6, 7, 12, 15, 16, 17, 32, 44, 47, 64, 65, 68, 70, 72 (coverage), 73, 74, 75, 76, 77 + Obs-2 (duplicate "external") |
 | 🔍 Investigated, not a bug | 1 | Bug 14 — cross-dossier refs are `type=external` rows |
 | 🛑 Deferred / accepted | 4 | Bug 31 (RRN acceptable), Bug 45 (MinIO migration), Bug 63 (403 is correct HTTP), Bug 71 (test activities, deploy-time removal) |
-| 🧪 Test suite | **767/767** passing | engine 712, toelatingen 16, file_service 21, common/signing 18 |
+| 🧪 Test suite | **771/771** passing | engine 716, toelatingen 16, file_service 21, common/signing 18 |
 | 🏃 `test_requests.sh` | **25/25 OK, exit 0, zero deadlocks, zero worker crashes** | D1–D9 green |
 | ✂️ Duplication closed | **D1, D2, D4, D22, D25** | Graph-loader consolidation + audit-emit wrapper |
 | 🧰 Harnesses installed | **3** | Guidebook YAML lint + phase-docstring lint + CI shell-spec wrapper |
 | 🤖 CI wired | **GitHub Actions** | `.github/workflows/ci.yml` — 4 jobs: pytest, shell-spec, doc-harnesses, migrations-append-only |
-| 📦 Pending | ~57 bugs + 57 obs + 22 dups + 5 meta (partial relief) | See below |
+| 📦 Pending | ~56 bugs + 57 obs + 22 dups + 5 meta (partial relief) | See below |
 
 Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfaced and fixed in the same session as the harness that surfaced it.
 
@@ -34,7 +34,7 @@ Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfac
 | ~~2~~ | 1 | ~~Add-validator dispatch path also triggers on removes.~~ | ✅ |
 | ~~5~~ | 2 | ~~`check_dossier_access` docstring claims default-deny but code asserts default-allow.~~ | ✅ **Fixed in Round 15.** Code now matches the module docstring: an un-provisioned dossier (no `oe:dossier_access` entity, or one with empty content) raises 403 with `emit_dossier_audit(reason="Dossier has no access entity configured")` instead of falling through to permit. Drive-by consistency fix in the same file — three gratuitous in-function `from ..audit import emit_dossier_audit` hoisted to module level. Four tests updated + two regression tests added + `_bootstrap_with_entity` in `test_prov_endpoints.py` taught to seed the access entity that production's `setDossierAccess` side-effect writes. |
 | ~~6~~ | 2 | ~~Alembic failure fallback runs `create_tables()` — half-migrated schema risk.~~ | ✅ **Fixed in Round 16.** `app.py` now raises `RuntimeError` on any Alembic `upgrade head` non-zero exit (logging stderr at ERROR first so the Alembic traceback survives in the app log) *and* on missing `alembic.ini`. Previous silent fallback to `create_tables()` is gone — it masked partial-migration corruption by no-op'ing over existing tables. Extracted the Alembic invocation to a module-level `_run_alembic_migrations(db_url)` helper so the fail-fast paths are unit-testable without a live DB. 5 regression tests added. |
-| 7 | 2 | Batch endpoint emits audit events per item before transaction commit. |  |
+| ~~7~~ | 2 | ~~Batch endpoint emits audit events per item before transaction commit.~~ | ✅ **Fixed in Round 17.** Scope was wider than the title suggested: all three activity endpoints (generic single, generic batch, typed-per-workflow) share `_run_activity`, which emitted `dossier.created`/`dossier.updated` in-transaction *before* `run_with_deadlock_retry` committed. On mid-batch rollback the audit log falsely recorded committed work; on deadlock-retry it double-emitted. Fix moves the success emit to a new module-level `_emit_activity_success(...)` helper invoked *after* `run_with_deadlock_retry` returns in all three call sites (batch accumulates per-item descriptors in a closure list that clears on every retry attempt). Denial emit on `ActivityError(403)` stays in-transaction — the denial decision is the auditable fact regardless of rollback. Sibling Bug 77 found and fixed during regression-test authoring (see below). |
 | 🔍 14 | 3 | **Not a bug.** Cross-dossier refs persisted as local `type=external` rows via `ensure_external_entity`; raw-UUID cross-dossier refs rejected at `resolve_used:89-92` with 422. | Dropped from must-fix. |
 | ~~15~~ | 3 | ~~Archive tempfile leak fills `/tmp` on heavy use.~~ | ✅ |
 | ~~16~~ | 3 | ~~Duplicate PROV-JSON build between `/prov` and `/archive`.~~ | ✅ |
@@ -97,6 +97,7 @@ Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfac
 | ~~74~~ | (impl) | ~~Worker/route deadlock on `system:task` rows.~~ | ✅ **Fixed.** Structural (worker takes dossier lock first, matching user-activity order) + defence-in-depth (`run_with_deadlock_retry` on routes). |
 | ~~75~~ | (impl) | ~~Worker crashes on cold start if the app hasn't finished Alembic migrations yet — `UndefinedTableError` propagates to top-level crash handler.~~ | ✅ **Fixed.** Surfaced by harness 2. Worker now tolerates SQLSTATE 42P01 during pre-ready window, logs a warning and retries; real missing-table errors after first successful poll still propagate. |
 | ~~76~~ | (impl) | ~~`file_service/app.py:265` — the `.meta` parse during `/internal/move` catches OSError and JSONDecodeError and falls back to "no binding info", which then permits the move.~~ | ✅ **Fixed & tested.** Discovered during M2 Stage 3: the silent-bypass code had already been replaced with `logger.error` + `raise HTTPException(500, ...)` with a thorough docstring explaining the four `.meta` states (missing / valid-with-field / valid-no-field / corrupted) and the policy for each. Review was carrying a stale open-bug entry. **One real sub-bug caught by writing the regression tests:** `UnicodeDecodeError` (subclass of `ValueError`, *not* of `JSONDecodeError`) wasn't in the except clause, so non-UTF-8 garbage in `.meta` crashed with a default 500 rather than the intended explicit reject. Widened the except to `(OSError, json.JSONDecodeError, UnicodeDecodeError)`; added two regression tests in `TestMoveEnforcesDossierBinding` (truncated JSON + binary garbage). Both green; full class 7/7 passing. |
+| ~~77~~ | (impl) | ~~`activities.py:_run_activity` denial-audit emit was dead code — read `getattr(e, 'code', None)` and `getattr(e, 'message', str(e))` on an `ActivityError` that stores `status_code` and `detail`. Write-side `dossier.denied` events have never fired.~~ | ✅ **Fixed in Round 17 alongside Bug 7.** Surfaced by writing the Bug 7 regression test for the denial path: the test correctly got a 403 back from the endpoint but captured zero audit emits, because `getattr(e, 'code', None)` always returned `None` and the `if code == 403:` guard always skipped. Read-side denials from `routes/access.py` had been working all along so the SIEM stream wasn't empty, but the `_run_activity` docstring's promise that "SIEM sees both read-side denials (from `routes/access.py`) and write-side denials (from here) in one stream" had been silently broken. Fixed by reading `e.status_code` and `e.detail` directly (no getattr-with-default, so an attribute rename is a loud AttributeError, not silent skip). The regression test now pins the emit AND a substring of the real authorize message so a future rename is caught on both axes. |
 
 ### Lower-priority
 
@@ -444,10 +445,44 @@ Two paths hit `create_tables()`: the non-zero-exit fallback on line 344 (the mai
 
 **Note on what didn't change.** `create_tables()` in `dossier_engine.db.session` stays. It's the right tool for in-process test schema bootstrap (`conftest.py`) and for the standalone stress-test harness, both of which intentionally sidestep Alembic. The bug was never `create_tables` itself — it was *using it as a production failure fallback*. That usage is now gone; the helper remains fit for purpose.
 
+### Round 17 — Bug 7 (premature audit emit in activity endpoints) + adjacent Bug 77 (dead denial emit)
+
+Verify-before-plan confirmed Bug 7 was real. `routes/activities.py::_run_activity` called `emit_dossier_audit(action="dossier.created"|"dossier.updated", outcome="allowed", ...)` immediately after `execute_activity` returned — while still inside `run_with_deadlock_retry`'s `async with session.begin():`. If any subsequent item in a batch raised, or the outer transaction rolled back for any reason, the audit log on disk (NDJSON, synchronous writes) still claimed the activity committed. Same bug shape hit deadlock retries: a deadlocked attempt that emitted N audits before rolling back would re-emit on the successful retry, doubling the event count.
+
+**Scope was wider than the review title.** The phrase "batch endpoint" was the visible symptom, but the bug lived in `_run_activity` — a shared helper called from three places: `_handle_single`, `_handle_batch`, and the typed-per-workflow endpoint factory. Single-activity endpoints were also affected via deadlock-retry double-emit; only the "in practice deadlocks are rare because the worker takes locks in user-activity order now (Bug 74)" part kept this from being a visible problem in production. The fix had to touch all three call sites.
+
+**Design options considered.** (A) SQLAlchemy `after_commit` event listener, (B) explicit `AuditBuffer` with try/finally flush, (C) `_run_activity` returns events, caller emits, (D) post-commit emit outside `run_with_deadlock_retry`. User picked D. Reasoning: `run_with_deadlock_retry` already owns the transaction boundary, so "emit after the retry returns successfully" is the natural layering; no SQLAlchemy event plumbing; no framework dependency; deadlock-retry double-emit goes away for free because each retry starts a fresh attempt and the success-emit happens exactly once at the end.
+
+**Fix (Bug 7).**
+- **New module-level helper** `_emit_activity_success(user, dossier_id, act_def, activity_id)` in `activities.py` — encapsulates the `can_create_dossier` → `dossier.created` vs `dossier.updated` derivation + emit.
+- **`_run_activity`** no longer emits on success. The method docstring rewritten with an explicit "Audit emission on writes" section distinguishing the denial path (in-transaction, correct on rollback) from the success path (caller's responsibility, post-commit).
+- **`_handle_single`** captures the retry return value, calls `_emit_activity_success`, returns.
+- **`_handle_batch`** owns a closure-captured `pending_emits: list[tuple[dict, UUID]]` cleared at the top of `_work` (so deadlock retries reset from scratch), appended to after each successful `_run_activity` return (never after a raise), and flushed after the commit. Matches the existing atomicity contract — "either all items commit + all audits emit or none do."
+- **Typed-per-workflow endpoint** gets the same treatment as `_handle_single`.
+- **`emit_dossier_audit` hoisted** to module-level import (same cleanup as `access.py` in Round 15). This also makes the regression test's `monkeypatch.setattr(activities_mod, "emit_dossier_audit", ...)` work cleanly.
+
+**Tests shipped for Bug 7.** 4 new tests in `test_http_activities.py::TestAuditEmitIsPostCommit`:
+- `test_successful_single_emits_exactly_one_success_event` — happy-path single count and action name.
+- `test_batch_rollback_emits_no_success_events` — **the core Bug 7 regression.** 2-item batch, second item fails with 422, asserts zero success emits captured. Before the fix this was 1 success emit (for the doomed first item).
+- `test_batch_success_emits_one_event_per_committed_item` — happy-path batch count, per-item action names and activity IDs.
+- `test_denial_still_emits_in_transaction` — pins that `dossier.denied` on `ActivityError(403)` still emits, so a future refactor that over-generalizes "defer everything to post-commit" is caught.
+
+**Adjacent Bug 77 surfaced and fixed.** Writing the denial test showed the endpoint correctly returned 403 with `{"detail":"Authorization failed: User does not have role 'oe:behandelaar'"}` — but the audit capture was empty. Trace: `_run_activity`'s denial path read `code = getattr(e, 'code', None)` on an `ActivityError`, which stores its status as `status_code` (see `engine/errors.py`). The getattr default silently returned `None`, `if code == 403:` always fell through, and the `dossier.denied` emit has been dead code in every deployment. Same issue with `reason = getattr(e, 'message', str(e))` — `ActivityError` stores `detail`, not `message`, so even if `code` had been fixed the reason would have been `str(e)` = the exception's default repr, uninformative to SIEM.
+
+**Fix (Bug 77).** Replaced the getattr-with-default accesses with direct attribute reads: `e.status_code == 403` and `str(e.detail)`. No defaults — if the attribute ever disappears, it raises `AttributeError` loudly instead of silently skipping. A comment explains the attribute-name history and references the regression test. The test was tightened to pin both the emit presence AND a substring of the real authorize message (`"behandelaar"`), so a future rename is caught on two axes, not just one.
+
+**Operational implication of Bug 77 worth surfacing:** read-side denials from `routes/access.py` (missing dossier_access, role mismatch, audit-denied) have always been emitting correctly, so the `dossier.denied` SIEM stream has not been empty. But **write-side denials — users attempting activities they don't have roles for — have never been audited.** Production deployments that build Wazuh rules on the `dossier.denied` stream have been getting a partial picture of denial patterns. The fix restores the contract the `_run_activity` docstring was advertising.
+
+**Verified.**
+- **Test suite:** 771/771 (engine 716, up from 712; toelatingen 16, common/signing 18, file_service 21). +4 matches the four new Bug 7 regression tests; Bug 77's fix rides on the same set (the denial test covers both).
+- **Shell spec via harness 2:** exit 0, 25 OK, 5 summaries, D1–D9 green, zero tracebacks/5xx. The shell spec exercises only happy-path flows, so the behavior shift (emit post-commit instead of pre-commit) is invisible to it — which is exactly what we want: end-users see no difference in response shape or timing.
+
+**Process note.** This round repeats the Round 14 pattern where regression-test authoring surfaced an adjacent bug (Round 14: `UnicodeDecodeError` gap in `.meta` parse; this round: dead denial-emit attribute access). The pattern is worth naming: **writing a test that exercises the path the fix claims to preserve is often the most productive scrutiny a fix gets.** In both cases the adjacent bug was older than the one being fixed, invisible under the old behavior, and not catchable by any of the live harnesses (guidebook lint, phase docstrings, shell spec). Only the act of constructing a test that said "the denial path still works the same way" forced the code to be exercised under a pinned contract.
+
 ### Where to go next (in priority order)
 
-1. **Bug 7 — batch endpoint emits audit events per item before transaction commit.** Fail-open shape in the opposite direction from Bug 6: audit is append-only NDJSON, so once an event is emitted you can't retract it. If the batch commit fails after partial audit emission, the log claims actions that never happened. Verify still open first.
-2. **Remaining open "must-fix" bugs** — Bugs 30, 55, 57, 58, 62 in number order. Priority depends on deployment context, but the severity-first walk keeps them grouped before should-fix.
+1. **Bug 30 — `move_bijlagen_to_permanent` silently swallows per-file exceptions.** Continues the severity-first walk through open must-fix bugs. Another M2 silent-skip pattern, though likely already partially visible via Round 13's Stage 1 logging additions — verify first.
+2. **Remaining open "must-fix" bugs** — 55, 57, 58, 62 in number order.
 
 The two "optional" items previously on this list remain closed:
 - **Obs-3** (write-on-change for `set_dossier_access`) — deferred by product decision. Keeping the full provenance graph is intended behaviour, not a pending optimization. Filed alongside Bugs 31/45/71 under deferred/accepted.

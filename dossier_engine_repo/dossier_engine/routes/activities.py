@@ -26,6 +26,7 @@ from uuid import UUID
 from fastapi import Depends, FastAPI, HTTPException
 
 from ..auth import User
+from ..audit import emit_dossier_audit
 from ..db import Repository, run_with_deadlock_retry
 from ..engine import ActivityError, execute_activity
 from ..plugin import Plugin, PluginRegistry
@@ -90,7 +91,19 @@ def register(
                 informed_by=request.informed_by,
             )
 
-        return await run_with_deadlock_retry(_work)
+        result = await run_with_deadlock_retry(_work)
+        # Post-commit: the transaction owned by run_with_deadlock_retry
+        # has committed successfully. Emit the success audit event now.
+        # On exception (HTTPException, ActivityError, or deadlock-retry
+        # exhaustion) we never reach this line, so the audit log never
+        # claims an activity that didn't actually commit.
+        _emit_activity_success(
+            user=user,
+            dossier_id=dossier_id,
+            act_def=act_def,
+            activity_id=activity_id,
+        )
+        return result
 
     async def _handle_batch(
         dossier_id: UUID,
@@ -98,23 +111,46 @@ def register(
         user: User,
         workflow_override: str | None = None,
     ):
-        """Execute a batch of activities atomically."""
+        """Execute a batch of activities atomically.
+
+        Audit emission is deferred until after the outer
+        ``run_with_deadlock_retry`` commit. Inside ``_work`` we
+        accumulate one descriptor per successful ``_run_activity``
+        return; if the batch rolls back (any item raises) or
+        deadlock-retries (the retry starts fresh and rebuilds the
+        list from scratch), no audit events are emitted for the
+        failed attempt. Only the descriptors from the committing
+        attempt reach the audit log. This is what Bug 7 called for.
+        """
         wf = workflow_override or request.workflow
+        # Per-item success descriptors collected during _work. The
+        # list is reset on every retry attempt via the closure — the
+        # outer helper above allocates it fresh inside _work so a
+        # deadlock retry starts with an empty buffer. Each entry is
+        # ``(act_def, activity_id)``; the caller user and dossier_id
+        # are constant for the whole batch.
+        pending_emits: list[tuple[dict, UUID]] = []
 
         async def _work(session):
+            # Reset the buffer on every attempt. A deadlock retry
+            # starts a fresh session/transaction and re-runs the
+            # whole loop; the previous attempt's descriptors must be
+            # discarded or we'd double-emit after the retry commits.
+            pending_emits.clear()
             repo = Repository(session)
             results = []
             for item in request.activities:
                 plugin, act_def = _resolve_plugin_and_def(
                     registry, item.type, wf,
                 )
+                item_activity_id = UUID(item.activity_id)
                 try:
                     response = await _run_activity(
                         repo=repo,
                         plugin=plugin,
                         act_def=act_def,
                         dossier_id=dossier_id,
-                        activity_id=UUID(item.activity_id),
+                        activity_id=item_activity_id,
                         user=user,
                         role=item.role,
                         used=item.used,
@@ -140,6 +176,10 @@ def register(
                     )
                 await repo.session.flush()
                 results.append(response)
+                # Record the successful item for post-commit emit.
+                # Recorded AFTER the successful _run_activity return
+                # so a raise from execute_activity leaves no entry.
+                pending_emits.append((act_def, item_activity_id))
             return {
                 "activities": results,
                 "dossier": results[-1]["dossier"] if results else None,
@@ -148,7 +188,20 @@ def register(
         # A deadlock anywhere in the batch retries the whole batch with
         # a fresh transaction. This matches the existing atomicity
         # contract — either all items commit or none do.
-        return await run_with_deadlock_retry(_work)
+        result = await run_with_deadlock_retry(_work)
+        # Post-commit: emit one audit event per item that was part of
+        # the committed attempt. ``pending_emits`` was rebuilt from
+        # scratch on the final attempt (see the clear() at the top of
+        # _work), so we don't double-emit for items that ran on an
+        # earlier deadlock-retried attempt.
+        for act_def, emitted_activity_id in pending_emits:
+            _emit_activity_success(
+                user=user,
+                dossier_id=dossier_id,
+                act_def=act_def,
+                activity_id=emitted_activity_id,
+            )
+        return result
 
     # --- Workflow-agnostic routes ---
 
@@ -336,7 +389,17 @@ def _register_typed_route(
                 informed_by=request.informed_by,
             )
 
-        return await run_with_deadlock_retry(_work)
+        result = await run_with_deadlock_retry(_work)
+        # Post-commit emit (Bug 7): see _handle_single for the
+        # rationale. The typed endpoint is a thin wrapper; emission
+        # timing follows the same rule.
+        _emit_activity_success(
+            user=user,
+            dossier_id=dossier_id,
+            act_def=act_def,
+            activity_id=activity_id,
+        )
+        return result
 
     # FastAPI uses function name for route uniqueness. Strip the
     # colon from the name since it's invalid in Python identifiers.
@@ -397,6 +460,45 @@ def _resolve_plugin_and_def(
     )
 
 
+def _emit_activity_success(
+    *,
+    user: User,
+    dossier_id: UUID,
+    act_def: dict,
+    activity_id: UUID,
+) -> None:
+    """Emit the success audit event for one activity execution.
+
+    Extracted from ``_run_activity`` for Bug 7 fix: the event must
+    fire *after* the DB transaction has committed, not during the
+    transactional work. Callers invoke this only after
+    ``run_with_deadlock_retry`` has returned success; on rollback or
+    deadlock-retry this function is never called, so the audit log
+    never claims an activity that didn't commit.
+
+    The action name is derived from the activity definition:
+    ``can_create_dossier: true`` (the entry-point activity, e.g.
+    ``dienAanvraagIn``) emits ``dossier.created``; everything else
+    emits ``dossier.updated``. The distinction matters to SIEM rules
+    that track dossier lifecycle.
+
+    Best-effort emission: ``emit_dossier_audit`` never raises, so a
+    misbehaving audit sink cannot invalidate a committed DB
+    transaction. See ``dossier_engine.audit`` for the log-sink
+    contract.
+    """
+    is_root = bool(act_def.get("can_create_dossier"))
+    action = "dossier.created" if is_root else "dossier.updated"
+    emit_dossier_audit(
+        action=action,
+        user=user,
+        dossier_id=dossier_id,
+        outcome="allowed",
+        activity_type=act_def.get("name"),
+        activity_id=str(activity_id),
+    )
+
+
 async def _run_activity(
     *,
     repo: Repository,
@@ -421,24 +523,24 @@ async def _run_activity(
     that all three endpoints repeat — the engine takes plain dicts,
     not Pydantic models.
 
-    Also the chokepoint for audit emission on writes: every activity
-    execution emits exactly one audit event here. The two success
-    actions (`dossier.created` for root, `dossier.updated` otherwise)
-    differ by whether the activity is marked as dossier-creating in
-    its workflow YAML — `can_create_dossier: true` means it's the
-    entry-point activity that spawns a new dossier row (e.g.
-    `dienAanvraagIn`). On authorization denial (`ActivityError` with
-    code 403), we emit `dossier.denied` so SIEM sees both read-side
-    denials (from `routes/access.py`) and write-side denials (from
-    here) in one stream. Non-authorization errors (validation, 422,
-    etc.) are not audited — those belong in the application log /
-    Sentry, not the SIEM audit trail.
+    Audit emission on writes:
+
+    * **Denial path** (``ActivityError`` with code 403) emits
+      ``dossier.denied`` directly here, in-transaction. This is
+      correct on rollback: the denial decision *is* the auditable
+      fact; whether the transaction rolled back or committed doesn't
+      change that. The denial event reflects that the user attempted
+      the action and was refused — independent of any DB state.
+    * **Success path** does NOT emit here. The caller invokes
+      ``_emit_activity_success`` after ``run_with_deadlock_retry``
+      returns success, so the audit event fires only once per
+      committed activity (not per deadlock-retry attempt, and never
+      for an item that was part of a batch that later rolled back).
+
+    Non-authorization errors (validation, 422, etc.) are not audited
+    — those belong in the application log / Sentry, not the SIEM
+    audit trail.
     """
-    from ..audit import emit_dossier_audit
-
-    is_root = bool(act_def.get("can_create_dossier"))
-    action = "dossier.created" if is_root else "dossier.updated"
-
     try:
         result = await execute_activity(
             plugin=plugin,
@@ -461,26 +563,32 @@ async def _run_activity(
         # routes/access.py. Non-403 errors (validation, business rule
         # violations) are NOT audited — those are app-level concerns,
         # not security events.
-        code = getattr(e, 'code', None)
-        if code == 403:
+        #
+        # This emit happens in-transaction, which is correct: the
+        # denial decision is the auditable fact regardless of whether
+        # downstream DB work rolls back. A 403 means no material DB
+        # writes happened yet anyway — ``authorize`` runs before
+        # ``resolve_used`` / ``process_generated`` / ``persistence``
+        # in ``execute_activity``.
+        #
+        # Attribute names: ``ActivityError`` stores ``status_code`` and
+        # ``detail`` (see ``engine/errors.py``). Earlier versions of
+        # this code read ``code`` and ``message`` via getattr-with-
+        # default, which silently returned ``None`` for every denial —
+        # meaning write-side ``dossier.denied`` events had never
+        # reached the SIEM at all. Fixed under Bug 77; the regression
+        # test in ``TestAuditEmitIsPostCommit.test_denial_still_emits_in_transaction``
+        # pins the emit path and the attribute names.
+        if e.status_code == 403:
             emit_dossier_audit(
                 action="dossier.denied",
                 user=user,
                 dossier_id=dossier_id,
                 outcome="denied",
-                reason=getattr(e, 'message', str(e)),
+                reason=str(e.detail),
                 activity_type=act_def.get("name"),
                 activity_id=str(activity_id),
             )
         raise activity_error_to_http(e)
 
-    # Success. One audit event per committed activity.
-    emit_dossier_audit(
-        action=action,
-        user=user,
-        dossier_id=dossier_id,
-        outcome="allowed",
-        activity_type=act_def.get("name"),
-        activity_id=str(activity_id),
-    )
     return result

@@ -614,3 +614,263 @@ class TestPutActivityTypedWrapper:
         assert r.status_code in (403, 404)  # depends on resolution order
         # Ensure it's NOT a 405 (route not registered)
         assert r.status_code != 405
+
+
+# --------------------------------------------------------------------
+# Bug 7 — audit emit must be post-commit
+# --------------------------------------------------------------------
+#
+# Before the fix, `_run_activity` emitted `dossier.created` /
+# `dossier.updated` in-transaction, before the outer
+# `run_with_deadlock_retry` commit. On rollback (a mid-batch failure)
+# the audit log still claimed the failed items succeeded; on deadlock-
+# retry the log claimed each retried item twice or more. After the
+# fix, emission happens after `run_with_deadlock_retry` returns — so
+# the audit log is only written for items that actually committed,
+# and exactly once per committed activity.
+#
+# Denial emits (`dossier.denied` on ActivityError.code=403) stay where
+# they are — the denial decision is the auditable fact regardless of
+# whether the surrounding transaction commits. Pin that too so a
+# future refactor doesn't accidentally defer denials.
+
+
+class TestAuditEmitIsPostCommit:
+
+    async def test_successful_single_emits_exactly_one_success_event(
+        self, activity_client, repo, monkeypatch,
+    ):
+        """Happy path: a single successful activity produces exactly
+        one `dossier.created` (or `.updated`) audit event. Pin the
+        happy-path count so a regression that double-emits or
+        drops-emits would fail here."""
+        import dossier_engine.routes.activities as activities_mod
+        captured: list[dict] = []
+        monkeypatch.setattr(
+            activities_mod, "emit_dossier_audit",
+            lambda **kwargs: captured.append(kwargs),
+        )
+
+        await _commit(repo)
+        activity_id = uuid4()
+        ref, _, _ = _new_ref("oe:aanvraag")
+        r = await activity_client.put(
+            f"/dossiers/{D1}/activities/{activity_id}",
+            json={
+                "type": "createStuff",
+                "workflow": "testwf",
+                "generated": [
+                    {"entity": ref, "content": {"titel": "ok"}},
+                ],
+            },
+            headers={"X-POC-User": "aanvrager"},
+        )
+        assert r.status_code == 200
+
+        # Exactly one success event. createStuff has
+        # can_create_dossier=True so the action is 'dossier.created'.
+        successes = [
+            c for c in captured if c.get("outcome") == "allowed"
+        ]
+        assert len(successes) == 1
+        assert successes[0]["action"] == "dossier.created"
+        assert successes[0]["activity_id"] == str(activity_id)
+
+    async def test_batch_rollback_emits_no_success_events(
+        self, activity_client, repo, monkeypatch,
+    ):
+        """Bug 7 core regression: a batch where the second item
+        fails rolls back the whole transaction — including the
+        successful first item's DB effects. The audit log must
+        reflect reality: zero success events. Before the fix, the
+        first item's `dossier.created` was already on disk by the
+        time the second raised, so the log claimed an item that
+        never committed."""
+        import dossier_engine.routes.activities as activities_mod
+        captured: list[dict] = []
+        monkeypatch.setattr(
+            activities_mod, "emit_dossier_audit",
+            lambda **kwargs: captured.append(kwargs),
+        )
+
+        await _commit(repo)
+        aanvraag_ref, _, _ = _new_ref("oe:aanvraag")
+        r = await activity_client.put(
+            f"/dossiers/{D1}/activities",
+            json={
+                "workflow": "testwf",
+                "activities": [
+                    {
+                        "activity_id": str(uuid4()),
+                        "type": "createStuff",
+                        "generated": [
+                            {"entity": aanvraag_ref, "content": {"titel": "first"}},
+                        ],
+                    },
+                    {
+                        # Second item fails — `used` references a
+                        # version that doesn't exist, so resolve_used
+                        # raises 422. The transaction rolls back,
+                        # including the first createStuff's effects.
+                        "activity_id": str(uuid4()),
+                        "type": "readStuff",
+                        "role": "oe:behandelaar",
+                        "used": [
+                            {"entity": f"oe:aanvraag/{uuid4()}@{uuid4()}"},
+                        ],
+                        "generated": [],
+                    },
+                ],
+            },
+            headers={"X-POC-User": "behandelaar"},
+        )
+        assert r.status_code == 422
+
+        # The whole batch rolled back. No success audit events
+        # should have been emitted — not for the first item, not
+        # for anything. Zero is the correct answer; any other
+        # value means the audit log is lying about committed work.
+        successes = [
+            c for c in captured if c.get("outcome") == "allowed"
+        ]
+        assert successes == [], (
+            f"expected no success emits on rollback, got: "
+            f"{[s.get('activity_id') for s in successes]}"
+        )
+
+    async def test_batch_success_emits_one_event_per_committed_item(
+        self, activity_client, repo, monkeypatch,
+    ):
+        """Happy batch of two: exactly two success events, one per
+        committed activity. Pins the count so a refactor that
+        skipped per-item emission (e.g. emitting once for the
+        whole batch) would fail here."""
+        import dossier_engine.routes.activities as activities_mod
+        captured: list[dict] = []
+        monkeypatch.setattr(
+            activities_mod, "emit_dossier_audit",
+            lambda **kwargs: captured.append(kwargs),
+        )
+
+        await _commit(repo)
+        aanvraag_ref, _, vid = _new_ref("oe:aanvraag")
+        beslissing_ref, _, _ = _new_ref("oe:beslissing")
+        first_aid = uuid4()
+        second_aid = uuid4()
+        r = await activity_client.put(
+            f"/dossiers/{D1}/activities",
+            json={
+                "workflow": "testwf",
+                "activities": [
+                    {
+                        "activity_id": str(first_aid),
+                        "type": "createStuff",
+                        "generated": [
+                            {"entity": aanvraag_ref, "content": {"titel": "ok"}},
+                        ],
+                    },
+                    {
+                        "activity_id": str(second_aid),
+                        "type": "readStuff",
+                        "role": "oe:behandelaar",
+                        "used": [{"entity": aanvraag_ref}],
+                        "generated": [
+                            {"entity": beslissing_ref, "content": {"oordeel": "yes"}},
+                        ],
+                    },
+                ],
+            },
+            headers={"X-POC-User": "behandelaar"},
+        )
+        assert r.status_code == 200
+
+        successes = [
+            c for c in captured if c.get("outcome") == "allowed"
+        ]
+        assert len(successes) == 2
+        emitted_aids = {s["activity_id"] for s in successes}
+        assert emitted_aids == {str(first_aid), str(second_aid)}
+        # Action names derive from can_create_dossier: createStuff is
+        # the root (can_create_dossier=True → dossier.created);
+        # readStuff is not (→ dossier.updated).
+        by_aid = {s["activity_id"]: s["action"] for s in successes}
+        assert by_aid[str(first_aid)] == "dossier.created"
+        assert by_aid[str(second_aid)] == "dossier.updated"
+
+    async def test_denial_still_emits_in_transaction(
+        self, activity_client, repo, monkeypatch,
+    ):
+        """Denial emits (ActivityError code=403) stay where they
+        are inside `_run_activity`, in-transaction. The denial
+        decision is the auditable fact; rollback doesn't change
+        that. Pin this so a future refactor doesn't accidentally
+        defer denials and leave a 403 un-audited for the SIEM
+        stream.
+
+        Bootstrap: create the dossier via createStuff as aanvrager
+        so readStuff has a valid dossier + used entity to work
+        against. The monkeypatch is installed AFTER the bootstrap
+        so the setup activity's emit doesn't pollute the capture —
+        we're only measuring the denial path.
+        """
+        import dossier_engine.routes.activities as activities_mod
+
+        await _commit(repo)
+        # Bootstrap — createStuff as aanvrager creates the dossier
+        # and generates an oe:aanvraag that readStuff can `use`.
+        aanvraag_ref, _, _ = _new_ref("oe:aanvraag")
+        bootstrap_r = await activity_client.put(
+            f"/dossiers/{D1}/activities/{uuid4()}",
+            json={
+                "type": "createStuff",
+                "workflow": "testwf",
+                "generated": [
+                    {"entity": aanvraag_ref, "content": {"titel": "x"}},
+                ],
+            },
+            headers={"X-POC-User": "aanvrager"},
+        )
+        assert bootstrap_r.status_code == 200
+
+        # Install the capture AFTER bootstrap so we only observe
+        # the denial attempt's emits.
+        captured: list[dict] = []
+        monkeypatch.setattr(
+            activities_mod, "emit_dossier_audit",
+            lambda **kwargs: captured.append(kwargs),
+        )
+
+        # readStuff requires oe:behandelaar; outsider has no roles
+        # → authorize() raises ActivityError(code=403) → dossier.denied.
+        beslissing_ref, _, _ = _new_ref("oe:beslissing")
+        r = await activity_client.put(
+            f"/dossiers/{D1}/activities/{uuid4()}",
+            json={
+                "type": "readStuff",
+                "workflow": "testwf",
+                "used": [{"entity": aanvraag_ref}],
+                "generated": [
+                    {"entity": beslissing_ref, "content": {"uitkomst": "x"}},
+                ],
+            },
+            headers={"X-POC-User": "outsider"},
+        )
+        assert r.status_code == 403
+
+        denials = [c for c in captured if c.get("outcome") == "denied"]
+        successes = [c for c in captured if c.get("outcome") == "allowed"]
+        assert len(denials) == 1
+        assert denials[0]["action"] == "dossier.denied"
+        # Pin that the `reason` field carries the real authorize
+        # message, not a default-fallback string. Before Bug 77 was
+        # fixed, the code read ``getattr(e, 'code', None)`` and
+        # ``getattr(e, 'message', str(e))`` on an ``ActivityError`` —
+        # neither attribute exists, so ``code`` was always ``None``
+        # (emit skipped) and ``reason`` would have been ``str(e)``
+        # (uninformative). Asserting a substring of the authorize
+        # message catches any regression where the attribute names
+        # drift again.
+        assert "behandelaar" in denials[0]["reason"]
+        # And no spurious success events.
+        assert successes == []
+
