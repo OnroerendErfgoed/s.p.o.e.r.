@@ -56,7 +56,7 @@ roles:
 entity_types:
   - type: "oe:aanvraag"
     cardinality: "single"     # one per dossier
-    schema: "my_workflow.entities.Aanvraag"
+    model: "my_workflow.entities.Aanvraag"
 
 activities:
 
@@ -632,15 +632,15 @@ Then use them anywhere a qualified type goes — entity types, relations, activi
 entity_types:
   - type: "oe:aanvraag"          # your own ontology
     cardinality: multiple
-    schema: "my_workflow.entities.Aanvraag"
+    model: "my_workflow.entities.Aanvraag"
 
   - type: "foaf:Person"           # adopted from FOAF
     cardinality: multiple
-    schema: "my_workflow.entities.Person"
+    model: "my_workflow.entities.Person"
 
   - type: "dcterms:BibliographicResource"   # adopted from Dublin Core
     cardinality: multiple
-    schema: "my_workflow.entities.Document"
+    model: "my_workflow.entities.Document"
 
 relations:
   - type: "oe:betreft"

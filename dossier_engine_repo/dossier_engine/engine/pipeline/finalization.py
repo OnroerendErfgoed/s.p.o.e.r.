@@ -49,7 +49,7 @@ async def run_pre_commit_hooks(state: ActivityState) -> None:
 
     Reads:  state.plugin.pre_commit_hooks, state.repo, state.dossier_id,
             state.plugin, state.activity_def, state.generated,
-            state.used_rows, state.user
+            state.used_rows_by_ref, state.user
     Writes: nothing directly (hooks may call state.repo themselves)
     Raises: whatever the hook raises (typically ActivityError)
     """

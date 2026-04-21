@@ -854,6 +854,19 @@ async def _worker_loop_body(session_factory, registry, shutdown, poll_interval: 
     the top-level orchestration (config load, DB init, Sentry init,
     signal wiring, top-level try/except)."""
 
+    # Track whether we've ever successfully polled. Before the first
+    # successful poll, we tolerate "schema not ready" errors as a
+    # startup-race condition (Bug 75): when the worker is launched
+    # concurrently with the app, and the app is the process that
+    # runs Alembic migrations at startup, there's a window where
+    # the worker polls and the tables don't exist yet. Rather than
+    # crashing and needing an external supervisor to restart us,
+    # we just sleep and retry. After the first successful poll, any
+    # subsequent UndefinedTableError is a real bug — tables don't
+    # disappear — and we let it propagate to the top-level crash
+    # handler.
+    schema_ready = False
+
     while not shutdown.is_set():
         # Inner drain loop — keep claiming and executing one task at
         # a time until _claim_one_due_task returns None (nothing
@@ -866,34 +879,57 @@ async def _worker_loop_body(session_factory, registry, shutdown, poll_interval: 
             task_for_failure_path: EntityRow | None = None
             failure: Exception | None = None
 
-            async with session_factory() as session:
-                async with session.begin():
-                    task = await _claim_one_due_task(session)
-                    if task is None:
-                        break  # nothing claimable — leave the drain loop
+            try:
+                async with session_factory() as session:
+                    async with session.begin():
+                        task = await _claim_one_due_task(session)
+                        if task is None:
+                            schema_ready = True  # poll worked, even if empty
+                            break  # nothing claimable — leave the drain loop
 
-                    try:
-                        await _execute_claimed_task(session, task, registry)
-                        processed_this_cycle += 1
-                    except Exception as e:
-                        # Capture the exception so we can handle it in a
-                        # fresh transaction below. The `async with
-                        # session.begin()` will roll back this transaction
-                        # on the way out because we're re-raising — no,
-                        # wait, we don't want to re-raise, we want the
-                        # transaction to roll back cleanly and then handle
-                        # failure separately. Do that by catching here
-                        # and remembering the task + exception, then
-                        # exiting the inner `begin()` block by falling
-                        # through to the end of the `with`. That commits
-                        # the (empty) transaction, which is fine because
-                        # _claim_one_due_task only did a SELECT.
-                        logger.error(
-                            f"Task {task.id} execution failed: {e}",
-                            exc_info=True,
-                        )
-                        task_for_failure_path = task
-                        failure = e
+                        schema_ready = True  # claim worked; tables exist
+                        try:
+                            await _execute_claimed_task(session, task, registry)
+                            processed_this_cycle += 1
+                        except Exception as e:
+                            # Capture the exception so we can handle it in a
+                            # fresh transaction below. The `async with
+                            # session.begin()` will roll back this transaction
+                            # on the way out because we're re-raising — no,
+                            # wait, we don't want to re-raise, we want the
+                            # transaction to roll back cleanly and then handle
+                            # failure separately. Do that by catching here
+                            # and remembering the task + exception, then
+                            # exiting the inner `begin()` block by falling
+                            # through to the end of the `with`. That commits
+                            # the (empty) transaction, which is fine because
+                            # _claim_one_due_task only did a SELECT.
+                            logger.error(
+                                f"Task {task.id} execution failed: {e}",
+                                exc_info=True,
+                            )
+                            task_for_failure_path = task
+                            failure = e
+            except Exception as claim_exc:
+                # Separate handling for claim-phase failures (the
+                # `task = await _claim_one_due_task(...)` call above).
+                # The startup-race case is the important one: during
+                # the window between worker launch and migrations
+                # completing in the app process, ``entities`` doesn't
+                # exist and the SELECT raises UndefinedTableError.
+                # Sleep and try again rather than crashing the loop.
+                if not schema_ready and _is_missing_schema_error(claim_exc):
+                    logger.warning(
+                        "Worker poll: schema not ready yet "
+                        "(likely waiting for migrations); will retry",
+                    )
+                    # Break out of the drain loop and fall through to
+                    # the normal poll-interval sleep. Another iteration
+                    # of the outer loop will retry.
+                    break
+                # Not a startup race — real problem. Let the top-level
+                # crash handler in worker_loop see it.
+                raise
 
             # If execution failed, record the failure in a fresh
             # transaction. The original session/transaction from the
@@ -940,6 +976,35 @@ async def _worker_loop_body(session_factory, registry, shutdown, poll_interval: 
             await asyncio.wait_for(shutdown.wait(), timeout=poll_interval)
         except asyncio.TimeoutError:
             pass
+
+
+def _is_missing_schema_error(exc: BaseException) -> bool:
+    """Return True if ``exc`` is Postgres' ``undefined_table``
+    (SQLSTATE 42P01).
+
+    We check via the standard SQLSTATE rather than matching on the
+    error message text, which varies across locales and versions.
+    SQLAlchemy wraps the asyncpg exception in ``DBAPIError``; the
+    original exception is reachable via ``.orig`` (and, in some
+    driver/wrapper combinations, via ``__cause__``).
+
+    Returning True here during startup means "ignore the error, try
+    again after the poll interval." It must stay tightly scoped —
+    any wider and we'd mask real data-integrity bugs as "schema
+    not ready."
+    """
+    # Local import so this module doesn't become a hard dependency
+    # on SQLAlchemy's exception hierarchy if callers import it
+    # without having used the engine yet.
+    from sqlalchemy.exc import DBAPIError
+
+    if not isinstance(exc, DBAPIError):
+        return False
+    for candidate in (getattr(exc, "orig", None), exc.__cause__):
+        sqlstate = getattr(candidate, "sqlstate", None)
+        if sqlstate == "42P01":
+            return True
+    return False
 
 
 async def _select_dead_lettered_tasks(
