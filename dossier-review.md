@@ -10,15 +10,15 @@
 
 | Status | Count | Items |
 |---|---|---|
-| ✅ Fixed & verified | 23 | Bugs 1, 2, 5, 6, 7, 12, 15, 16, 17, 30, 32, 44, 47, 64, 65, 68, 70, 72 (coverage), 73, 74, 75, 76, 77 + Obs-2 (duplicate "external") |
+| ✅ Fixed & verified | 24 | Bugs 1, 2, 5, 6, 7, 12, 15, 16, 17, 30, 32, 44, 47, 55, 64, 65, 68, 70, 72 (coverage), 73, 74, 75, 76, 77 + Obs-2 (duplicate "external") |
 | 🔍 Investigated, not a bug | 1 | Bug 14 — cross-dossier refs are `type=external` rows |
 | 🛑 Deferred / accepted | 4 | Bug 31 (RRN acceptable), Bug 45 (MinIO migration), Bug 63 (403 is correct HTTP), Bug 71 (test activities, deploy-time removal) |
-| 🧪 Test suite | **783/783** passing | engine 722, toelatingen 22, file_service 21, common/signing 18 |
+| 🧪 Test suite | **785/785** passing | engine 724, toelatingen 22, file_service 21, common/signing 18 |
 | 🏃 `test_requests.sh` | **25/25 OK, exit 0, zero deadlocks, zero worker crashes** | D1–D9 green |
 | ✂️ Duplication closed | **D1, D2, D4, D22, D25** | Graph-loader consolidation + audit-emit wrapper |
 | 🧰 Harnesses installed | **3** | Guidebook YAML lint + phase-docstring lint + CI shell-spec wrapper |
 | 🤖 CI wired | **GitHub Actions** | `.github/workflows/ci.yml` — 4 jobs: pytest, shell-spec, doc-harnesses, migrations-append-only |
-| 📦 Pending | ~55 bugs + 57 obs + 22 dups + 5 meta (partial relief) | See below |
+| 📦 Pending | ~54 bugs + 57 obs + 22 dups + 5 meta (partial relief) | See below |
 
 Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfaced and fixed in the same session as the harness that surfaced it.
 
@@ -44,7 +44,7 @@ Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfac
 | ~~44~~ | 5 | ~~File service falls back to `temp/file_id` regardless of `dossier_id`.~~ | ✅ |
 | 🛑 45 | 5 | Deferred — MinIO migration handles it. |  |
 | ~~47~~ | 5 | ~~Upload tokens dossier-agnostic.~~ | ✅ |
-| 55 | 5 | `lineage.find_related_entity` doesn't filter by `dossier_id` defensively. |  |
+| ~~55~~ | 5 | ~~`lineage.find_related_entity` doesn't filter by `dossier_id` defensively.~~ | ✅ **Fixed in Round 19.** Guard added at per-activity loop entry: walker loads the activity, compares `activity_row.dossier_id` against its scope argument, and short-circuits before querying the activity's generated/used entities if the dossier doesn't match. Repo helpers (`get_entities_generated_by_activity`, `get_used_entities_for_activity`, `get_activity`) got scoping-contract docstrings making the trust boundary explicit. **The return value was already None for cross-dossier edges (line-87 scope check on `get_latest_entity_by_id`), so this is genuine defense in depth — pre-fix the walk happened but the return stayed safe; post-fix the walk is refused at the traversal layer.** 2 regression tests spy on repo helper calls rather than asserting on return value, so a future regression that removes the guard would go red. |
 | 57 | 6 | `routes/entities.py` three endpoints skip `inject_download_urls`. |  |
 | 58 | 6 | `POST /{workflow}/validate/{name}` has no authentication. |  |
 | 62 | 6 | `/entities/{type}/{eid}/{vid}` doesn't verify `entity_id` matches. |  |
@@ -513,11 +513,45 @@ Use `user` when asking "who is doing this thing right now?" Use `triggering_user
 
 **Process note on scope discipline.** This round took 6 turns end-to-end — the bulkiest fix in the engagement, not because Bug 30 itself was hard (~30 lines in the end) but because the audit emit required a distributed plumbing refactor across the engine and worker. The lesson is that **when a bug fix's audit/attribution story requires user context, walk every `ActivityContext` construction site before estimating the scope** — that check would have told me up-front this was "fix + refactor", not just "fix", and the scope conversation would have happened earlier. I surfaced this after Phase 2 and the user made an informed call to ship the full plumbing; the surfacing was the right move but should have happened during verify-before-plan rather than mid-execution.
 
+### Round 19 — Bug 55 (lineage walker cross-dossier defense in depth) + stale-migration postmortem
+
+Verify-before-plan confirmed Bug 55's framing: `lineage.find_related_entity` walks PROV edges (`generated_by`, `used`, `informed_by_activity_id`) across the activity graph but doesn't check that each visited activity belongs to the walker's dossier scope. In normal operation nothing ever points cross-dossier — PROV edges are created within a single scope — but if a data integrity violation or PROV manipulation ever produced one, the walker would follow it, query the foreign activity's generated/used entities, and form a candidate set. The single existing scope defense, at line 87's `get_latest_entity_by_id(dossier_id, ...)`, would reject the final return; so pre-fix, **no actual data leak surfaces to the caller**, but the walk itself traversed cross-dossier data (wasted queries at best, a confirmation-timing side channel at worst).
+
+User picked **option A + docstrings**: guard at the walker, plus tightened docstrings on the three activity-id-only repo helpers so the trust boundary is explicit for future callers.
+
+**Fix shape:**
+- `lineage.py` — in the per-activity loop, `repo.get_activity(activity_id)` is loaded first (was previously lazy-loaded only when the `informed_by` path needed it), its `dossier_id` is compared against the walker's scope argument, and a mismatch short-circuits with `continue` — before `get_entities_generated_by_activity` or `get_used_entities_for_activity` runs. One extra query per visited node in the happy path (the `informed_by` lookup is now folded in rather than being a second query); zero change for the cross-dossier rejection path.
+- `lineage.py` module docstring — new "Intra-dossier by construction" semantics bullet explicitly documenting the guard and its defense-in-depth rationale.
+- `db/models.py` — `get_activity`, `get_entities_generated_by_activity`, `get_used_entities_for_activity` each got a "scoping contract" docstring paragraph stating that the helper queries by activity-id alone and that callers traversing PROV edges from untrusted sources must check dossier scope separately. Cheaper than changing signatures, and future readers of the helpers see the constraint inline.
+
+**Tests (2 new) — pinning traversal, not return value.** First pass at the regression tests asserted only `result is None`. Both tests passed with the guard present *and* with the guard temporarily reverted — because the pre-existing line-87 scope check was doing the work. Caught via the paranoia check (revert the fix, rerun the tests; if they still pass, they're not pinning the right thing). Rewrote both tests to spy on `get_entities_generated_by_activity` / `get_used_entities_for_activity` via `monkeypatch` and assert the walker never queries the cross-dossier activity id. With the guard removed, both tests now fail with a clean assertion pointing at the exact foreign activity id that got queried; with the guard present, they pass.
+
+This is the test-design lesson the round surfaces: **for defense-in-depth fixes, asserting on user-visible behaviour (return value) is not enough when another layer already provides some defense — the test has to pin the new layer's behaviour directly.** Worth making this standard practice going forward. Baking in a "revert the fix, rerun the tests, confirm they go red" step for any defense-in-depth regression test would have caught this on the first pass rather than on the paranoia check.
+
+**Scope disciplined — no refactor creep.** The wider option (B: push `dossier_id` filtering into the repo helpers themselves) would have touched every caller of those three helpers throughout the engine. Resisted; the lineage walker is the only caller that *traverses* foreign activity ids, so it's the only caller that needed the guard. The docstrings carry the contract forward for any future caller that joins the traversal pattern.
+
+**Stale-migration postmortem (carried in from the CI investigation across Rounds 18-19 boundary).** Round 18's final CI run exposed a shell-spec failure: `DuplicateColumnError: column "uri" of relation "agents" already exists` from `ALTER TABLE agents ADD COLUMN uri TEXT`, with Round 16's `_run_alembic_migrations` correctly refusing to start on rc=1. Initial hypothesis chain (worker race on empty schema → autogenerate drift → something emitting ALTER we can't find) was wrong in all cases. The actual cause, confirmed by the user after inspecting their local branch: **stale migration version files on the CI branch**. A prior cleanup had retroactively inlined the `uri` column into the initial `create_table('agents', ...)` call (legitimate consolidation), but the delta migration that originally added `uri` was never removed from `alembic/versions/` — so Alembic's `upgrade head` ran both, hit the ALTER, and crashed on the duplicate column.
+
+**Gap in existing tooling.** Round 8's append-only guard catches **mutation** of existing migration files (Bug 68's original shape). It does not catch **stale leftover files** from consolidation work — from Alembic's perspective the file is still a valid revision in the chain; nothing in the file itself looks wrong. The only signal is that the DDL fails at runtime. Two follow-ups worth considering, both filed as Obs-58 (new):
+
+1. **CI preflight** — run `alembic upgrade head` against a fresh Postgres before the shell-spec job, with the expectation of rc=0. Same mechanism the production `_run_alembic_migrations` uses, just separated into a dedicated CI step so migration failures fail fast and distinctly from application failures. Would have turned Round 18's CI failure into a clearer "migration broken" signal instead of a 30-second timeout on dossier_app startup.
+2. **Static consistency check** — cross-reference each migration's DDL against the union of prior migrations' DDL; flag any `op.add_column('X', 'Y', ...)` where an earlier migration's `op.create_table('X', ..., Column('Y', ...))` already declares the column. Harder to write correctly (migrations can rename, drop, re-add) but would catch the stale-file shape without a live DB.
+
+Not blocking; filed as an observation rather than a bug because the append-only guard isn't broken, it just has a narrow scope that this case falls outside of.
+
+**Verification — Round 19:**
+- Engine: **717 passed + 7 Sentry-skipped** (was 715; +2 Bug 55 tests)
+- Toelatingen / common / file_service unchanged at 22 / 18 / 21.
+- **785 total** (was 783).
+- Shell spec green: 25 OK, D1-D9, zero tracebacks. Per-activity guard adds one `get_activity` call per visited node; no observable latency impact on D1-D9.
+
 ### Where to go next (in priority order)
 
-1. **Bug 55 — `lineage.find_related_entity` doesn't filter by `dossier_id` defensively.** Continues the severity-first walk through open must-fix bugs. Security-adjacent (defense in depth against cross-dossier lineage leaks). Verify still open first.
-2. **Remaining open "must-fix" bugs** — 57, 58, 62 in number order.
+1. **Bug 57 — `routes/entities.py` three endpoints skip `inject_download_urls`.** Continues the severity-first walk through open must-fix bugs. Presentation-layer bug (file downloads break for these specific endpoints); verify still open + identify which three endpoints before planning.
+2. **Remaining open "must-fix" bugs** — 58, 62 in number order.
+3. **Obs-58 (new)** — CI migration preflight and/or static migration consistency check. Tractable as a dedicated small round after the remaining must-fixes close.
 
-The two "optional" items previously on this list remain closed:
-- **Obs-3** (write-on-change for `set_dossier_access`) — deferred by product decision. Keeping the full provenance graph is intended behaviour, not a pending optimization. Filed alongside Bugs 31/45/71 under deferred/accepted.
-- **Bug 63 follow-up** (enumeration alerting) — not an application concern. The `dossier.denied` stream already carries everything needed; dashboard + alert rule is a Wazuh config task, owned by SIEM operators.
+The three "optional" items previously on this list remain closed:
+- **Obs-3** (write-on-change for `set_dossier_access`) — deferred by product decision.
+- **Bug 63 follow-up** (enumeration alerting) — owned by SIEM operators, not an application concern.
+- Default worker-schema-retry loop behaviour — already present (see the "Worker poll: schema not ready yet" WARN in Round 19's shell-spec log), no action needed.

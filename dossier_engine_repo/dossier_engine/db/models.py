@@ -300,6 +300,14 @@ class Repository:
     # --- Activity ---
 
     async def get_activity(self, activity_id: UUID) -> Optional[ActivityRow]:
+        """Return an activity row by id, or None if not found.
+
+        Scoping contract: activity-id-only lookup; does NOT filter by
+        dossier. Callers that reach this helper via a PROV traversal
+        (``informed_by_activity_id``, ``generated_by``, etc.) must
+        check the returned row's ``dossier_id`` against their own
+        scope if the traversal could cross dossier boundaries.
+        """
         return await self.session.get(ActivityRow, activity_id)
 
     async def get_activities_for_dossier(self, dossier_id: UUID) -> list[ActivityRow]:
@@ -576,7 +584,18 @@ class Repository:
     async def get_entities_generated_by_activity(
         self, activity_id: UUID
     ) -> list[EntityRow]:
-        """Return all entities whose `generated_by` points at this activity."""
+        """Return all entities whose `generated_by` points at this activity.
+
+        Scoping contract: this helper queries by ``activity_id`` alone
+        and does NOT filter by dossier. Callers are responsible for
+        ensuring the activity belongs to the dossier they intend to
+        operate on. Every PROV edge is created within a single dossier
+        scope, so in normal operation this is free — but code that
+        *traverses* activity IDs from untrusted inputs (e.g. the
+        lineage walker resolving ``informed_by_activity_id``, or any
+        future caller walking PROV graphs from client-supplied refs)
+        must verify dossier scope separately before calling this.
+        """
         result = await self.session.execute(
             select(EntityRow)
             .where(EntityRow.generated_by == activity_id)
@@ -587,7 +606,12 @@ class Repository:
     async def get_used_entities_for_activity(
         self, activity_id: UUID
     ) -> list[EntityRow]:
-        """Return the full EntityRow objects used by an activity."""
+        """Return the full EntityRow objects used by an activity.
+
+        Scoping contract: same as
+        ``get_entities_generated_by_activity`` above — this query is
+        activity-id-only, callers must ensure dossier scope themselves.
+        """
         result = await self.session.execute(
             select(EntityRow)
             .join(UsedRow, UsedRow.entity_id == EntityRow.id)

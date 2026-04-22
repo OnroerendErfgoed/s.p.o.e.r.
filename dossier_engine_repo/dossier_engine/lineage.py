@@ -31,6 +31,15 @@ Semantics:
   to walk from) or if the max_hops budget is exhausted.
 * Returns the start entity itself if `start_entity.type == target_type`
   (trivial case, no walk needed).
+* **Intra-dossier by construction.** The walker refuses to traverse
+  any activity whose `dossier_id` differs from the `dossier_id`
+  argument. In normal operation this never triggers — PROV edges
+  are created within a single dossier scope — but the check is
+  defense-in-depth against data integrity violations or PROV
+  manipulation that would otherwise let the walker leak a
+  confirmation signal about another dossier's activity graph.
+  Cross-dossier references (`informed_by_uri`) are separately
+  not walkable from within one repository scope.
 """
 
 from __future__ import annotations
@@ -72,6 +81,31 @@ async def find_related_entity(
                 continue
             visited_activities.add(activity_id)
 
+            # Defense-in-depth: refuse to traverse activities from a
+            # different dossier. In normal operation the walker never
+            # encounters one — entity and activity rows are always
+            # created within a single dossier scope — but if a data
+            # integrity violation, PROV manipulation, or future refactor
+            # bug ever produced a cross-dossier edge, the walker would
+            # traverse into it and (at best) waste queries checking
+            # entities we'd never return, (at worst) leak a confirmation
+            # signal about another dossier's activity graph. Failing
+            # closed at the activity level — not just at the final
+            # ``get_latest_entity_by_id(dossier_id, ...)`` scope check
+            # (line below) — keeps the walker intra-dossier by
+            # construction, not by post-hoc filter.
+            #
+            # Concretely: ``get_entities_generated_by_activity`` and
+            # ``get_used_entities_for_activity`` are activity-id-only
+            # queries (see their docstrings — "caller is responsible
+            # for scoping to a known dossier"). This is the caller
+            # that the docstring contract is about.
+            activity_row = await repo.get_activity(activity_id)
+            if activity_row is None:
+                continue
+            if activity_row.dossier_id != dossier_id:
+                continue
+
             # What did this activity touch? generated + used.
             generated = await repo.get_entities_generated_by_activity(activity_id)
             used = await repo.get_used_entities_for_activity(activity_id)
@@ -83,6 +117,10 @@ async def find_related_entity(
                 entity_ids = {e.entity_id for e in candidates}
                 if len(entity_ids) == 1:
                     # Return the current latest version of this entity_id.
+                    # The scope check above means this query is guaranteed
+                    # to be for an entity in ``dossier_id`` — the
+                    # ``dossier_id`` argument here is belt-and-braces,
+                    # not the primary defense.
                     return await repo.get_latest_entity_by_id(
                         dossier_id, candidates[0].entity_id,
                     )
@@ -96,10 +134,10 @@ async def find_related_entity(
             # (b) Through the informed_by chain — only same-dossier.
             # Cross-dossier references (informed_by_uri) can't be walked
             # from within one repository scope; the lineage walker is
-            # intra-dossier by design.
-            activity_row = await repo.get_activity(activity_id)
-            if (activity_row is not None
-                    and activity_row.informed_by_activity_id is not None):
+            # intra-dossier by design. The dossier-scope check at the
+            # top of the loop will reject any informed_by_activity_id
+            # that somehow points cross-dossier.
+            if activity_row.informed_by_activity_id is not None:
                 next_frontier.append(activity_row.informed_by_activity_id)
 
         frontier = next_frontier
