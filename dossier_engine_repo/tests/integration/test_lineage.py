@@ -9,9 +9,12 @@ Branches:
 * Target found at first hop (in the generating activity's scope)
 * Target found after two hops (through used entity's generator)
 * Ambiguous result (two distinct entity_ids of target type at
-  one activity) → return None
+  one activity) → **raise ``LineageAmbiguous``** (Bug 54, Round 25;
+  previously returned None, conflating ambiguity with not-found)
 * Max hops exhausted → return None
 * Target not found anywhere → return None
+* High-fan-in graph → frontier stays bounded, walk terminates
+  correctly (Bug 53, Round 25)
 """
 from __future__ import annotations
 
@@ -188,21 +191,133 @@ class TestFindRelatedEntity:
         assert result is not None
         assert result.entity_id == aanvraag_eid
 
-    async def test_ambiguous_returns_none(self, repo):
-        """Activity A generates TWO distinct aanvraag entities
+    async def test_ambiguous_raises_lineage_ambiguous(self, repo):
+        """Bug 54: activity A generates TWO distinct aanvraag entities
         and one beslissing. Start from beslissing, target is
-        aanvraag. Two distinct entity_ids → ambiguous → None."""
+        aanvraag. Two distinct entity_ids → ``LineageAmbiguous`` raised
+        (not silently None-returned as before the fix).
+
+        The exception must carry the activity_id where ambiguity
+        was detected plus the full set of candidate entity_ids, so
+        operators investigating the resulting log line can find the
+        offending data."""
+        from dossier_engine.lineage import LineageAmbiguous
+
         boot = await _bootstrap(repo)
         act_a = await _make_activity(repo, "a")
-        await _make_entity(repo, act_a, "oe:aanvraag")
-        await _make_entity(repo, act_a, "oe:aanvraag")
+        eid_a1, _ = await _make_entity(repo, act_a, "oe:aanvraag")
+        eid_a2, _ = await _make_entity(repo, act_a, "oe:aanvraag")
         _, beslissing_vid = await _make_entity(repo, act_a, "oe:beslissing")
+
+        start_row = await repo.get_entity(beslissing_vid)
+
+        with pytest.raises(LineageAmbiguous) as exc_info:
+            await find_related_entity(
+                repo, D1, start_row, "oe:aanvraag",
+            )
+
+        # Exception must identify the where + the what — this is the
+        # triage affordance Bug 54 was filed to add.
+        exc = exc_info.value
+        assert exc.activity_id == act_a
+        assert exc.target_type == "oe:aanvraag"
+        assert set(exc.candidate_entity_ids) == {eid_a1, eid_a2}
+        # Message should be informative enough to search a log for.
+        msg = str(exc)
+        assert "oe:aanvraag" in msg
+        assert str(act_a) in msg
+
+    async def test_not_found_still_returns_none_after_bug54(self, repo):
+        """Bug 54 regression (negative side): changing ambiguous to
+        raise must NOT change the not-found contract. All four
+        "no result" cases — exhausted frontier, max_hops, root
+        entity, no generated_by — must still return None. Pin the
+        first two; the trivial cases are covered elsewhere in this
+        class.
+
+        Why both: if the fix accidentally converted all Nones to
+        exceptions, the caller's 'proceed unanchored' path would
+        stop working. These tests ensure 'no result' stays a
+        quiet None return, distinct from the noisy raise."""
+        # No-match case: walker exhausts the frontier with no target.
+        boot = await _bootstrap(repo)
+        act_a = await _make_activity(repo, "a")
+        _, vid = await _make_entity(repo, act_a, "oe:beslissing")
+
+        start_row = await repo.get_entity(vid)
+        result = await find_related_entity(
+            repo, D1, start_row, "oe:completely_different_type",
+        )
+        assert result is None
+
+    async def test_bug53_high_fan_in_walk_still_correct(self, repo):
+        """Bug 53 sanity test — not a regression test for the fix.
+
+        The Bug 53 fix is a pure micro-optimization: change the
+        frontier from ``list`` to ``set``, dedup activities at append
+        time. It does NOT change behaviour; the walker's visited-set
+        already guaranteed correctness. What it changes is frontier
+        memory growth: without the fix, a high-fan-in diamond puts
+        the same ancestor activity in ``next_frontier`` N times
+        (once per path); the dedup bounds the frontier to the number
+        of distinct unvisited activities.
+
+        This test is therefore a **sanity check**, not a proper
+        regression test — it confirms the walk resolves correctly
+        on a high-fan-in graph, but does NOT assert anything the
+        un-fixed code would fail. We tried writing a regression
+        test that would go red on revert and could not find an
+        assertion shape that pinned the dedup without coupling to
+        internal state (monkey-patching frontier type, spying on
+        set-vs-list behaviour). Rather than ship a weak test that
+        pretends to pin the fix, we document the honest situation
+        here: the paranoia check (Round 19 practice) caught that
+        this test passed with the fix reverted, so we downgraded
+        its docstring rather than let it masquerade as a regression
+        gate. The fix itself is described in the walker's module
+        docstring + inline comments so a future reader reverting
+        it would have to do so deliberately, not by accident.
+
+        High-fan-in fixture:
+          * root_act generates shared_entity AND target aanvraag
+          * act_1..act_5 each USE shared_entity, generate mid_entity
+          * final_act USES all 5 mid_entities, generates beslissing
+
+        Walk from beslissing → eventually reaches root_act → finds
+        aanvraag. Both with and without the dedup fix, this works."""
+        boot = await _bootstrap(repo)
+
+        # root_act generates the shared ancestor entity + the target aanvraag
+        root_act = await _make_activity(repo, "root")
+        aanvraag_eid, aanvraag_vid = await _make_entity(
+            repo, root_act, "oe:aanvraag",
+        )
+        shared_eid, shared_vid = await _make_entity(
+            repo, root_act, "oe:shared",
+        )
+
+        # 5 mid activities, each using the shared entity.
+        mid_vids = []
+        for i in range(5):
+            mid_act = await _make_activity(repo, f"mid_{i}")
+            await repo.create_used(mid_act, shared_vid)
+            _, mid_vid = await _make_entity(repo, mid_act, f"oe:mid_{i}")
+            mid_vids.append(mid_vid)
+        await repo.session.flush()
+
+        # final_act uses ALL 5 mid entities.
+        final_act = await _make_activity(repo, "final")
+        for mv in mid_vids:
+            await repo.create_used(final_act, mv)
+        _, beslissing_vid = await _make_entity(repo, final_act, "oe:beslissing")
+        await repo.session.flush()
 
         start_row = await repo.get_entity(beslissing_vid)
         result = await find_related_entity(
             repo, D1, start_row, "oe:aanvraag",
         )
-        assert result is None
+        assert result is not None
+        assert result.entity_id == aanvraag_eid
 
     async def test_max_hops_exhausted_returns_none(self, repo):
         """Build a chain deeper than max_hops and verify the

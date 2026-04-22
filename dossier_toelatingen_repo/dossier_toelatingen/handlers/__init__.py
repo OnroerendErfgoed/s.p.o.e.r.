@@ -312,20 +312,52 @@ async def _build_trekAanvraag_task(context: ActivityContext) -> dict | None:
     builder so behaviour stays identical. Resolves the anchor entity
     (via used, then via lineage walk from the beslissing) and reads
     the deadline days from plugin constants.
+
+    Bug 54 (Round 25) behaviour: if the lineage walk detects ambiguity
+    (beslissing lineage touches multiple distinct aanvragen at one
+    activity — a structural signal that shouldn't happen in
+    well-formed data), log a WARNING with the candidate entity IDs
+    and proceed with an unanchored task. This is intentionally
+    permissive — the task still goes out, just without an anchor —
+    because crashing the activity on a structural-data anomaly is
+    too strong a response for the one caller that exists today.
+    Operators get a log line to triage from. Stricter callers should
+    let ``LineageAmbiguous`` propagate.
     """
+    import logging
     from datetime import datetime, timezone, timedelta
-    from dossier_engine.lineage import find_related_entity
+    from dossier_engine.lineage import find_related_entity, LineageAmbiguous
+
+    _logger = logging.getLogger(__name__)
 
     aanvraag_row = context.get_used_row("oe:aanvraag")
     if aanvraag_row is None:
         beslissing_row = context.get_used_row("oe:beslissing")
         if beslissing_row is not None:
-            aanvraag_row = await find_related_entity(
-                context.repo,
-                context.dossier_id,
-                beslissing_row,
-                "oe:aanvraag",
-            )
+            try:
+                aanvraag_row = await find_related_entity(
+                    context.repo,
+                    context.dossier_id,
+                    beslissing_row,
+                    "oe:aanvraag",
+                )
+            except LineageAmbiguous as exc:
+                # Operators: a beslissing's lineage reached an activity
+                # that touched >1 distinct aanvraag. The task still
+                # goes out unanchored; the underlying data anomaly
+                # needs human triage. Log enough context to find it.
+                _logger.warning(
+                    "trekAanvraagIn task: lineage ambiguous for "
+                    "beslissing %s in dossier %s — activity %s "
+                    "touched %d aanvragen (%s). Proceeding with "
+                    "unanchored task.",
+                    beslissing_row.entity_id,
+                    context.dossier_id,
+                    exc.activity_id,
+                    len(exc.candidate_entity_ids),
+                    exc.candidate_entity_ids,
+                )
+                aanvraag_row = None
 
     anchor_entity_id = str(aanvraag_row.entity_id) if aanvraag_row else None
 

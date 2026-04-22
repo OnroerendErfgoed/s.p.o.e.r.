@@ -10,16 +10,16 @@
 
 | Status | Count | Items |
 |---|---|---|
-| ✅ Fixed & verified | 30 | Bugs 1, 2, 5, 6, 7, 12, 15, 16, 17, 30, 32, 44, 47, 55, 56, 57, 58, 62, 64, 65, 66, 68, 69, 70, 72 (coverage), 73, 74, 75, 76, 77 + Obs-2 (duplicate "external") |
+| ✅ Fixed & verified | 32 | Bugs 1, 2, 5, 6, 7, 12, 15, 16, 17, 30, 32, 44, 47, 53, 54, 55, 56, 57, 58, 62, 64, 65, 66, 68, 69, 70, 72 (coverage), 73, 74, 75, 76, 77 + Obs-2 (duplicate "external") |
 | 🔍 Investigated, not a bug | 1 | Bug 14 — cross-dossier refs are `type=external` rows |
 | 🛑 Deferred / accepted | 4 | Bug 31 (RRN acceptable), Bug 45 (MinIO migration), Bug 63 (403 is correct HTTP), Bug 71 (test activities, deploy-time removal) |
-| 🧪 Test suite | **794/794** passing | engine 733, toelatingen 22, file_service 21, common/signing 18 |
+| 🧪 Test suite | **800/800** passing | engine 735, toelatingen 26, file_service 21, common/signing 18 |
 | 🏃 `test_requests.sh` | **25/25 OK, exit 0, zero deadlocks, zero worker crashes** | D1–D9 green |
 | ✂️ Duplication closed | **D1, D2, D4, D22, D25** | Graph-loader consolidation + audit-emit wrapper |
 | 🧰 Harnesses installed | **3** | Guidebook YAML lint + phase-docstring lint + CI shell-spec wrapper |
 | 🤖 CI wired | **GitHub Actions** | `.github/workflows/ci.yml` — 4 jobs: pytest, shell-spec, doc-harnesses, migrations-append-only |
 | 🎯 Must-fix walk | **Complete** | All 17 fixable must-fix bugs closed; the 5 open rows are deferred/investigated by product decision (Bugs 14, 31, 45, 63, 71) |
-| 📦 Pending | 28 should-fix + 16 lower-priority bugs + 30 observations + 21 dups + 5 meta (partial relief) | See below |
+| 📦 Pending | 26 should-fix + 16 lower-priority bugs + 29 observations + 21 dups + 5 meta (partial relief) | See below |
 
 Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfaced and fixed in the same session as the harness that surfaced it.
 
@@ -83,8 +83,8 @@ Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfac
 | 46 | 5 | `POST /files/upload/request` accepts unbounded `request_body: dict`. |  |
 | 48 | 5 | `.meta` filename not sanitized. |  |
 | 50 | 5 | Migration fallback uses module-level `SYSTEM_ACTION_DEF` with bare name. |  |
-| 53 | 5 | `lineage.find_related_entity` frontier growth unbounded. |  |
-| 54 | 5 | `lineage.find_related_entity` returns `None` for both "not found" and "ambiguous". |  |
+| ~~53~~ | 5 | ~~`lineage.find_related_entity` frontier growth unbounded.~~ | ✅ **Fixed in Round 25 (Cat 4 lineage walker completion).** Frontier changed from `list[UUID]` to `set[UUID]`, append-time dedup against `visited_activities`. Bounds memory by "activities not yet visited" (≤ dossier's activity count) rather than "paths taken through the graph." Micro-optimization, not a correctness change — the pre-existing `visited_activities` guard already prevented incorrect reprocessing. Sanity test in `test_lineage.py::test_bug53_high_fan_in_walk_still_correct` confirms high-fan-in walks still resolve correctly; **no behaviour-observable regression test exists** for the memory bound itself (see Round 25 writeup on why that's the honest disposition). |
+| ~~54~~ | 5 | ~~`lineage.find_related_entity` returns `None` for both "not found" and "ambiguous".~~ | ✅ **Fixed in Round 25 (Cat 4 lineage walker completion).** New `LineageAmbiguous(Exception)` raised when a visited activity touches >1 distinct `entity_id` of the target type; the exception carries the ambiguous activity_id + candidate entity_ids for operator triage. Not-found/root/exhausted cases still return `None` — these share a "no anchor available" outcome at the callsite. Sole production caller (`_build_trekAanvraag_task` in toelatingen plugin) updated to catch `LineageAmbiguous`, emit a WARNING log carrying the triage info, and proceed with an unanchored task. 4 caller-side tests in new `test_build_trekAanvraag_task.py`, plus updated `test_ambiguous_raises_lineage_ambiguous` in walker tests. |
 | ~~56~~ | 6 | ~~README claims externals in both `used`/`generated` allowed; code + test reject.~~ | ✅ **Fixed in Round 24 (Cat 1 doc-fix batch).** README section D5 rewritten to correctly describe externals as rejected the same way local overlaps are — with a `kind: "external"` payload instead of `kind: "local"`. Verified against `invariants.enforce_used_generated_disjoint` and `test_invariants.py::test_external_overlap_by_uri`. Cross-refs Obs 69 (marked closed). |
 | 59 | 6 | Unregistered validators silently skip. |  |
 | 60 | 6 | `alembic/env.py` nested `asyncio.run()` hazard. |  |
@@ -166,7 +166,7 @@ The structural sweep catalogued observations clustering into five themes. **Coun
 - **Obs 63 — `"behandelaar"` role review.** Back-compat `"behandelaar"` role needs an owner + removal deadline. **Closed** in Round 11 (confirmed actively used by `workflow.yaml:71, 80, 89, 304, 391, 724, 755` authorization entries — legitimate global-staff role, not legacy).
 - **Obs 64 — `systemAction` sub-types.** Introduce `oe:migrationAction`, `oe:requeueAction`, `oe:retryAction`. **Open.**
 - **Obs 65 — Document `systeemgebruiker` role grants + `caller_only: "system"` check.** **Open.**
-- **Obs 66 — Lineage walker completion** (covered by Bugs 53, 54). Needs per-walk cache + distinguishable "not found" vs "ambiguous" return. **Open.** Redundant with Bugs 53/54 in the should-fix table; Round 23 triage Category 4 schedules them together.
+- **Obs 66 — Lineage walker completion** (covered by Bugs 53, 54). ~~Needs per-walk cache + distinguishable "not found" vs "ambiguous" return.~~ **Closed** in Round 25 alongside Bugs 53/54. The per-walk cache framing turned out to be Bug 53 (frontier dedup via set-based data structure); the not-found vs ambiguous distinction is Bug 54 (new `LineageAmbiguous` exception). Both fixes shipped together as Cat 4 of the Round 23 triage.
 
 ### Documentation drift
 - **Obs 67 — Pipeline doc UPDATE-after-persistence claim.** ~~Pipeline doc's "UPDATE must happen after persistence" claim is factually wrong.~~ **Closed** in Round 24 (Cat 1 doc-fix batch). Reworded `docs/pipeline_architecture.md` phases 14/15 prose to describe the actual mechanism (`state.activity_row.computed_status` is an in-memory dirty-flag write on a session-tracked ORM object, flushed with the transaction — not a separate UPDATE statement).
@@ -204,7 +204,7 @@ The structural sweep catalogued observations clustering into five themes. **Coun
 - **Obs 93 — Pipeline-architecture-doc ActivityState hazard enforcement.** **Closed** in Round 8 (harness 3 enforces it).
 - **Obs 94 — Migration consistency checks.** Filed in Round 19 CI postmortem (was provisionally numbered "Obs-58" at the time, renumbered here to avoid collision with the new Obs 58). Round 8's append-only guard catches **mutation** of existing migration files (Bug 68's original shape) but not **stale leftover files** from consolidation work — stale versions pass the append-only check yet fail at `alembic upgrade head`. Candidate follow-ups: CI migration preflight job (runs `alembic upgrade head` against a fresh Postgres; fails the build on rc≠0), or static consistency check scanning for redundant DDL across migration files. **Open.**
 
-**Observation totals:** 45 catalogued, Obs 50-94. **13 closed** (Obs 61, 63, 67, 68, 69, 70, 71, 72, 73, 74, 83, 90, 93), **1 partially addressed** (Obs 52), **1 deferred by product decision** (Obs 84), **30 open**. Three of the remaining open observations are explicitly redundant with bugs (Obs 66 ↔ Bugs 53/54; Obs 80 ↔ Bug 25; Obs 81 ↔ Bug 38) — the bug tables are authoritative for those; obs entries are cross-references. Round 24 closed six observations in the Cat 1 doc-fix batch, three of which were redundant with Bugs 56/66/69 (now also closed in the Should-fix table). Most of the non-redundant open ones are not acute — the pattern is "code works today but will decay without attention."
+**Observation totals:** 45 catalogued, Obs 50-94. **14 closed** (Obs 61, 63, 66, 67, 68, 69, 70, 71, 72, 73, 74, 83, 90, 93), **1 partially addressed** (Obs 52), **1 deferred by product decision** (Obs 84), **29 open**. Two of the remaining open observations are explicitly redundant with bugs (Obs 80 ↔ Bug 25; Obs 81 ↔ Bug 38) — the bug tables are authoritative for those; obs entries are cross-references. Round 24 closed six observations in the Cat 1 doc-fix batch, three of which were redundant with Bugs 56/66/69; Round 25 closed Obs 66 alongside Bugs 53/54. Most of the non-redundant open ones are not acute — the pattern is "code works today but will decay without attention."
 
 ## Duplication targets (27 catalogued, 6 closed)
 
@@ -721,7 +721,7 @@ Bug 55 (Round 19) did the cross-dossier defense. The lineage walker has two more
 - **Bug 53** — frontier growth unbounded.
 - **Bug 54** — returns None for both "not found" and "ambiguous" — caller can't distinguish.
 
-**Verdict: one round, both together.** They share the walker's state machine; fixing them in one pass means one coherent "lineage walker completion" round with regression tests for both semantics.
+**Verdict: one round, both together.** ✅ **Shipped in Round 25.** Bug 53 fixed via `list→set` frontier + dedup-on-add; Bug 54 fixed via new `LineageAmbiguous` exception with the sole production caller (`_build_trekAanvraag_task`) updated to catch + log + proceed unanchored. Obs 66 closed alongside. Test suite grew 794→800 (+4 caller tests, +2 lineage tests, -2 weak Bug-53 tests downgraded to 1 sanity test — see Round 25 writeup on why).
 
 ##### Category 5 — Plugin-surface tightening (medium, needs design)
 
@@ -798,17 +798,17 @@ Items that are **duplicates across tables** and should be merged:
 | Priority | Category | Approach | Estimated rounds |
 |---|---|---|---|
 | ✅ Done | Cat 1 — Doc-only fixes | batch-fix | 1 (shipped Round 24) |
-| 1 | Cat 4 — Lineage walker completion (Bugs 53, 54) | one coherent round | 1 |
-| 2 | Cat 3 — Caching & perf | batch-fix | 1-2 |
-| 3 | Cat 2 — Small-surface behaviour fixes | cherry-pick, sev-first | 4-6 |
-| 4 | Cat 7 — Test/deployment polish | cherry-pick | 2-3 |
-| 5 | Cat 5 — Plugin-surface (needs design first) | discussion + fix rounds | 1 design + 2-4 fix |
+| ✅ Done | Cat 4 — Lineage walker completion (Bugs 53, 54) | one coherent round | 1 (shipped Round 25) |
+| 1 | Cat 3 — Caching & perf | batch-fix | 1-2 |
+| 2 | Cat 2 — Small-surface behaviour fixes | cherry-pick, sev-first | 4-6 |
+| 3 | Cat 7 — Test/deployment polish | cherry-pick | 2-3 |
+| 4 | Cat 5 — Plugin-surface (needs design first) | discussion + fix rounds | 1 design + 2-4 fix |
 | — | Cat 6, 8, 9 | defer with revisit trigger | 0 scheduled |
 | — | Cat 10 | reconciliation done via Round 24's cross-refs | complete |
 
-**Total scheduled work across categories 2-5 + 7:** ~9-13 rounds, plus Cat 5's design discussion. Cat 1 closed in Round 24.
+**Total scheduled work across categories 2-5 + 7:** ~8-12 rounds, plus Cat 5's design discussion. Cat 1 closed in Round 24, Cat 4 closed in Round 25.
 
-**The "top-of-queue" question** — if we're picking the next one — is **Cat 4 (lineage walker, Bugs 53+54)**. It completes a defense-in-depth suite started in Round 19 (Bug 55's cross-dossier check) and is one coherent round. Alternatively Cat 3 (caching/perf batch) if you'd rather knock out several small wins in one pass. Either is a reasonable next step; Cat 4 finishes a thread, Cat 3 starts clearing the perf cluster.
+**The "top-of-queue" question** — if we're picking the next one — is **Cat 3 (caching & perf batch)**. Five related items (Bug 38 + Obs 75/76/77/78) sharing the same "cache what's expensively re-computed" pattern; one coherent batch-round gives a single set of benchmarks + cache-invariants documentation as the deliverable. Alternatively Cat 2 cherry-picks if you'd rather tackle user-visible behaviour bugs one at a time (top-4 are Bugs 9, 20, 27, 28).
 
 ### Round 24 — Observation numbering + Cat 1 doc-fix batch
 
@@ -835,3 +835,63 @@ Two deliverables: comprehensive observation-numbering pass (the "Obs N" labels w
 **Totals after Round 24:** 30 bugs fixed (was 27) — Bugs 56, 66, 69 added to the closed column. Should-fix table: 28 open + 13 closed (was 31 open + 10 closed). Observations: 30 open + 13 closed + 1 partial + 1 deferred = 45 total (was 35 open + 7 closed + 1 + 1 = 44 listed, one added via Obs 94 renumbering). Lower-priority and Must-fix tables unchanged.
 
 **Process note worth capturing for future rounds.** Two Cat 1 items (Obs 67, Obs 68) turned out to involve factual code-doc mismatches that had been mis-summarized in the review itself. Obs 67 was "UPDATE must happen after persistence" — but the real issue is that there's no UPDATE; the doc had invented a mechanism that didn't exist. Obs 68 was "⅓ of fields documented, presented as complete" — but the table also contained a `computed_status` row that referred to a field that doesn't exist on `ActivityState`. In both cases the observation's one-line summary was less wrong than the doc it described, and "fixing the doc" meant more than textual change — it meant reading the code carefully enough to describe the actual behaviour. **Takeaway: doc-fix rounds should verify-before-plan the same way behaviour-fix rounds do.** Read the code, understand what the doc is supposed to describe, then write. The "doc-only" framing can mask the real work, which is re-establishing ground truth.
+
+### Round 25 — Bugs 53 + 54 (lineage walker completion)
+
+Cat 4 from the Round 23 triage. Two bugs in the same file, same state machine: Bug 53 (frontier growth unbounded) and Bug 54 (`None` conflates not-found with ambiguous). Closed together as one coherent round — shared verify-before-plan, shared test-file edits, shared caller update.
+
+**Verify-before-plan.** Read `lineage.py::find_related_entity` end-to-end before writing anything. Two observations from the read that shaped the fix:
+1. Bug 53 is **not a correctness bug.** The existing `visited_activities` set guards against reprocessing — duplicates in the frontier cause wasted loop iterations but no incorrect results. What's wasted is memory (frontier size grows O(paths) instead of O(nodes)) and the occasional harmless iteration of the visited-check-then-continue path. Severity 5 is right for the resource concern, but the fix has no behaviour-observable effect on a correct implementation.
+2. Bug 54's current None-return is used by exactly one production caller (`_build_trekAanvraag_task` in the toelatingen plugin). That caller treats `None` as "no anchor available, task goes out unanchored." Changing the return contract to distinguish ambiguous from not-found has to thread through to that caller — which turns a "lineage walker fix" into "lineage walker + caller fix."
+
+**Shape decision for Bug 54.** Three options considered in-round: (A) raise a custom exception on ambiguity, (B) return a tagged union/sentinel, (C) return `(Optional[EntityRow], reason: str)` tuple. Picked **A** for minimum-change reasons — the happy-path return type stays `Optional[EntityRow]`, no callers need updating for the common case, and callers who want the old "silently drop" behaviour can catch the exception. Downside: `LineageAmbiguous` is a new type to learn, and forgetting to catch it anywhere it could fire would propagate the exception further than intended. Weighed vs the explicit-reason-code option (C) — C is more debuggable but requires every caller to unwrap the tuple. Given only one caller exists, A is cleaner.
+
+**Caller-side decision.** `_build_trekAanvraag_task` sits in a task-builder hook during the activity pipeline. Letting `LineageAmbiguous` propagate would crash the activity (roll back the beslissing because we couldn't decide which aanvraag to anchor a trekAanvraag task to) — too strong a response for a structural-data anomaly that doesn't block the beslissing's correctness. Instead: catch it, emit a WARNING log with the activity_id + candidate entity_ids (the triage affordance Bug 54 was filed to add), proceed with an unanchored task. Operators get the signal; the workflow keeps running. Stricter callers in the future can let it propagate.
+
+**Fixes shipped:**
+- `lineage.py` — `frontier` and `next_frontier` changed from `list[UUID]` to `set[UUID]`; `.append(...)` → `.add(...)` with `not in visited_activities` guards at append time (Bug 53). New `LineageAmbiguous(Exception)` class carrying `activity_id` + `target_type` + `candidate_entity_ids`; `return None  # ambiguous` replaced with `raise LineageAmbiguous(...)` (Bug 54). Module docstring rewritten to document both the new contract and the frontier-management semantics.
+- `handlers/__init__.py::_build_trekAanvraag_task` — wrapped the `find_related_entity` call in `try/except LineageAmbiguous`, added `_logger = logging.getLogger(__name__)`, emits warning on ambiguity, proceeds unanchored.
+
+**Test work, with honest self-report.** This section captures a process failure that the paranoia check caught mid-round, because the lesson it produced is worth more than the fix itself.
+
+First-pass regression tests (2 for Bug 53, 1 for Bug 54 replacement + 1 for not-found negative case):
+- `test_ambiguous_raises_lineage_ambiguous` — asserts `pytest.raises(LineageAmbiguous)` with the right attributes carried on the exception.
+- `test_not_found_still_returns_none_after_bug54` — asserts None still returns for the "no match in graph" case (pins the negative side of Bug 54's contract split).
+- `test_bug53_frontier_deduplicated_high_fan_in` (original form) — built a high-fan-in diamond graph, asserted correctness of the resolved aanvraag.
+- `test_bug53_no_match_high_fan_in_terminates` (original form) — same fixture, no target present, asserted None return.
+
+When I wrote the two Bug 53 tests I included a comment inside one of them: *"wait — re-read: the `continue` is ABOVE the get_activity call. So visited still short-circuits. The real savings are memory + loop iterations, not DB. Either way, result correctness is what matters most."* I knew at write-time that the tests were weak. Shipped them anyway.
+
+**Paranoia check (Round 19 practice: revert the fix, confirm tests go red).** Reverted both fixes via targeted string-replacement in `lineage.py`, reran the suite. Result:
+- ✅ `test_ambiguous_raises_lineage_ambiguous` — red as expected (`DID NOT RAISE`). Bug 54 fix pinned correctly.
+- ❌ `test_bug53_frontier_deduplicated_high_fan_in` — **still green** without the fix.
+- ❌ `test_bug53_no_match_high_fan_in_terminates` — **still green** without the fix.
+
+Exactly what my comment had said would happen: the dedup only changes memory growth, which my tests didn't measure. Both Bug 53 tests were theatre.
+
+**What I did about it (mid-round, before shipping):**
+1. Deleted `test_bug53_no_match_high_fan_in_terminates` entirely (redundant with existing no-match tests anyway).
+2. Renamed `test_bug53_frontier_deduplicated_high_fan_in` to `test_bug53_high_fan_in_walk_still_correct` and rewrote its docstring to explicitly mark it as a **sanity test**, not a regression test. The docstring calls out that we tried to write a pinning test and couldn't find an assertion shape that wouldn't couple to internal state (monkeypatching frontier type, spying on `set` vs `list` behaviour), and documents the honest situation: the fix is described in the walker's module docstring + inline comments so a future reader reverting it would have to do so deliberately.
+3. Restored the fix; added the caller-side tests (which the paranoia check *did* catch — 1 of 4 red on caller-revert, healthy shape).
+
+**New lesson (additional to Round 19's paranoia-check + Round 21's test-docstring-states-what-it-pins):**
+
+> **Don't ship tests that you've already admitted are weak.**
+> If writing the test surfaces "I'm not sure this actually pins the fix," that doubt is the signal to either find an assertion shape that does pin it, or accept that the fix isn't behaviour-observable and document the disposition honestly rather than invent a ceremonial test.
+> The comment I wrote inside the original Bug 53 test (acknowledging the test was weak) was not a substitute for acting on it. If the paranoia check hadn't caught it, a weak test would have lived in the suite forever, pretending to guard Bug 53, making the next reviewer think the regression was covered when it wasn't.
+
+This extends Round 21's practice ("test docstrings state what they pin AND what they don't") — in Round 21 the downgrade was real ("test pins A but not the stronger property B"). In Round 25 the downgrade is more severe ("this test pins nothing the fix actually changed"). Both are acceptable dispositions *if honestly documented*. What's not acceptable is shipping the test with a hopeful docstring that over-claims what it pins.
+
+**Bug 53's disposition is therefore:** fixed, with the fix itself documented in code; no regression test; sanity test confirms the walk still produces correct results on a high-fan-in graph (which it always did, since correctness was never the issue). This is the right answer — inventing a fake regression test would have been worse.
+
+**Verification — Round 25:**
+- Engine: **728 + 7 Sentry-skipped** (was 726 + 7). +1 new Bug 54 regression test (`test_ambiguous_raises_lineage_ambiguous`); +1 new not-found regression test (`test_not_found_still_returns_none_after_bug54`); +1 kept-as-sanity-test (downgraded from weak regression test); -1 removed (`test_ambiguous_returns_none` replaced by the raises-variant); -1 deleted (the second weak Bug 53 test). Net +2.
+- Toelatingen: **26 tests** (was 22; +4 new caller tests in `test_build_trekAanvraag_task.py` — 1 happy-path anchor, 1 walker-returns-None unanchor, 1 `LineageAmbiguous` caught-and-logged, 1 no-beslissing-no-walk). Paranoia-checked; reverted the try/except and 1 of 4 went red cleanly.
+- Common 18, file_service 21 unchanged. **Total 800 tests** across all packages.
+- Shell spec: 25 OK, D1-D9, zero tracebacks. Bug 53+54 aren't exercised by shell spec (no happy-path ambiguity scenarios in D1-D9); re-ran as a smoke test for "I didn't break anything adjacent."
+
+**Totals after Round 25:** 32 bugs fixed (was 30) — Bugs 53, 54 added. Should-fix table: 26 open + 15 closed (was 28 + 13). Observations: 14 closed + 29 open (was 13 + 30); Obs 66 flipped to closed as cross-ref to Bugs 53/54. Lower-priority and Must-fix tables unchanged.
+
+### Where to go next (post-Cat-4)
+
+Cat 3 (caching & perf batch) is my recommendation for Round 26 — Bug 38 + Obs 75/76/77/78, all sharing the "cache what's expensively re-computed" pattern. One coherent batch round.
