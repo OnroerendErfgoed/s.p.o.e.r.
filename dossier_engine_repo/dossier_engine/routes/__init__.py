@@ -93,6 +93,7 @@ def register_routes(
     _reference_routes.register(
         app,
         registry=registry,
+        get_user=get_user,
     )
 
     # Per-plugin search route factories (Elasticsearch-backed search

@@ -10,15 +10,15 @@
 
 | Status | Count | Items |
 |---|---|---|
-| ✅ Fixed & verified | 25 | Bugs 1, 2, 5, 6, 7, 12, 15, 16, 17, 30, 32, 44, 47, 55, 57, 64, 65, 68, 70, 72 (coverage), 73, 74, 75, 76, 77 + Obs-2 (duplicate "external") |
+| ✅ Fixed & verified | 26 | Bugs 1, 2, 5, 6, 7, 12, 15, 16, 17, 30, 32, 44, 47, 55, 57, 58, 64, 65, 68, 70, 72 (coverage), 73, 74, 75, 76, 77 + Obs-2 (duplicate "external") |
 | 🔍 Investigated, not a bug | 1 | Bug 14 — cross-dossier refs are `type=external` rows |
 | 🛑 Deferred / accepted | 4 | Bug 31 (RRN acceptable), Bug 45 (MinIO migration), Bug 63 (403 is correct HTTP), Bug 71 (test activities, deploy-time removal) |
-| 🧪 Test suite | **788/788** passing | engine 727, toelatingen 22, file_service 21, common/signing 18 |
+| 🧪 Test suite | **792/792** passing | engine 731, toelatingen 22, file_service 21, common/signing 18 |
 | 🏃 `test_requests.sh` | **25/25 OK, exit 0, zero deadlocks, zero worker crashes** | D1–D9 green |
 | ✂️ Duplication closed | **D1, D2, D4, D22, D25** | Graph-loader consolidation + audit-emit wrapper |
 | 🧰 Harnesses installed | **3** | Guidebook YAML lint + phase-docstring lint + CI shell-spec wrapper |
 | 🤖 CI wired | **GitHub Actions** | `.github/workflows/ci.yml` — 4 jobs: pytest, shell-spec, doc-harnesses, migrations-append-only |
-| 📦 Pending | ~53 bugs + 57 obs + 22 dups + 5 meta (partial relief) | See below |
+| 📦 Pending | ~52 bugs + 57 obs + 22 dups + 5 meta (partial relief) | See below |
 
 Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfaced and fixed in the same session as the harness that surfaced it.
 
@@ -46,7 +46,7 @@ Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfac
 | ~~47~~ | 5 | ~~Upload tokens dossier-agnostic.~~ | ✅ |
 | ~~55~~ | 5 | ~~`lineage.find_related_entity` doesn't filter by `dossier_id` defensively.~~ | ✅ **Fixed in Round 19.** Guard added at per-activity loop entry: walker loads the activity, compares `activity_row.dossier_id` against its scope argument, and short-circuits before querying the activity's generated/used entities if the dossier doesn't match. Repo helpers (`get_entities_generated_by_activity`, `get_used_entities_for_activity`, `get_activity`) got scoping-contract docstrings making the trust boundary explicit. **The return value was already None for cross-dossier edges (line-87 scope check on `get_latest_entity_by_id`), so this is genuine defense in depth — pre-fix the walk happened but the return stayed safe; post-fix the walk is refused at the traversal layer.** 2 regression tests spy on repo helper calls rather than asserting on return value, so a future regression that removes the guard would go red. |
 | ~~57~~ | 6 | ~~`routes/entities.py` three endpoints skip `inject_download_urls`.~~ | ✅ **Fixed in Round 20** — narrower scope than the bug title implies. Only the single-version endpoint (`GET /dossiers/{id}/entities/{type}/{eid}/{vid}`) got the injection; the two bulk endpoints (`/entities/{type}` and `/entities/{type}/{eid}`) deliberately do NOT inject, because they're inspection/revision-history shaped — clients follow up with a single-version fetch to actually download, and minting signed URLs across every file in every version is waste in the common case. Module docstring documents the deliberate asymmetry. If a future client needs URLs in the bulk responses the fix is the same per-entity inject call in the per-version loop. |
-| 58 | 6 | `POST /{workflow}/validate/{name}` has no authentication. |  |
+| ~~58~~ | 6 | ~~`POST /{workflow}/validate/{name}` has no authentication.~~ | ✅ **Fixed in Round 21.** Both validator endpoints (`GET /{workflow}/validate` list + `POST /{workflow}/validate/{name}` typed POST) now require `Depends(get_user)`. The reference-data endpoints in the same file deliberately stay public per product decision — "authenticated = fine" framing: auth is attack-surface reduction, not RBAC, so any authenticated user of any role may call the validators. Reference data is shared dropdown data that doesn't leak dossier state. Module docstring documents the split explicitly. |
 | 62 | 6 | `/entities/{type}/{eid}/{vid}` doesn't verify `entity_id` matches. |  |
 | 📝 63 | 7 | **Accepted — keep 403.** Enumeration via 403-vs-404 response-code differential flagged as a security concern. For this deployment the tradeoff falls on semantic correctness: dossier UUIDs are cryptographically random (128 bits of entropy), the system runs behind SSO, `dossier.denied` audit events fire on every 403 so probing shows up in SIEM, and HTTP-client tooling relies on correct status codes for caching / routing / retries. Collapsing 403 to 404 would break that contract to close a leak with negligible real-world impact in this environment. RFC 9110 §15.5.5 permits 404-for-hidden-existence but it's not the right default here. Enumeration detection is a Wazuh dashboard + alert-rule concern, not an application concern — the `dossier.denied` stream already carries everything Wazuh needs (actor, dossier, reason, timestamp). | Decided. |
 | ~~68~~ | 7 | ~~Initial-schema Alembic migration mutated retroactively.~~ | ✅ |
@@ -577,13 +577,41 @@ Process bake-in for future rounds: **before writing the fix, articulate the mini
 - **788 total** (was 785).
 - Shell spec green: 25 OK, D1-D9, zero tracebacks.
 
+### Round 21 — Bug 58 (validator endpoints unauthenticated) with narrow "authenticated = fine" framing
+
+Verify-before-plan confirmed: `routes/reference.py` registered four endpoints (all-reference-data, single-reference-list, list-validators, POST-validator), none carrying `Depends(get_user)`. Bug title names the POST validator specifically; in practice all four lacked auth.
+
+**Attack-surface analysis done before planning the fix.** The validators are pure, side-effect-free lookup oracles: `erfgoedobject` resolves a URI to `{label, type, gemeente}`; `handeling` maps type → allowed-handelingen set (and surfaces the full allowed-set in error messages on invalid input). Unauthenticated access lets a caller enumerate the inventaris URI space and the allowed-action mapping, and — in production where these back onto the real inventaris API — provides a DoS vector. No data modification, no dossier visibility bypass, no RBAC concerns.
+
+**Scope question surfaced and answered.** The reference-data endpoints share the file and the "unauthenticated" shape, so the natural scope-expansion question was "all four, or just the validate ones?" User picked validate-only: reference data is shared dropdown data (bijlagetypes, documenttypes, gemeenten), freely public by product decision. This is the third round running where asking the scope question up front paid off — Round 18 (ActivityContext plumbing) expanded scope mid-round and cost real rework; Round 20 (Bug 57) narrowed scope mid-edit; Round 21 got the scope settled before coding. **Baking the "articulate the minimum change first" step in is working.**
+
+**"Authenticated = fine" framing.** Product decision recorded in-round: any authenticated session may call the validators, regardless of role. Auth here is not RBAC (no per-validator role gates, no dossier scoping); it's attack-surface reduction — gating on "has a valid session" closes the unauthenticated enumeration / DoS surface without adding permission logic the use case doesn't need. The module docstring now documents this explicitly so future readers don't wonder whether role gates are missing.
+
+**Fix shipped:**
+- `routes/reference.py` imports `Depends`, `User`; `register()` signature takes `get_user` and threads it into both `_register_reference_routes` (for the `list_validators` GET only — reference endpoints in the same function stay untouched) and `_register_validator_route` (both Pydantic-bodied and dict-bodied endpoint closures get a `user: User = Depends(get_user)` parameter, with `user: User` added to `__annotations__` in the Pydantic-bodied branch so FastAPI's dependency resolution kicks in).
+- `routes/__init__.py` passes `get_user=get_user` to `_reference_routes.register(...)`.
+- Module docstring rewritten to document the split: reference endpoints public, validate endpoints auth-required, with the rationale for both positions.
+
+**Regression tests updated + added:**
+- The 8 existing `TestValidation` tests got a class-level `_AUTH = {"X-POC-User": "claeyswo"}` constant and pass it as `headers=self._AUTH` on every call. Any authenticated POC user works — role irrelevant — so claeyswo (a `beheerder` in the toelatingen workflow) serves as the "pick one arbitrary authenticated user" stand-in.
+- New `TestValidateRequiresAuth` class (4 tests): 401 on unauthenticated `GET /validate`, 401 on unauthenticated `POST /validate/{real_name}`, 401 on real-name + empty body (pins that auth fires **before** Pydantic body validation — otherwise the 422 vs 401 distinction would let an attacker learn that the validator name is real), plus a sanity guard that `/reference` and `/reference/{name}` stay public.
+
+**Mid-test scope pullback worth capturing.** First pass at the "enumeration resistance" test also claimed that `POST /validate/nonexistent_validator` must return 401, not 404 — the reasoning being that 401-vs-404 lets an attacker enumerate validator names. Turned out that's stronger than Bug 58 requires: FastAPI's route resolution happens *before* middleware, so `POST /.../nonexistent_validator` 404s before the auth middleware runs, and enforcing otherwise would need a catch-all handler or a route-resolution hack. Dropped the claim and added a paragraph in the test's docstring explaining what it does and does not pin. The "authenticated = fine" framing treats validator **names** as non-sensitive (the `GET /validate` list returns them to any authed user anyway); only the **oracle behaviour** is sensitive, and that's what the remaining assertions guard.
+
+**Paranoia check applied per Round 19-20 lesson, first pass.** Reverted the three `Depends(get_user)` additions in `reference.py` via scripted in-place edit, re-ran `TestValidateRequiresAuth`. 3 of 4 tests went red with clean assertions (200 where 401 expected on list-validators; 200 on unauthenticated POST; 422 on unauthenticated + empty body — the 422 is the Pydantic validator firing before the missing auth, which is exactly the ordering failure `test_post_validate_without_auth_even_for_bogus_inputs` was written to pin). The 4th test (`test_reference_stays_public`) correctly stayed green because it's a sanity-guard on a code path the revert didn't touch. Restored the fix; all 17 tests in the file pass. **The "3 of 4 red" pattern — guard tests going red while unrelated-path sanity tests stay green — is the healthy signal for a scoped fix.**
+
+**Verification — Round 21:**
+- Engine: **724 passed + 7 Sentry-skipped** (was 720; +4 Bug 58 regression tests).
+- Toelatingen / common / file_service unchanged at 22 / 18 / 21.
+- **792 total** (was 788).
+- Shell spec green: 25 OK, D1-D9, zero tracebacks. `test_requests.sh` doesn't exercise `/validate/*`, so the fix was confirmed to have zero happy-path impact by direct grep before running the harness.
+
 ### Where to go next (in priority order)
 
-1. **Bug 58 — `POST /{workflow}/validate/{name}` has no authentication.** Continues the severity-first walk through open must-fix bugs. Security-relevant (validation endpoint publicly callable; might leak schema information or be used as an oracle). Verify still open first.
-2. **Remaining open "must-fix" bug** — 62 (last one).
-3. **Obs-58** (migration consistency checks, carried over from Round 19) — tractable as a small dedicated round after 58/62 close.
+1. **Bug 62 — `/entities/{type}/{eid}/{vid}` doesn't verify `entity_id` matches.** Last open must-fix. Verify still open first: the URL segments `entity_id` and `version_id` together identify an entity version, but the single-version read endpoint only checks version_id and dossier+type; a mismatched `entity_id` in the URL might return the version anyway, which at minimum violates URL semantics and at worst provides a cross-reference leak. Severity 6.
+2. **Obs-58** (migration consistency checks, carried over from Round 19) — after Bug 62 closes.
 
 The three "optional" items previously on this list remain closed:
 - **Obs-3** (write-on-change for `set_dossier_access`) — deferred by product decision.
-- **Bug 63 follow-up** (enumeration alerting) — owned by SIEM operators, not an application concern.
+- **Bug 63 follow-up** (enumeration alerting) — owned by SIEM operators.
 - Default worker-schema-retry loop behaviour — already present.

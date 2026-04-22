@@ -88,9 +88,17 @@ class TestReferenceData:
 
 class TestValidation:
 
+    # Any authenticated user of any role can call these endpoints
+    # (Bug 58 decision — auth is for attack-surface reduction, not
+    # RBAC). Pick one of the toelatingen plugin's poc_users; the
+    # exact role doesn't matter.
+    _AUTH = {"X-POC-User": "claeyswo"}
+
     async def test_list_validators(self, activity_client):
         """GET /{workflow}/validate lists registered validators."""
-        r = await activity_client.get("/toelatingen/validate")
+        r = await activity_client.get(
+            "/toelatingen/validate", headers=self._AUTH,
+        )
         assert r.status_code == 200
         names = r.json()["validators"]
         assert "erfgoedobject" in names
@@ -101,6 +109,7 @@ class TestValidation:
         r = await activity_client.post(
             "/toelatingen/validate/erfgoedobject",
             json={"uri": "https://id.erfgoed.net/erfgoedobjecten/10001"},
+            headers=self._AUTH,
         )
         assert r.status_code == 200
         body = r.json()
@@ -114,6 +123,7 @@ class TestValidation:
         r = await activity_client.post(
             "/toelatingen/validate/erfgoedobject",
             json={"uri": "https://id.erfgoed.net/erfgoedobjecten/99999"},
+            headers=self._AUTH,
         )
         assert r.status_code == 200
         body = r.json()
@@ -125,6 +135,7 @@ class TestValidation:
         r = await activity_client.post(
             "/toelatingen/validate/erfgoedobject",
             json={"uri": "http://example.com/something"},
+            headers=self._AUTH,
         )
         assert r.status_code == 200
         body = r.json()
@@ -139,6 +150,7 @@ class TestValidation:
                 "erfgoedobject_uri": "https://id.erfgoed.net/erfgoedobjecten/10001",
                 "handeling": "restauratie",
             },
+            headers=self._AUTH,
         )
         assert r.status_code == 200
         assert r.json()["valid"] is True
@@ -151,6 +163,7 @@ class TestValidation:
                 "erfgoedobject_uri": "https://id.erfgoed.net/erfgoedobjecten/20001",
                 "handeling": "sloop_deel",
             },
+            headers=self._AUTH,
         )
         assert r.status_code == 200
         body = r.json()
@@ -163,6 +176,7 @@ class TestValidation:
         r = await activity_client.post(
             "/toelatingen/validate/nonexistent",
             json={},
+            headers=self._AUTH,
         )
         assert r.status_code == 404
 
@@ -172,8 +186,86 @@ class TestValidation:
         r = await activity_client.post(
             "/toelatingen/validate/erfgoedobject",
             json={},
+            headers=self._AUTH,
         )
         assert r.status_code == 422
         detail = r.json()["detail"]
         # FastAPI's validation error includes the field name.
         assert any("uri" in str(e.get("loc", "")) for e in detail)
+
+
+class TestValidateRequiresAuth:
+    """Bug 58 regression — the validator endpoints were unauthenticated
+    before this fix. An unauthenticated caller could hit them to
+    enumerate the inventaris URI space (``erfgoedobject``: URI →
+    label/type/gemeente) or the allowed-handelingen mapping
+    (``handeling``: invalid input surfaces the full allowed-set in
+    the error message). Requiring any authenticated session closes
+    that surface without adding role-based access control — the
+    decision recorded in the round was "authenticated = fine"
+    because these are field-level sanity checks any logged-in user
+    might legitimately call.
+
+    This class pins the 401 behaviour so a future regression that
+    drops the dependency goes red. Reference-data endpoints stay
+    public by product decision (see reference.py module docstring)
+    — tests for those *not* requiring auth live in
+    ``TestReferenceData`` above."""
+
+    async def test_list_validators_without_auth_returns_401(
+        self, activity_client,
+    ):
+        """GET /{workflow}/validate (validator list) requires auth."""
+        r = await activity_client.get("/toelatingen/validate")
+        assert r.status_code == 401
+
+    async def test_post_validate_without_auth_returns_401(
+        self, activity_client,
+    ):
+        """POST /{workflow}/validate/{name} requires auth. The 401
+        fires from the middleware before the Pydantic body model
+        validates, so even a malformed body reaches the auth gate
+        first — good for the "can't be used as oracle" story."""
+        r = await activity_client.post(
+            "/toelatingen/validate/erfgoedobject",
+            json={"uri": "https://id.erfgoed.net/erfgoedobjecten/10001"},
+        )
+        assert r.status_code == 401
+
+    async def test_post_validate_without_auth_even_for_bogus_inputs(
+        self, activity_client,
+    ):
+        """Auth must fire regardless of body shape — not after the
+        Pydantic validation runs, which would let an attacker
+        distinguish "route exists but unauthenticated" (401) from
+        "body failed validation" (422) and thereby enumerate
+        validator input schemas. Real validator name + empty body
+        must 401, not 422.
+
+        Note on what this test does NOT claim: it does not pin 401
+        for unknown validator names. FastAPI's route resolution
+        happens before middleware, so ``POST /.../nonexistent`` 404s
+        before the auth middleware runs. Knowing which validator
+        names exist is a weaker disclosure than what Bug 58 targets
+        (the oracle behaviour of actually running the validator);
+        the ``GET /validate`` endpoint also returns the list for
+        authenticated users. Enforcing name-level enumeration
+        resistance would require a catch-all handler or a route-
+        resolution hack, which is out of scope for Bug 58's
+        'authenticated = fine' framing."""
+        r = await activity_client.post(
+            "/toelatingen/validate/erfgoedobject",
+            json={},
+        )
+        # Real validator + missing body — auth beats Pydantic.
+        assert r.status_code == 401
+
+    async def test_reference_stays_public(self, activity_client):
+        """Sanity check: the reference endpoints are still callable
+        without auth. Guards against a future 'add auth to the
+        whole file' refactor that would drag the public reference
+        endpoints behind an unnecessary auth gate."""
+        r_all = await activity_client.get("/toelatingen/reference")
+        assert r_all.status_code == 200
+        r_one = await activity_client.get("/toelatingen/reference/bijlagetypes")
+        assert r_one.status_code == 200
