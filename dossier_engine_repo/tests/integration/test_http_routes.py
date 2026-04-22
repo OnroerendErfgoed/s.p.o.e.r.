@@ -53,12 +53,33 @@ from httpx import ASGITransport, AsyncClient
 from dossier_engine.auth import POCAuthMiddleware
 from dossier_engine.db.models import Repository, AssociationRow
 from dossier_engine.entities import SYSTEM_ACTION_DEF, SystemNote, TaskEntity
+from dossier_engine.file_refs import FileId
 from dossier_engine.plugin import Plugin, PluginRegistry
 from dossier_engine.routes import register_routes
+from pydantic import BaseModel
 
 
 D1 = UUID("11111111-1111-1111-1111-111111111111")
 D2 = UUID("22222222-2222-2222-2222-222222222222")
+
+
+class _TestBijlage(BaseModel):
+    """Minimal Bijlage stand-in with a single FileId field. Mirrors
+    the real ``dossier_toelatingen.Bijlage`` shape for the fields
+    that the ``inject_download_urls`` walker cares about.
+    ``file_id`` is a ``FileId`` so a ``file_download_url`` sibling
+    is auto-injected into the response content (Bug 57)."""
+    file_id: FileId
+    filename: str = ""
+
+
+class _TestAanvraag(BaseModel):
+    """Minimal Aanvraag stand-in with a nested list of ``_TestBijlage``.
+    Used by the Bug-57 regression test to exercise download-URL
+    injection through a list-of-submodels, which is the shape
+    that appears in real dossier_toelatingen entities."""
+    titel: str = ""
+    bijlagen: list[_TestBijlage] = []
 
 
 def _build_test_app() -> FastAPI:
@@ -94,6 +115,15 @@ def _build_test_app() -> FastAPI:
         entity_models={
             "system:task": TaskEntity,
             "system:note": SystemNote,
+            # oe:aanvraag needs a real Pydantic model with a FileId
+            # field so the Bug-57 regression test can assert
+            # download-URL injection actually fires. The shape matches
+            # the real dossier_toelatingen Aanvraag/Bijlage pair (a
+            # top-level entity with a list of nested FileId-carrying
+            # children), which is the interesting case — it exercises
+            # both the top-level walker and the nested recursion in
+            # ``inject_download_urls``.
+            "oe:aanvraag": _TestAanvraag,
         },
     )
 
@@ -466,6 +496,130 @@ class TestGetEntityVersion:
             headers={"X-POC-User": "alice"},
         )
         assert r.status_code == 404
+
+    # --- Bug 57 regression tests -----------------------------------
+
+    async def test_bug57_single_version_injects_file_download_urls(
+        self, client, repo,
+    ):
+        """Bug 57: `GET /dossiers/{id}/entities/{type}/{eid}/{vid}`
+        must inject ``file_download_url`` siblings for FileId fields
+        in the entity's content. Before the fix, the endpoint returned
+        ``content`` verbatim — clients saw raw file_ids with no
+        download URL — which meant downloads broke unless the same
+        entity was also read via the dossier-detail route. This test
+        pins the fix: after Bug 57, the response carries download
+        URLs on file_id fields at every level of the content tree
+        (top-level and nested through lists of submodels)."""
+        boot = await _bootstrap_dossier(repo)
+        eid, vid = await _seed_entity(
+            repo, boot, "oe:aanvraag",
+            content={
+                "titel": "met bijlagen",
+                "bijlagen": [
+                    {"file_id": "f-0001", "filename": "plan.pdf"},
+                    {"file_id": "f-0002", "filename": "foto.jpg"},
+                ],
+            },
+        )
+        await _commit(repo)
+
+        r = await client.get(
+            f"/dossiers/{D1}/entities/oe:aanvraag/{eid}/{vid}",
+            headers={"X-POC-User": "alice"},
+        )
+        assert r.status_code == 200
+        content = r.json()["content"]
+
+        # Structural: injected sibling keys present on each bijlage.
+        assert "bijlagen" in content
+        assert len(content["bijlagen"]) == 2
+        for i, bijlage in enumerate(content["bijlagen"]):
+            assert "file_id" in bijlage, (
+                f"bijlagen[{i}]: file_id should still be present"
+            )
+            assert "file_download_url" in bijlage, (
+                f"bijlagen[{i}]: Bug 57 regression — "
+                f"file_download_url missing from response content"
+            )
+            # URL shape: points at the configured file_service URL
+            # (see _build_test_app's config: http://test.local:8001)
+            # and carries a query-string token. Not asserting the full
+            # token shape — that's the signing helper's job, tested
+            # elsewhere — just that a token is there.
+            url = bijlage["file_download_url"]
+            assert url.startswith("http://test.local:8001/download/"), url
+            assert bijlage["file_id"] in url
+            assert "?" in url, f"expected query-string token in {url}"
+
+    async def test_bug57_no_model_registered_returns_content_unchanged(
+        self, client, repo,
+    ):
+        """Defensive fallback: if no plugin registers a model for this
+        entity type, ``inject_download_urls`` receives ``None`` as the
+        model class and returns content unchanged. The endpoint stays
+        usable — clients just don't get injected URLs, same as
+        pre-Bug-57 behaviour. Pin this so a future refactor doesn't
+        accidentally 500 on unknown types. ``oe:bijlage`` is
+        declared in ``entity_types`` but has no entry in
+        ``entity_models`` in the test plugin, so it exercises the
+        fallback path."""
+        boot = await _bootstrap_dossier(repo)
+        eid, vid = await _seed_entity(
+            repo, boot, "oe:bijlage",
+            content={"file_id": "f-orphan", "filename": "orphan.pdf"},
+        )
+        await _commit(repo)
+
+        r = await client.get(
+            f"/dossiers/{D1}/entities/oe:bijlage/{eid}/{vid}",
+            headers={"X-POC-User": "alice"},
+        )
+        assert r.status_code == 200
+        content = r.json()["content"]
+        # file_id preserved; no file_download_url (no model class to
+        # drive the walker).
+        assert content["file_id"] == "f-orphan"
+        assert "file_download_url" not in content
+
+    async def test_bug57_token_carries_dossier_and_user_scope(
+        self, client, repo,
+    ):
+        """Bug 47 / Round 11 lineage: download tokens are
+        dossier+user-scoped, so a token minted for dossier A + user
+        alice can't pull a file from dossier B even if the file_id
+        matches. Pin the scope binding here too — the entities route
+        mints tokens the same way ``dossiers.py`` does, and this
+        test guards against a future refactor that drops one of the
+        two scopes from the signer closure."""
+        boot = await _bootstrap_dossier(repo)
+        eid, vid = await _seed_entity(
+            repo, boot, "oe:aanvraag",
+            content={
+                "titel": "scoped",
+                "bijlagen": [{"file_id": "f-scope", "filename": "p.pdf"}],
+            },
+        )
+        await _commit(repo)
+
+        # Two requests, same entity, different users. The tokens
+        # should differ — same file_id, same dossier, different user.
+        r_alice = await client.get(
+            f"/dossiers/{D1}/entities/oe:aanvraag/{eid}/{vid}",
+            headers={"X-POC-User": "alice"},
+        )
+        r_admin = await client.get(
+            f"/dossiers/{D1}/entities/oe:aanvraag/{eid}/{vid}",
+            headers={"X-POC-User": "admin"},
+        )
+        url_alice = r_alice.json()["content"]["bijlagen"][0]["file_download_url"]
+        url_admin = r_admin.json()["content"]["bijlagen"][0]["file_download_url"]
+        # Same file_id path, but different query strings because
+        # the token carries user_id.
+        assert url_alice.split("?")[0] == url_admin.split("?")[0]
+        assert url_alice != url_admin, (
+            "Bug 47 regression: tokens for different users must differ"
+        )
 
 
 # --------------------------------------------------------------------

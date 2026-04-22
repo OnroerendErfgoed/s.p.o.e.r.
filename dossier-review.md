@@ -10,15 +10,15 @@
 
 | Status | Count | Items |
 |---|---|---|
-| ✅ Fixed & verified | 24 | Bugs 1, 2, 5, 6, 7, 12, 15, 16, 17, 30, 32, 44, 47, 55, 64, 65, 68, 70, 72 (coverage), 73, 74, 75, 76, 77 + Obs-2 (duplicate "external") |
+| ✅ Fixed & verified | 25 | Bugs 1, 2, 5, 6, 7, 12, 15, 16, 17, 30, 32, 44, 47, 55, 57, 64, 65, 68, 70, 72 (coverage), 73, 74, 75, 76, 77 + Obs-2 (duplicate "external") |
 | 🔍 Investigated, not a bug | 1 | Bug 14 — cross-dossier refs are `type=external` rows |
 | 🛑 Deferred / accepted | 4 | Bug 31 (RRN acceptable), Bug 45 (MinIO migration), Bug 63 (403 is correct HTTP), Bug 71 (test activities, deploy-time removal) |
-| 🧪 Test suite | **785/785** passing | engine 724, toelatingen 22, file_service 21, common/signing 18 |
+| 🧪 Test suite | **788/788** passing | engine 727, toelatingen 22, file_service 21, common/signing 18 |
 | 🏃 `test_requests.sh` | **25/25 OK, exit 0, zero deadlocks, zero worker crashes** | D1–D9 green |
 | ✂️ Duplication closed | **D1, D2, D4, D22, D25** | Graph-loader consolidation + audit-emit wrapper |
 | 🧰 Harnesses installed | **3** | Guidebook YAML lint + phase-docstring lint + CI shell-spec wrapper |
 | 🤖 CI wired | **GitHub Actions** | `.github/workflows/ci.yml` — 4 jobs: pytest, shell-spec, doc-harnesses, migrations-append-only |
-| 📦 Pending | ~54 bugs + 57 obs + 22 dups + 5 meta (partial relief) | See below |
+| 📦 Pending | ~53 bugs + 57 obs + 22 dups + 5 meta (partial relief) | See below |
 
 Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfaced and fixed in the same session as the harness that surfaced it.
 
@@ -45,7 +45,7 @@ Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfac
 | 🛑 45 | 5 | Deferred — MinIO migration handles it. |  |
 | ~~47~~ | 5 | ~~Upload tokens dossier-agnostic.~~ | ✅ |
 | ~~55~~ | 5 | ~~`lineage.find_related_entity` doesn't filter by `dossier_id` defensively.~~ | ✅ **Fixed in Round 19.** Guard added at per-activity loop entry: walker loads the activity, compares `activity_row.dossier_id` against its scope argument, and short-circuits before querying the activity's generated/used entities if the dossier doesn't match. Repo helpers (`get_entities_generated_by_activity`, `get_used_entities_for_activity`, `get_activity`) got scoping-contract docstrings making the trust boundary explicit. **The return value was already None for cross-dossier edges (line-87 scope check on `get_latest_entity_by_id`), so this is genuine defense in depth — pre-fix the walk happened but the return stayed safe; post-fix the walk is refused at the traversal layer.** 2 regression tests spy on repo helper calls rather than asserting on return value, so a future regression that removes the guard would go red. |
-| 57 | 6 | `routes/entities.py` three endpoints skip `inject_download_urls`. |  |
+| ~~57~~ | 6 | ~~`routes/entities.py` three endpoints skip `inject_download_urls`.~~ | ✅ **Fixed in Round 20** — narrower scope than the bug title implies. Only the single-version endpoint (`GET /dossiers/{id}/entities/{type}/{eid}/{vid}`) got the injection; the two bulk endpoints (`/entities/{type}` and `/entities/{type}/{eid}`) deliberately do NOT inject, because they're inspection/revision-history shaped — clients follow up with a single-version fetch to actually download, and minting signed URLs across every file in every version is waste in the common case. Module docstring documents the deliberate asymmetry. If a future client needs URLs in the bulk responses the fix is the same per-entity inject call in the per-version loop. |
 | 58 | 6 | `POST /{workflow}/validate/{name}` has no authentication. |  |
 | 62 | 6 | `/entities/{type}/{eid}/{vid}` doesn't verify `entity_id` matches. |  |
 | 📝 63 | 7 | **Accepted — keep 403.** Enumeration via 403-vs-404 response-code differential flagged as a security concern. For this deployment the tradeoff falls on semantic correctness: dossier UUIDs are cryptographically random (128 bits of entropy), the system runs behind SSO, `dossier.denied` audit events fire on every 403 so probing shows up in SIEM, and HTTP-client tooling relies on correct status codes for caching / routing / retries. Collapsing 403 to 404 would break that contract to close a leak with negligible real-world impact in this environment. RFC 9110 §15.5.5 permits 404-for-hidden-existence but it's not the right default here. Enumeration detection is a Wazuh dashboard + alert-rule concern, not an application concern — the `dossier.denied` stream already carries everything Wazuh needs (actor, dossier, reason, timestamp). | Decided. |
@@ -545,13 +545,45 @@ Not blocking; filed as an observation rather than a bug because the append-only 
 - **785 total** (was 783).
 - Shell spec green: 25 OK, D1-D9, zero tracebacks. Per-activity guard adds one `get_activity` call per visited node; no observable latency impact on D1-D9.
 
+### Round 20 — Bug 57 (entities read endpoints skip `inject_download_urls`) with mid-round scope narrowing
+
+Verify-before-plan confirmed: `routes/entities.py` had three GET endpoints (all-versions-of-a-type, all-versions-of-an-entity, single-version), none of which called `inject_download_urls`. The `routes/dossiers.py` route for the dossier-detail read *did* inject, so clients reading a dossier via that route got signed download URLs on their file_id fields; clients reading via any entities route got raw file_ids with no downloadable URL. Bug title said "three endpoints" — confirmed on inspection.
+
+**Mid-round scope narrowing (important).** Original plan was to fix all three endpoints: refactor `PluginRegistry` to add `get_for_entity_type`, thread `registry` through `register_routes → entities.register` (signature change), add a reusable `_make_signer` helper, inject URLs in all three handlers. Started executing — added the registry helper, changed the signature, wrote the shared closure. User pulled scope back: "Actually I'd just add it to the single version endpoint." Rolled back the registry helper and the signature change; kept only the import additions and the single-handler fix.
+
+The narrowing was the right call and worth articulating:
+- The **bulk endpoints are inspection-shaped** — they return revision history, typically for debugging or for a UI listing all versions of an aanvraag. Clients in the download flow follow up with a single-version fetch to get the specific row they want.
+- Minting one signed URL per file per version across every version of every entity is **waste in the common case**: most fetches of the bulk endpoints don't use the URLs at all, and each URL involves HMAC-signing a token. For a dossier with 20 aanvragen, each averaging 5 versions, each with 3 bijlagen, a bulk fetch would mint 300 URLs per request.
+- The **minimum change that closes the reported symptom** (clients can't download via entities route) is the single-version endpoint, since that's where a download-oriented client lands. The module docstring now explicitly documents the asymmetry and the "fix it the same way" path if a future client actually needs bulk URLs.
+
+Process bake-in for future rounds: **before writing the fix, articulate the minimum change and ask whether it covers the reported symptom.** I auto-expanded Bug 57's scope from "one endpoint" to "three endpoints" based on the bug title without checking whether all three actually needed the fix for the reported behaviour. Same shape as Round 18's `ActivityContext` scope blowup but caught earlier — partway through coding rather than partway through a multi-turn plumbing refactor.
+
+**Actual fix shipped (minimal, 1 handler + imports + docstring):**
+- `routes/entities.py` imports `inject_download_urls`, `sign_token`, `token_to_query_string`.
+- Single-version handler resolves the owning plugin via `app.state.registry` (already wired at `app.py:317`, no new plumbing needed), mints a per-request dossier+user-scoped signer closure matching `routes/dossiers.py`'s pattern, calls `inject_download_urls(model_class, entity.content, sign)`.
+- Plugin lookup is a short loop over `registry.all_plugins()` checking `entity_models` membership — a registry helper would be overkill for a single caller. If a third caller ever shows up, promote it to the registry.
+- Module docstring documents the three-endpoints-shape and the deliberate asymmetry (single-version injects; bulk inspect-shaped endpoints don't).
+
+**Regression tests (3 new) in `TestGetEntityVersion`:**
+1. **`test_bug57_single_version_injects_file_download_urls`** — seeds an aanvraag with two bijlagen (each with a `file_id`), fetches via the single-version endpoint, asserts every bijlage has a `file_download_url` sibling and that the URL points at the configured file_service URL with a query-string token. Test infra required adding a minimal `_TestAanvraag` / `_TestBijlage` Pydantic pair to the synthetic test plugin's `entity_models` — mirroring the real `dossier_toelatingen` shape so both top-level and nested-list-of-submodels injection paths are exercised.
+2. **`test_bug57_no_model_registered_returns_content_unchanged`** — pins the defensive fallback: if no plugin registers a model for the entity type, `inject_download_urls(None, ...)` returns content unchanged, endpoint stays 200. Uses `oe:bijlage` which is declared in `entity_types` but has no `entity_models` entry in the test plugin. Guards against a future refactor that would accidentally 500 on unknown types.
+3. **`test_bug57_token_carries_dossier_and_user_scope`** — Bug 47 / Round 11 lineage test: same entity fetched by alice vs admin returns different URLs (same path, different query-string tokens). Guards against a future signer refactor that drops user_id or dossier_id from the token's scope fields.
+
+**Paranoia check applied per Round 19's lesson.** Before writing the review entry, temporarily reverted just the `inject_download_urls(...)` call in `entities.py` to a passthrough of `entity.content`, ran the tests, confirmed 2 of the 3 regression tests go red with clean assertions (`file_download_url missing from response content` and `KeyError: 'file_download_url'`). The third test (no-model-registered fallback) passes both with and without the fix — which is **correct**: it's specifically the defensive-fallback path where no model means no injection, so the output is the same either way. Restored the fix; 7/7 green. This is the right shape for applying the Round 19 lesson going forward: revert, run, check the red, restore.
+
+**Verification — Round 20:**
+- Engine: **720 passed + 7 Sentry-skipped** (was 717; +3 Bug 57 regression tests).
+- Toelatingen / common / file_service unchanged at 22 / 18 / 21.
+- **788 total** (was 785).
+- Shell spec green: 25 OK, D1-D9, zero tracebacks.
+
 ### Where to go next (in priority order)
 
-1. **Bug 57 — `routes/entities.py` three endpoints skip `inject_download_urls`.** Continues the severity-first walk through open must-fix bugs. Presentation-layer bug (file downloads break for these specific endpoints); verify still open + identify which three endpoints before planning.
-2. **Remaining open "must-fix" bugs** — 58, 62 in number order.
-3. **Obs-58 (new)** — CI migration preflight and/or static migration consistency check. Tractable as a dedicated small round after the remaining must-fixes close.
+1. **Bug 58 — `POST /{workflow}/validate/{name}` has no authentication.** Continues the severity-first walk through open must-fix bugs. Security-relevant (validation endpoint publicly callable; might leak schema information or be used as an oracle). Verify still open first.
+2. **Remaining open "must-fix" bug** — 62 (last one).
+3. **Obs-58** (migration consistency checks, carried over from Round 19) — tractable as a small dedicated round after 58/62 close.
 
 The three "optional" items previously on this list remain closed:
 - **Obs-3** (write-on-change for `set_dossier_access`) — deferred by product decision.
 - **Bug 63 follow-up** (enumeration alerting) — owned by SIEM operators, not an application concern.
-- Default worker-schema-retry loop behaviour — already present (see the "Worker poll: schema not ready yet" WARN in Round 19's shell-spec log), no action needed.
+- Default worker-schema-retry loop behaviour — already present.
