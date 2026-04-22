@@ -10,7 +10,7 @@
 
 | Status | Count | Items |
 |---|---|---|
-| ✅ Fixed & verified | 27 | Bugs 1, 2, 5, 6, 7, 12, 15, 16, 17, 30, 32, 44, 47, 55, 57, 58, 62, 64, 65, 68, 70, 72 (coverage), 73, 74, 75, 76, 77 + Obs-2 (duplicate "external") |
+| ✅ Fixed & verified | 30 | Bugs 1, 2, 5, 6, 7, 12, 15, 16, 17, 30, 32, 44, 47, 55, 56, 57, 58, 62, 64, 65, 66, 68, 69, 70, 72 (coverage), 73, 74, 75, 76, 77 + Obs-2 (duplicate "external") |
 | 🔍 Investigated, not a bug | 1 | Bug 14 — cross-dossier refs are `type=external` rows |
 | 🛑 Deferred / accepted | 4 | Bug 31 (RRN acceptable), Bug 45 (MinIO migration), Bug 63 (403 is correct HTTP), Bug 71 (test activities, deploy-time removal) |
 | 🧪 Test suite | **794/794** passing | engine 733, toelatingen 22, file_service 21, common/signing 18 |
@@ -18,8 +18,8 @@
 | ✂️ Duplication closed | **D1, D2, D4, D22, D25** | Graph-loader consolidation + audit-emit wrapper |
 | 🧰 Harnesses installed | **3** | Guidebook YAML lint + phase-docstring lint + CI shell-spec wrapper |
 | 🤖 CI wired | **GitHub Actions** | `.github/workflows/ci.yml` — 4 jobs: pytest, shell-spec, doc-harnesses, migrations-append-only |
-| 🎯 Must-fix walk | **Complete** | All sev-4 through sev-6 must-fix bugs closed; remaining pending items are observations + dups + meta |
-| 📦 Pending | 57 obs + 22 dups + 5 meta (partial relief) | See below |
+| 🎯 Must-fix walk | **Complete** | All 17 fixable must-fix bugs closed; the 5 open rows are deferred/investigated by product decision (Bugs 14, 31, 45, 63, 71) |
+| 📦 Pending | 28 should-fix + 16 lower-priority bugs + 30 observations + 21 dups + 5 meta (partial relief) | See below |
 
 Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfaced and fixed in the same session as the harness that surfaced it.
 
@@ -85,14 +85,14 @@ Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfac
 | 50 | 5 | Migration fallback uses module-level `SYSTEM_ACTION_DEF` with bare name. |  |
 | 53 | 5 | `lineage.find_related_entity` frontier growth unbounded. |  |
 | 54 | 5 | `lineage.find_related_entity` returns `None` for both "not found" and "ambiguous". |  |
-| 56 | 6 | README claims externals in both `used`/`generated` allowed; code + test reject. |  |
+| ~~56~~ | 6 | ~~README claims externals in both `used`/`generated` allowed; code + test reject.~~ | ✅ **Fixed in Round 24 (Cat 1 doc-fix batch).** README section D5 rewritten to correctly describe externals as rejected the same way local overlaps are — with a `kind: "external"` payload instead of `kind: "local"`. Verified against `invariants.enforce_used_generated_disjoint` and `test_invariants.py::test_external_overlap_by_uri`. Cross-refs Obs 69 (marked closed). |
 | 59 | 6 | Unregistered validators silently skip. |  |
 | 60 | 6 | `alembic/env.py` nested `asyncio.run()` hazard. |  |
 | ~~64~~ | 7 | ~~Plugin guidebook uses `schema:` where loader reads `model:`.~~ | ✅ **Fixed** in `docs/plugin_guidebook.md:59`. Harness 1 prevents recurrence. |
 | ~~65~~ | 7 | ~~Same `schema:` vs `model:` bug in external-ontologies section.~~ | ✅ **Fixed** in `docs/plugin_guidebook.md:635, 639, 643`. |
-| 66 | 7 | Relation validator keying rules undocumented. |  |
+| ~~66~~ | 7 | ~~Relation validator keying rules undocumented.~~ | ✅ **Fixed in Round 24 (Cat 1 doc-fix batch).** Added "Relation-validator keying" subsection to `docs/plugin_guidebook.md` documenting all three resolution styles (per-operation `validators: {add, remove}` dict, activity-level single `validator:` string, plugin-level by relation-type name) with YAML examples, resolution priority order, and a warning about the key-space ambiguity between named-validator lookups and by-type lookups in `plugin.relation_validators`. Cross-refs Obs 73 (marked closed). |
 | 67 | 7 | `_errors.py` payload key collision. |  |
-| 69 | 7 | Tombstone role shape inconsistent between dossiertype template and workflow.yaml. |  |
+| ~~69~~ | 7 | ~~Tombstone role shape inconsistent between dossiertype template and workflow.yaml.~~ | ✅ **Fixed in Round 24 (Cat 1 doc-fix batch).** `dossiertype_template.md` rewritten to show the correct flat-list shape `allowed_roles: ["beheerder"]` instead of the broken dict-of-dicts form `- role: "beheerder"`. Verified against `app.py:138-142` which iterates the list treating each element as a bare role-name string — the dict form would silently produce `{"role": {"role": "beheerder"}}` and break tombstone authorization. Cross-refs Obs 71 (marked closed). |
 | ~~70~~ | 8 | ~~`test_requests.sh` outputs dead `/prov/graph` URL.~~ | ✅ **Fixed** — four echo sites updated to `/prov/graph/timeline` (the user-visible visualization route). `prov.py` module docstring also corrected — it documented a `/prov/graph` endpoint that doesn't exist; now lists the four real ones. Verified end-to-end: `/prov/graph/timeline` returns 401 without auth (route registered), the old `/prov/graph` returns 404 (proves the URL was dead). |
 | ~~73~~ | (impl) | ~~`conftest.py` TRUNCATE list omits `domain_relations`.~~ | ✅ |
 | ~~74~~ | (impl) | ~~Worker/route deadlock on `system:task` rows.~~ | ✅ **Fixed.** Structural (worker takes dossier lock first, matching user-activity order) + defence-in-depth (`run_with_deadlock_retry` on routes). |
@@ -145,7 +145,7 @@ Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfac
 
 ## Structural observations
 
-The 8-pass sweep catalogued 57 structural observations. They cluster into five themes. Status key: **open** (unchanged), **partially addressed** (progress in a specific pass), **closed** (folded into a fix). Individual-observation numbering is reconstructed from the original passes where it was explicit.
+The structural sweep catalogued observations clustering into five themes. **Count reconciliation (Round 23 bookkeeping):** 44 items are currently listed in this section — 35 open, 7 closed, 1 partially addressed, 1 deferred. An earlier pass may have counted ~57 structural observations including items that have since been reclassified as bugs (e.g. items 38, 53, 54, 56, 59, 66, 69 referenced in the bug tables); the 44 here are what the review actually lists. Status key: **open** (unchanged), **partially addressed** (progress in a specific pass), **closed** (folded into a fix). Individual-observation numbering is reconstructed from the original passes where it was explicit.
 
 ### Code organization
 - **Obs 50 — Worker split.** `worker.py` is ~1,340 lines (grew ~80 lines with Bug 75's resilience logic + Bug 12's log-and-defer). Proposed split: `poll.py`, `execute.py`, `retry.py`, `requeue.py`, `signals.py`. **Open.**
@@ -157,55 +157,56 @@ The 8-pass sweep catalogued 57 structural observations. They cluster into five t
 
 ### Plugin surface
 - **Obs 56 — Centralize plugin validation.** Three load-time validators exist (`validate_workflow_version_references`, `validate_side_effect_conditions`, `validate_side_effect_condition_fn_registrations`, `_validate_plugin_prefixes`), five more are missing. Also: no cross-check that `handler:` / `validator:` names resolve to registered callables (Bug 59 territory). **Open.**
-- Plugin interface table in docs promises 15 field validations; 3 are actually checked. **Open.**
-- `authorize_activity` pre-creation vs post-creation modes threaded via `dossier_id: UUID | None` — should split into two functions. **Open.**
-- Load-time validation for `status:` dict-form shape. **Open.**
-- `eligible_activities` column: `Text` → `JSONB`. **Open.**
-- **`set_dossier_access`** — 6 copies of the view list, duplicate `"external"`. **Closed** in Round 11 (view-list constants + role helpers extracted, duplicate bug fixed, 16 regression tests added). Write-on-change optimization explicitly declined as a product decision (keep full provenance graph).
-- Remove legacy `handle_beslissing` (marked "kept for backward compatibility"). **Open.**
-- Back-compat `"behandelaar"` role needs an owner + removal deadline. **Closed** in Round 11 (confirmed actively used by `workflow.yaml:71, 80, 89, 304, 391, 724, 755` authorization entries — legitimate global-staff role, not legacy).
-- `systemAction` sub-types: `oe:migrationAction`, `oe:requeueAction`, `oe:retryAction`. **Open.**
-- Document `systeemgebruiker` role grants; add `caller_only: "system"` check. **Open.**
-- Lineage walker needs per-walk cache + distinguishable "not found" vs "ambiguous" return (Bugs 53, 54). **Open.**
+- **Obs 57 — Plugin interface table drift.** Docs promise 15 field validations; 3 are actually checked. **Open.**
+- **Obs 58 — Split `authorize_activity`.** Pre-creation vs post-creation modes threaded via `dossier_id: UUID | None` — should split into two functions. **Open.**
+- **Obs 59 — `status:` dict-form load-time validation.** Load-time validation for `status:` dict-form shape. **Open.**
+- **Obs 60 — `eligible_activities` column type.** `Text` → `JSONB`. **Open.**
+- **Obs 61 — `set_dossier_access` view-list duplication.** 6 copies of the view list, duplicate `"external"`. **Closed** in Round 11 (view-list constants + role helpers extracted, duplicate bug fixed, 16 regression tests added). Write-on-change optimization explicitly declined as a product decision (keep full provenance graph).
+- **Obs 62 — Legacy `handle_beslissing`.** Remove legacy `handle_beslissing` (marked "kept for backward compatibility"). **Open.**
+- **Obs 63 — `"behandelaar"` role review.** Back-compat `"behandelaar"` role needs an owner + removal deadline. **Closed** in Round 11 (confirmed actively used by `workflow.yaml:71, 80, 89, 304, 391, 724, 755` authorization entries — legitimate global-staff role, not legacy).
+- **Obs 64 — `systemAction` sub-types.** Introduce `oe:migrationAction`, `oe:requeueAction`, `oe:retryAction`. **Open.**
+- **Obs 65 — Document `systeemgebruiker` role grants + `caller_only: "system"` check.** **Open.**
+- **Obs 66 — Lineage walker completion** (covered by Bugs 53, 54). Needs per-walk cache + distinguishable "not found" vs "ambiguous" return. **Open.** Redundant with Bugs 53/54 in the should-fix table; Round 23 triage Category 4 schedules them together.
 
 ### Documentation drift
-- Pipeline doc's "UPDATE must happen after persistence" claim is factually wrong. **Open.**
-- Pipeline doc's `ActivityState` field table covers ~⅓ of actual fields, presented as complete. **Open.**
-- README claims external-overlap is allowed; code + tests reject (Bug 56). **Open.**
-- Guidebook uses wrong YAML key (`schema:` vs `model:`). **Closed** in Round 8 (Bugs 64, 65 fixed; harness 1 now prevents recurrence).
-- Dossiertype template's tombstone block shape doesn't match production workflow (Bug 69). **Open.**
-- Template's endpoint docs omit the workflow-name prefix — 4 different URL forms for workflow search, none matching production. **Open.**
-- Relation validator keying rules (three styles) undocumented (Bug 66). **Open.**
-- `prov.py` module docstring referenced non-existent `/prov/graph` endpoint. **Closed** in Round 12 (fixed alongside Bug 70).
+- **Obs 67 — Pipeline doc UPDATE-after-persistence claim.** ~~Pipeline doc's "UPDATE must happen after persistence" claim is factually wrong.~~ **Closed** in Round 24 (Cat 1 doc-fix batch). Reworded `docs/pipeline_architecture.md` phases 14/15 prose to describe the actual mechanism (`state.activity_row.computed_status` is an in-memory dirty-flag write on a session-tracked ORM object, flushed with the transaction — not a separate UPDATE statement).
+- **Obs 68 — Pipeline doc `ActivityState` field table.** ~~Covers ~⅓ of actual fields, presented as complete.~~ **Closed** in Round 24 (Cat 1 doc-fix batch). Reframed the table as a curated walkthrough of phase-boundary fields, redirected readers to `state.py:ActivityState` as source-of-truth for the full ~37-field list, fixed the erroneous `computed_status` row (that field lives on `activity_row`, not on state itself) to `final_status` with an explicit note about the two places the activity's resolved status is mirrored.
+- **Obs 69 — README external-overlap claim** (covered by Bug 56). ~~README claims external-overlap is allowed; code + tests reject.~~ **Closed** in Round 24 alongside Bug 56 fix.
+- **Obs 70 — Guidebook `schema:` vs `model:` key.** **Closed** in Round 8 (Bugs 64, 65 fixed; harness 1 now prevents recurrence).
+- **Obs 71 — Dossiertype template tombstone shape** (covered by Bug 69). ~~Template's tombstone block shape doesn't match production workflow.~~ **Closed** in Round 24 alongside Bug 69 fix.
+- **Obs 72 — Template endpoint docs.** ~~Template's endpoint docs omit the workflow-name prefix — 4 different URL forms for workflow search, none matching production.~~ **Closed** in Round 24 (Cat 1 doc-fix batch). `dossiertype_template.md`'s `search_route_factory` example rewritten to show the `/{workflow}/dossiers` + `/{workflow}/admin/search/...` shape, with explanatory prose about the workflow-name-first convention. Endpoint table row updated from the fictional `/dossiers/{workflow}/search` to the real `/{workflow}/dossiers` + `/{workflow}/admin/search/{recreate,reindex,reindex-all}`.
+- **Obs 73 — Relation validator keying rules** (covered by Bug 66). ~~Three styles undocumented.~~ **Closed** in Round 24 alongside Bug 66 fix.
+- **Obs 74 — `prov.py` docstring `/prov/graph` reference.** **Closed** in Round 12 (fixed alongside Bug 70).
 
 ### Performance / observability
-- Cache `SearchSettings()` at module load (currently re-reads env on every `get_client()`). **Open.**
-- `is_singleton` should cache instead of linear-scanning `entity_types` per call. **Open.**
-- `derive_status` should prefer `dossier.cached_status` first. **Open.**
-- `check_workflow_rules` should pass `known_status` from `state.dossier.cached_status`. **Open.**
-- Archive size cap/warning. **Open.**
-- Reindex pagination (load all dossiers into memory; Bug 25). **Open.**
-- No per-user eligibility cache (Bug 38). **Open.**
+- **Obs 75 — Cache `SearchSettings()`** at module load (currently re-reads env on every `get_client()`). **Open.**
+- **Obs 76 — Cache `is_singleton`** instead of linear-scanning `entity_types` per call. **Open.**
+- **Obs 77 — `derive_status` uses `cached_status` first.** **Open.**
+- **Obs 78 — `check_workflow_rules` passes `known_status`** from `state.dossier.cached_status`. **Open.**
+- **Obs 79 — Archive size cap / warning.** **Open.**
+- **Obs 80 — Reindex pagination** (covered by Bug 25). Loads all dossiers into memory. **Open.** Redundant with Bug 25; Round 23 triage Category 2 cherry-picks.
+- **Obs 81 — Per-user eligibility cache** (covered by Bug 38). **Open.** Redundant with Bug 38; Round 23 triage Category 3.
 
 ### Test / deployment concerns
-- Test fixtures use direct `Repository` instances against real Postgres — no unit isolation story documented. **Open.**
-- `test_requests.sh` as an executable spec that wasn't in CI. **Closed** in Round 8 + Round 9 (`scripts/ci_run_shell_spec.sh` harness 2 + GitHub Actions `shell-spec` job).
-- Schema-versioning tests require declaring test-only activities in production YAML (Bug 71). **Deferred by product decision** (deploy-time checklist removes them).
-- Dependency-override-friendly auth for tests (replace `POCAuthMiddleware` instance with FastAPI `dependency_overrides`). **Open.**
-- Signing key rotation support (only one key accepted). **Open.**
-- Migration framework needs top-level audit log (who/when/command). **Open.**
-- `DataMigration.transform` signature should widen to `(content, row)`. **Open.**
-- Cross-workflow task permission model (no check that source plugin can schedule into target workflow). **Open.**
+- **Obs 82 — Test fixtures against real Postgres.** Direct `Repository` instances; no unit-isolation story documented. **Open.**
+- **Obs 83 — `test_requests.sh` in CI.** **Closed** in Round 8 + Round 9 (`scripts/ci_run_shell_spec.sh` harness 2 + GitHub Actions `shell-spec` job).
+- **Obs 84 — Schema-versioning test activities in production YAML** (covered by Bug 71). **Deferred by product decision** (deploy-time checklist removes them).
+- **Obs 85 — Dependency-override-friendly auth for tests.** Replace `POCAuthMiddleware` instance with FastAPI `dependency_overrides`. **Open.**
+- **Obs 86 — Signing key rotation** (only one key accepted today). **Open.**
+- **Obs 87 — Migration framework top-level audit log** (who/when/command). **Open.**
+- **Obs 88 — `DataMigration.transform` signature** should widen to `(content, row)`. **Open.**
+- **Obs 89 — Cross-workflow task permission model.** No check that source plugin can schedule into target workflow. **Open.**
 
 ### Specific refactors named
-- Add "Reads/Writes docstring matches state fields" lint. **Closed** in Round 8 (harness 3).
-- Share layout between `archive.render_timeline_svg` and columns graph (160 + 270 lines of separate layout code). **Open.**
-- `activity_view` mode complexity reduction (5 modes; hard mental load for small feature value). **Open.**
-- The pipeline architecture doc's ActivityState hazard is documented but not enforced. **Closed** in Round 8 (harness 3 enforces it).
+- **Obs 90 — Reads/Writes docstring lint.** **Closed** in Round 8 (harness 3).
+- **Obs 91 — Share layout between `archive.render_timeline_svg` and columns graph** (160 + 270 lines of separate layout code). **Open.**
+- **Obs 92 — `activity_view` mode complexity reduction.** 5 modes; hard mental load for small feature value. **Open.**
+- **Obs 93 — Pipeline-architecture-doc ActivityState hazard enforcement.** **Closed** in Round 8 (harness 3 enforces it).
+- **Obs 94 — Migration consistency checks.** Filed in Round 19 CI postmortem (was provisionally numbered "Obs-58" at the time, renumbered here to avoid collision with the new Obs 58). Round 8's append-only guard catches **mutation** of existing migration files (Bug 68's original shape) but not **stale leftover files** from consolidation work — stale versions pass the append-only check yet fail at `alembic upgrade head`. Candidate follow-ups: CI migration preflight job (runs `alembic upgrade head` against a fresh Postgres; fails the build on rc≠0), or static consistency check scanning for redundant DDL across migration files. **Open.**
 
-**Observation totals:** of the 57 catalogued, **~9 are closed or have direct relief shipped** (harness 3, harness 2 CI wiring, `set_dossier_access` refactor, Bugs 64/65 guidebook fix, Bug 70's doc-drift, `test_requests.sh` CI integration). The remaining ~48 are open and tracked in the themes above. Most are not acute — the pattern is "code works today but will decay without attention."
+**Observation totals:** 45 catalogued, Obs 50-94. **13 closed** (Obs 61, 63, 67, 68, 69, 70, 71, 72, 73, 74, 83, 90, 93), **1 partially addressed** (Obs 52), **1 deferred by product decision** (Obs 84), **30 open**. Three of the remaining open observations are explicitly redundant with bugs (Obs 66 ↔ Bugs 53/54; Obs 80 ↔ Bug 25; Obs 81 ↔ Bug 38) — the bug tables are authoritative for those; obs entries are cross-references. Round 24 closed six observations in the Cat 1 doc-fix batch, three of which were redundant with Bugs 56/66/69 (now also closed in the Should-fix table). Most of the non-redundant open ones are not acute — the pattern is "code works today but will decay without attention."
 
-## Duplication targets (27 catalogued, 5 closed)
+## Duplication targets (27 catalogued, 6 closed)
 
 | # | What | Status |
 |---|------|---|
@@ -237,7 +238,7 @@ The 8-pass sweep catalogued 57 structural observations. They cluster into five t
 | D26 | `sign_token` + `verify_token` share the payload-string building logic — should extract | Open. |
 | D27 | Test setup helpers (`_bootstrap_dossier`, `_seed_access_entity`, `_user`) exist in 4+ test files with slight variations | Open. |
 
-**Duplication totals:** **5 closed** (D1, D2, D4, D9, D22, D25 — counting D22 and D4 as one closure since they were the same pattern), **22 open**.
+**Duplication totals:** **6 closed** (D1, D2, D4, D9, D22, D25 — D22 and D4 were the same pattern under separate review entries), **21 open**.
 
 ## Meta-patterns (6)
 
@@ -533,7 +534,7 @@ This is the test-design lesson the round surfaces: **for defense-in-depth fixes,
 
 **Stale-migration postmortem (carried in from the CI investigation across Rounds 18-19 boundary).** Round 18's final CI run exposed a shell-spec failure: `DuplicateColumnError: column "uri" of relation "agents" already exists` from `ALTER TABLE agents ADD COLUMN uri TEXT`, with Round 16's `_run_alembic_migrations` correctly refusing to start on rc=1. Initial hypothesis chain (worker race on empty schema → autogenerate drift → something emitting ALTER we can't find) was wrong in all cases. The actual cause, confirmed by the user after inspecting their local branch: **stale migration version files on the CI branch**. A prior cleanup had retroactively inlined the `uri` column into the initial `create_table('agents', ...)` call (legitimate consolidation), but the delta migration that originally added `uri` was never removed from `alembic/versions/` — so Alembic's `upgrade head` ran both, hit the ALTER, and crashed on the duplicate column.
 
-**Gap in existing tooling.** Round 8's append-only guard catches **mutation** of existing migration files (Bug 68's original shape). It does not catch **stale leftover files** from consolidation work — from Alembic's perspective the file is still a valid revision in the chain; nothing in the file itself looks wrong. The only signal is that the DDL fails at runtime. Two follow-ups worth considering, both filed as Obs-58 (new):
+**Gap in existing tooling.** Round 8's append-only guard catches **mutation** of existing migration files (Bug 68's original shape). It does not catch **stale leftover files** from consolidation work — from Alembic's perspective the file is still a valid revision in the chain; nothing in the file itself looks wrong. The only signal is that the DDL fails at runtime. Two follow-ups worth considering, filed as **Obs 94** (provisionally called "Obs-58" in this round, renumbered during Round 24's observation-numbering pass to avoid collision with Plugin Surface's Obs 58):
 
 1. **CI preflight** — run `alembic upgrade head` against a fresh Postgres before the shell-spec job, with the expectation of rc=0. Same mechanism the production `_run_alembic_migrations` uses, just separated into a dedicated CI step so migration failures fail fast and distinctly from application failures. Would have turned Round 18's CI failure into a clearer "migration broken" signal instead of a 30-second timeout on dossier_app startup.
 2. **Static consistency check** — cross-reference each migration's DDL against the union of prior migrations' DDL; flag any `op.add_column('X', 'Y', ...)` where an earlier migration's `op.create_table('X', ..., Column('Y', ...))` already declares the column. Harder to write correctly (migrations can rename, drop, re-add) but would catch the stale-file shape without a live DB.
@@ -621,9 +622,11 @@ Last must-fix bug. Verify-before-plan confirmed: `get_entity_version` at `routes
 
 **Paranoia check, first pass.** Reverted the new check, both Bug 62 tests went red — and the failure output literally shows the silent mis-attribution: the response body carried A's titel ("A") and A's generatedBy activity, but the URL had used B's eid. That's the bug in the test's own failure message, which is the healthiest shape a red paranoia result can take. Restored; 9/9 in `TestGetEntityVersion`, 726/726 + 7 Sentry-skipped engine-wide.
 
-### Severity-first walk — complete
+### Severity-first walk — must-fix tier complete
 
-Round 22 closes the must-fix walk. Across Rounds 1-22 (some of which bundled multiple bugs), all 27 of the originally-filed must-fix bugs in severity 4-6 are now either **fixed + verified** (bulk of the work), **deferred + accepted** (product decisions: Bug 31 RRN format, Bug 45 MinIO migration, Bug 63 HTTP 403 semantics, Bug 71 deploy-time test-activity removal), or **investigated + reclassified** (Bug 14: "cross-dossier refs" turned out to be the `type=external` design).
+Round 22 closes the **must-fix** walk specifically. Across Rounds 1-22 (some of which bundled multiple bugs), all 17 fixable must-fix bugs are now **fixed + verified**; the remaining 5 must-fix rows are **deferred + accepted** (Bug 31 RRN, Bug 45 MinIO, Bug 63 HTTP 403, Bug 71 deploy-time test-activity removal) or **investigated + reclassified** (Bug 14: "cross-dossier refs" = `type=external` design).
+
+**What this does not mean** (corrected in Round 23 bookkeeping pass): "the walk" is complete only for the must-fix tier. The **should-fix table** has 31 open bugs + 10 closed; the **lower-priority table** has 16 open + 0 closed. Earlier round writeups implied a broader "walk complete" framing that wasn't accurate — the must-fix tier being done does not mean no bugs remain actionable. 47 open bugs across Should-fix + Lower-priority still exist, alongside 35 open observations and 21 open dups. Round 23's triage pass (below) addresses the unified open-items landscape.
 
 **Test suite trajectory:** the engagement started with ~510 tests across the five repos; it ends (for the must-fix walk) at **794 passing + 7 Sentry-skipped**. The delta isn't pure coverage gain — several rounds added or adjusted tests to match fixes rather than net-new coverage — but the suite has roughly 280 more green tests than it started with, and the shell spec's `test_requests.sh` end-to-end harness went from "25 OK with intermittent tracebacks and deadlocks" to "25 OK, exit 0, zero tracebacks, zero worker crashes, D1-D9 all green." That's the more durable signal.
 
@@ -638,23 +641,197 @@ Round 22 closes the must-fix walk. Across Rounds 1-22 (some of which bundled mul
 4. **Test docstrings explain what they pin AND what they don't** (Round 21 onwards). After the over-claimed enumeration-resistance test in Round 21, the practice is to state the test's boundary — "does not claim X, because X is a stronger property than the fix targets" — so a future reader doesn't think a weaker assertion is a coverage gap.
 
 **Operational notes surfaced mid-walk (not bugs):**
-- **Obs-58** (Round 19) — stale migration version files. Round 8's append-only guard catches mutations but not stale leftovers from consolidation. Candidate follow-ups: CI migration preflight job, or static consistency check scanning for redundant DDL across migration files. Filed as observation, tractable as a small dedicated round.
+- **Obs 94** (Round 19, originally filed as "Obs-58", renumbered in Round 24) — stale migration version files. Round 8's append-only guard catches mutations but not stale leftovers from consolidation. Candidate follow-ups: CI migration preflight job, or static consistency check scanning for redundant DDL across migration files. Filed as observation, tractable as a small dedicated round.
 - **Worker schema-retry loop** — surfaced in Round 19's shell-spec log during CI debugging; already present behaviour, no action needed, worth knowing about.
 - **Historical silent failures** (Round 18 aftermath) — pre-Bug-30 failed bijlage moves left aanvragen with broken refs permanently; file service `temp/` cleanup has likely reaped the unmoved files. Operators should expect "move_bijlagen task failed after N retries" as the new normal signal for stuck aanvragen.
 
-### Where to go next (in priority order)
+### Round 23 — Bookkeeping correction + unified triage of all open items
 
-The severity-first walk is done; what's open now is no longer ordered by severity but by whether it's structural, observational, or optional.
+This round is not a fix round. Two things delivered:
+1. **Bookkeeping correction** of counts across the summary, observations, and duplication sections (drift accumulated over ~8 rounds of summary updates where I'd been carrying forward "57 observations" and "22 open dups" without revalidating against the actual listed items).
+2. **Unified triage** of every open actionable item — 47 open bugs, 35 open observations, 21 open dups — grouped by shape-of-work rather than source table, with a verdict per category.
 
-1. **Structural — Obs-58 (migration consistency checks).** Carried over from Round 19's CI investigation. Tractable as a small dedicated round: either a CI migration preflight job (runs `alembic upgrade head` against a fresh Postgres, fails the build if rc≠0), or a static scanner flagging redundant DDL across migration files, or both. Concrete value because Round 21's CI blowup could happen again otherwise.
+#### Precise counts after Round 23 reconciliation
 
-2. **Observational pass — walk the ~57 open observations**. Different beast from bug-fix rounds: lower stakes per item, higher volume. Some are simple doc fixes; some are opinion pieces that deserve discussion rather than fixes; some will reveal actual bugs. Probably wants a different round cadence — "survey + triage + batch" rather than "fix + test + ship" — so we can sort the 57 into (a) quick fixes, (b) deferred/accepted, (c) escalate-to-bug.
+| Source | Open | Closed | Deferred / Investigated |
+|---|---|---|---|
+| Must-fix bug table | 0 actionable | 17 | 5 (3 deferred, 1 investigated-as-non-bug, 1 product decision) |
+| Should-fix bug table | 31 | 10 | 0 |
+| Lower-priority bug table | 16 | 0 | 0 |
+| Structural observations | 35 | 7 + 1 partial | 1 deferred |
+| Duplication targets | 21 | 6 | 0 |
+| **Total open work items** | **~103** | 40 | 6 |
 
-3. **Duplication cleanup — ~22 remaining dups.** Lowest urgency. D1/D2/D4/D22/D25 were closed opportunistically during bug fixes; the remainder are standalone dedup tasks.
+Item overlap exists (several observations are reference-entries for bugs in the bug tables — for example "README claims externals in both used/generated" = Bug 56 = obs line 174). Distinct work items after overlap resolution: probably ~90.
 
-4. **Deferred items that previously remained closed, still closed:**
-   - Obs-3 (write-on-change for `set_dossier_access`) — product decision.
-   - Bug 63 follow-up (enumeration alerting) — SIEM operators own it.
-   - Worker schema-retry loop — already present.
+#### Category-level triage
 
-**Recommendation.** Obs-58 before starting the observations pass — it's a discrete, high-value piece that closes a CI failure mode we saw, and it leaves the repo better instrumented for the observations work that follows. The observations pass is a substantial enough change in cadence that a checkpoint conversation before starting it would be worth having.
+Organized by shape-of-work rather than by source table. Each category has a verdict (`batch-fix` / `batch-defer` / `cherry-pick` / `reconcile`) and the reasoning. Items already catalogued as bugs keep their bug number; observations without one are cited by review line where useful.
+
+##### Category 1 — Doc-only fixes (cherry-pick, ~6 quick-fix rounds worth in aggregate)
+
+Standalone factual corrections to docstrings, README, and templates. Low risk, low effort, immediate value:
+
+- **Bug 56** — README claims external-overlap allowed; code rejects. *Fix: correct the README.* (Sev 6, misleading to new contributors.)
+- **Bug 69** — Dossiertype template tombstone block doesn't match production workflow. *Fix: update the template.* (Sev 7, trips up plugin authors.)
+- **Bug 66** — Relation validator keying rules (three styles) undocumented. *Fix: add a short paragraph to the relations doc.* (Sev 7.)
+- **Obs 67** — Pipeline doc's "UPDATE must happen after persistence" factually wrong. *Fix: correct the doc.*
+- **Obs 68** — Pipeline doc's `ActivityState` field table covers ~⅓ of fields, presented as complete. *Fix: either complete the table or rewrite as "selected fields."*
+- **Obs 72** — Template's endpoint docs omit workflow-name prefix; 4 different URL forms, none matching production. *Fix: update template endpoints.*
+
+**Verdict: batch-fix as a single doc-round.** ✅ **Shipped in Round 24.** All 6 items closed — Bugs 56/66/69 and Obs 67/68/72. Three redundant observations (Obs 69/71/73) closed alongside their bug counterparts. Full engine test suite stayed green (docs-only changes, 726 passed + 7 skipped).
+
+##### Category 2 — Small-surface behaviour fixes (cherry-pick, sev-ordered)
+
+Concrete behaviour bugs that are each ~30-100 lines of code + tests. Each wants its own round with verify-plan-fix-test-ship:
+
+- **Bug 4** — `Session` type annotation never imported. *Surface: typing only, runtime-safe but IDE-visible.*
+- **Bug 9** — N+1 in dossier detail view. *Sev 2 but directly user-visible as page-load latency.*
+- **Bug 13** — Deprecated `@app.on_event("startup")`. *Modernization, small fix.*
+- **Bug 20** — `_PendingEntity` missing several fields → `AttributeError`. *Sev 3, can crash on specific input shapes.*
+- **Bug 27** — `DossierAccessEntry.activity_view: str` too narrow (should be Literal). *Type tightening.*
+- **Bug 28** — `POCAuthMiddleware` silently overwrites on duplicate usernames. *Boot-time validation gap; should fail loudly.*
+- **Bug 34** — `authorize_activity` catches broad `Exception`. *Hides real errors.*
+- **Bug 39** — `TaskEntity.status: str` → `Literal[...]`. *Type tightening.*
+- **Bug 43** — `Aanvrager.model_post_init` raises ValueError without Pydantic shape. *422 error shape wrong.*
+- **Bug 48** — `.meta` filename not sanitized. *Security-adjacent.*
+- **Bug 50** — Migration fallback uses module-level `SYSTEM_ACTION_DEF` with bare name. *Should use qualified.*
+- **Bug 59** — Unregistered validators silently skip. *Config error becomes silent bug.*
+- **Bug 60** — `alembic/env.py` nested `asyncio.run()` hazard. *Migration reliability.*
+- **Bug 67** — `_errors.py` payload key collision. *Error shape wrong in specific cases.*
+
+**Verdict: cherry-pick, order by severity.** 14 items. Probably a second severity-first walk (Bugs 4, 9, 13, 19, 20, 27-28 first, then 34-39-etc) across ~4-6 rounds if bundled sensibly. The top 4 (Bugs 9, 20, 27, 28) feel like the priority: direct user-visible or correctness-visible. The rest can be a clean-up batch.
+
+##### Category 3 — Caching & performance polish (batch-fix as one round)
+
+Small perf wins, each ~10-30 lines:
+
+- **Bug 38** — No per-user authorize cache. (cross-ref obs line 188.)
+- **Obs 75** — Cache `SearchSettings()` at module load.
+- **Obs 76** — `is_singleton` cache.
+- **Obs 77** — `derive_status` prefers `dossier.cached_status` first.
+- **Obs 78** — `check_workflow_rules` passes `known_status` from `state.dossier.cached_status`.
+
+**Verdict: batch-fix as one perf-round.** The pattern is the same (cache what's expensively re-computed); doing them together gives a single set of benchmarks + "cache invariants doc" as the deliverable. One round, maybe two.
+
+##### Category 4 — Lineage walker completion (cherry-pick, 2 bugs)
+
+Bug 55 (Round 19) did the cross-dossier defense. The lineage walker has two more open items:
+
+- **Bug 53** — frontier growth unbounded.
+- **Bug 54** — returns None for both "not found" and "ambiguous" — caller can't distinguish.
+
+**Verdict: one round, both together.** They share the walker's state machine; fixing them in one pass means one coherent "lineage walker completion" round with regression tests for both semantics.
+
+##### Category 5 — Plugin-surface tightening (medium, needs design)
+
+Multi-item cluster that wants a coherent decision before coding:
+
+- **Obs 56 + obs line 160** — Centralize plugin validation; docs promise 15 field validations, 3 actually run.
+- **Obs 58** — `authorize_activity` pre/post-creation modes should split.
+- **Obs 59** — Load-time validation for `status:` dict-form shape.
+- **Obs 60** — `eligible_activities` column: `Text` → `JSONB`.
+- **Obs 62** — Remove legacy `handle_beslissing`.
+- **Obs 64** — `systemAction` sub-types should be introduced.
+- **Obs 65** — Document `systeemgebruiker` role grants; add `caller_only: "system"` check.
+
+**Verdict: design-discussion round first, then fix-rounds.** Several of these are interconnected (plugin validation centralization would naturally produce the missing validators; splitting `authorize_activity` affects the validation pipeline). Don't cherry-pick blindly; agree the shape first.
+
+##### Category 6 — Larger refactors (batch-defer with revisit trigger)
+
+These are the "worker.py is 1,340 lines" class of items. Each is substantial rework in codebase that currently works:
+
+- **Obs 50** — Worker split into poll/execute/retry/requeue/signals.
+- **Obs 51** — Unify relation shape in `ActivityState` (4 in-memory shapes for one concept).
+- **Obs 53** — Extract `prov_columns_layout.py` (~280 lines of pure layout).
+- **Obs 54** — Untangle import-inside-function cycles.
+- **Obs 55** — Rationalize `namespaces.py` singleton + scattered `try/except RuntimeError` fallbacks.
+- **Obs 91** — Share layout between `archive.render_timeline_svg` and columns graph.
+- **Obs 92** — `activity_view` mode complexity reduction.
+- **Bug 61** — `activity_relations` indices cost writes but zero readers.
+
+**Verdict: defer with explicit revisit trigger.** These earn their cost when *adding a feature* in the area — the refactor unblocks the feature work. Doing them speculatively in a standalone round is optimization without a forcing function. Exception: **Obs 53** (prov_columns_layout extraction) is a pure function of inputs, already identified as "easy to isolate" — it's a cheap win if anyone wants to grab it. Filing as "available but not scheduled."
+
+##### Category 7 — Test & deployment infrastructure (cherry-pick, ~3 rounds)
+
+Test-infra quality-of-life items. Low user-facing impact but affects future development velocity:
+
+- **Obs 82** — Test fixtures use direct Repository + no unit-isolation story documented.
+- **Obs 85** — Dependency-override-friendly auth for tests.
+- **Obs 86** — Signing key rotation support (only one key accepted).
+- **Obs 87** — Migration framework top-level audit log.
+- **Obs 88** — `DataMigration.transform` signature widening.
+- **Obs 89** — Cross-workflow task permission model.
+- **Obs 94** — Migration consistency checks (CI preflight, Round 19 origin; renumbered in Round 24).
+- Anonymous Should-fix items: Alembic subprocess timeout, file-service signing_key default at startup, plugin-load cross-check, worker's recorded tasks don't pass `anchor_entity_id`/`anchor_type`, archive size cap, `app.py:69` appends SYSTEM_ACTION_DEF by reference.
+
+**Verdict: cherry-pick across 2-3 rounds.** Obs 94 + the two migration-framework items (Obs 87, Obs 88) can be one migration-infra round. Dependency-override auth + signing key rotation + test unit-isolation can be one test-infra round. Cross-workflow task permissions is its own thing. The anonymous Should-fix items are small each; could be a "miscellaneous tightening" round.
+
+##### Category 8 — Duplication targets (batch-defer with opportunistic closure)
+
+Of 21 open dups, most are "two functions share a pattern, extract a helper." All genuine but none acute:
+
+- D3 (prov_type_value not used by all callers), D5 (4 copies of latest-version subquery), D6 (cache returns mutable), D7 (reindex loops 90% identical), D8 (`get_typed` vs `get_singleton_typed`), D10 (3 reindex_*), D11 (upload/download 7-param extraction), D12 (informed_by normalization in 4 places), D13 (_supersede_matching vs cancel_matching_tasks), D14 (tombstone tests), D15 (DossierAccessEntry docstring drift), D16 (validator-fn registration pattern), D17 (entities route access-check preamble), D18 (plugin-load sequence), D19 (scheduled_for parsing), D20 (`parse_activity_view` split across 3 route files), D21 ("filter activities by user access" hand-rolled in 4 places), D23 (find systemAction in 2 places), D24 (Alembic indices vs __table_args__ drift), D26 (sign_token/verify_token payload-string), D27 (test-setup helpers in 4+ files).
+
+**Verdict: batch-defer; close opportunistically when touching the file for another reason.** Same framing as Category 6's larger refactors — the dedup earns its cost when you're already in the area. Two exceptions worth escalating: **D6** (caller mutation corrupts cache) is a latent bug in waiting; **D24** (Alembic indices drift from `__table_args__`) is the exact shape that bit Round 21's CI (stale migration). Those two could be promoted.
+
+##### Category 9 — Meta-patterns (one-round each, if taken)
+
+The Meta-patterns section documents 6 high-level systemic patterns (line 242-onwards). Several have had partial relief shipped across the walk (harness 1/2/3, signing-key-rotation stubs, etc.). The remaining open meta-patterns want their own focused discussion rather than a generic triage line. Out of scope for this triage pass.
+
+##### Category 10 — Reconciliation items
+
+Items that are **duplicates across tables** and should be merged:
+
+- Obs line 169 (lineage walker cache + not-found/ambiguous disambiguation) = Bugs 53 + 54. **Already covered in Category 4** — should drop the observation as redundant.
+- Obs line 174 (README external-overlap) = Bug 56. **Already covered in Category 1.**
+- Obs line 176 (dossiertype tombstone) = Bug 69. **Already covered in Category 1.**
+- Obs line 178 (relation validator keying) = Bug 66. **Already covered in Category 1.**
+- Obs line 187 (reindex pagination) = Bug 25. **Covered in Category 2 cherry-picks.**
+- Obs line 188 (per-user eligibility cache) = Bug 38. **Already covered in Category 3.**
+- Obs line 159 (plugin validation ↔ Bug 59 territory) — Bug 59 is Category 2; obs is Category 5. These are related but not duplicates.
+
+**Verdict: reconcile in the observations section** — add "(covered by Bug N)" tags to the 6 duplicate observations so future readers aren't confused. Mechanical cleanup, can be rolled into the next bookkeeping touch.
+
+#### Summary — what the triage says to do next
+
+| Priority | Category | Approach | Estimated rounds |
+|---|---|---|---|
+| ✅ Done | Cat 1 — Doc-only fixes | batch-fix | 1 (shipped Round 24) |
+| 1 | Cat 4 — Lineage walker completion (Bugs 53, 54) | one coherent round | 1 |
+| 2 | Cat 3 — Caching & perf | batch-fix | 1-2 |
+| 3 | Cat 2 — Small-surface behaviour fixes | cherry-pick, sev-first | 4-6 |
+| 4 | Cat 7 — Test/deployment polish | cherry-pick | 2-3 |
+| 5 | Cat 5 — Plugin-surface (needs design first) | discussion + fix rounds | 1 design + 2-4 fix |
+| — | Cat 6, 8, 9 | defer with revisit trigger | 0 scheduled |
+| — | Cat 10 | reconciliation done via Round 24's cross-refs | complete |
+
+**Total scheduled work across categories 2-5 + 7:** ~9-13 rounds, plus Cat 5's design discussion. Cat 1 closed in Round 24.
+
+**The "top-of-queue" question** — if we're picking the next one — is **Cat 4 (lineage walker, Bugs 53+54)**. It completes a defense-in-depth suite started in Round 19 (Bug 55's cross-dossier check) and is one coherent round. Alternatively Cat 3 (caching/perf batch) if you'd rather knock out several small wins in one pass. Either is a reasonable next step; Cat 4 finishes a thread, Cat 3 starts clearing the perf cluster.
+
+### Round 24 — Observation numbering + Cat 1 doc-fix batch
+
+Two deliverables: comprehensive observation-numbering pass (the "Obs N" labels were inconsistent — six sections had 44 bullets where only Obs 50-56 were explicitly numbered, with a provisional "Obs-58" from Round 19 colliding with a new Obs 58), then the six Cat 1 doc fixes from Round 23's triage.
+
+**Numbering pass.** All 45 observations now sequential Obs 50-94, formatted consistently as `Obs NN — Title.` with status tags preserved. Six observations carry explicit `(covered by Bug N)` cross-references where they duplicate an already-catalogued bug (Obs 66 ↔ Bugs 53/54; Obs 69 ↔ Bug 56; Obs 71 ↔ Bug 69; Obs 73 ↔ Bug 66; Obs 80 ↔ Bug 25; Obs 81 ↔ Bug 38). The Round 19 provisional `Obs-58` (migration consistency checks) was renumbered to **Obs 94** and moved to the end of the "Specific refactors named" subsection — a note in both the Round 19 retrospective and the Round 23 triage explains the renumbering so future readers can cross-reference. Twenty-one `Obs (line N)` placeholders in the Round 23 triage rewritten to proper `Obs NN` via scripted replacement (21/21 matched).
+
+**Cat 1 doc-fix batch (6 items, all shipped):**
+
+1. **Bug 56 — README external-overlap claim.** `README.md` line 1164 falsely claimed externals in both `used`/`generated` are "allowed because externals are not PROV entities in the disjoint sense." Verified against `dossier_engine/engine/pipeline/invariants.py::enforce_used_generated_disjoint` (lines 30-116, explicit docstring: "externals that appear in `used` must not also appear in `generated`") and `tests/unit/test_invariants.py::test_external_overlap_by_uri` — the code actually rejects with `422 used_generated_overlap`, payload `kind: "external"`. Rewrote D5 description to enumerate six negative cases (was "five + one positive") and explicitly describe the symmetric external-URI rejection. Cross-refs the authoritative code + test by filename.
+
+2. **Bug 69 — dossiertype template tombstone shape.** `dossiertype_template.md` showed the dict-of-dicts form `allowed_roles: - role: "beheerder"` with a comment claiming the three authorization patterns from the activity section apply. Verified against `dossier_engine/app.py:138-142` which iterates `ts_roles` (a bare list) via `for r in ts_roles` and constructs `{"role": r}` per element — feeding the dict form would produce the broken nested `{"role": {"role": "beheerder"}}` structure at runtime. Production `workflow.yaml:147-148` uses the simple-list form. Rewrote the template's tombstone block to show the correct shape with a comment explaining why the dict form doesn't work and that per-role scopes aren't supported for tombstone (all-or-nothing capability per role).
+
+3. **Bug 66 — relation validator keying rules.** `docs/plugin_guidebook.md`'s plugin-interface table had a single line for `relation_validators` ("Relation type → async validator") — understating the three resolution styles the engine supports. Verified against `engine/pipeline/relations.py::_resolve_validator` (lines 365-403, three priority-ordered lookup styles: per-operation `validators: {add, remove}` dict, activity-level single `validator:` string, plugin-level by relation-type name). Added a new "Relation-validator keying" subsection after the plugin-interface table documenting all three styles with YAML examples and resolution priority, plus a warning about the key-space ambiguity — the same `plugin.relation_validators` dict is used for both named-validator lookups (Styles 1/2) and by-type lookups (Style 3), so validator names that collide with relation types produce confusing behaviour. Flagged the table entry to cross-ref the new subsection.
+
+4. **Obs 67 — pipeline doc "UPDATE after persistence" claim.** Two paragraphs in `docs/pipeline_architecture.md` (lines 91 + 97) claimed `determine_status` does an "UPDATE" that requires the activity row to be persisted first. Verified against `dossier_engine/engine/pipeline/finalization.py::determine_status` — the function writes to `state.activity_row.computed_status`, which is an attribute set on a tracked ORM object (the row is in the session from phase 12's persistence). SQLAlchemy batches the dirty-flag write into the next flush/commit; there's no standalone UPDATE statement. Rewrote both paragraphs to describe the real mechanism: "the row must be in the session so the dirty-flag write is picked up on the next flush/commit; phase 12's persistence is what puts the row in the session."
+
+5. **Obs 68 — ActivityState field table.** The pipeline doc's `ActivityState` field table (10 rows) was presented as a complete lifecycle listing but `state.py:ActivityState` actually has **~37 fields** (~17 inputs + ~20 phase outputs). The table also contained a factual error: a `computed_status` row, but there's no `ActivityState.computed_status` field — the activity's resolved status lives in `state.final_status` and is mirrored to `state.activity_row.computed_status` (two distinct fields, with `determine_status` setting both). Reframed the table as "a curated walkthrough of the fields that matter at phase boundaries, not an exhaustive listing," redirected readers to the class definition as source-of-truth, fixed the `computed_status` row to `final_status`, added `activity_row` and `current_status` rows for completeness, and added a note explaining the two-place-status-mirroring relationship.
+
+6. **Obs 72 — template endpoint docs workflow-name prefix.** `dossiertype_template.md` had two broken URL forms: line 716's example showed `@app.get("/dossiers/toelatingen/search", ...)` hardcoding the workflow name after `/dossiers/`, and line 880's endpoint table showed `GET /dossiers/{workflow}/search`. Production `dossier_toelatingen/__init__.py` registers search at `/toelatingen/dossiers` (workflow-name-first, not `/dossiers/toelatingen/...`) plus `/toelatingen/admin/search/{recreate,reindex,reindex-all}` for admin endpoints. Rewrote the template's `search_route_factory` example to show the correct shape with explanatory prose about the workflow-name-first convention and its rationale (plugin-registered routes under `/{workflow}/...` don't collide with engine's built-in `/dossiers/...` routes), and updated the endpoint table row from the fictional form to the real `/{workflow}/dossiers` plus a new row for admin endpoints.
+
+**Verification.** Docs-only changes; no code modified. Engine suite re-run (726 passed + 7 Sentry-skipped, identical to Round 23 — no regressions, no flakes in the test code itself; the one PG flake on first run was the sandbox's known issue, resolved by restart). Other suites unchanged: toelatingen 22, common 18, file_service 21. Shell spec not re-run in this round (it doesn't exercise documentation).
+
+**Totals after Round 24:** 30 bugs fixed (was 27) — Bugs 56, 66, 69 added to the closed column. Should-fix table: 28 open + 13 closed (was 31 open + 10 closed). Observations: 30 open + 13 closed + 1 partial + 1 deferred = 45 total (was 35 open + 7 closed + 1 + 1 = 44 listed, one added via Obs 94 renumbering). Lower-priority and Must-fix tables unchanged.
+
+**Process note worth capturing for future rounds.** Two Cat 1 items (Obs 67, Obs 68) turned out to involve factual code-doc mismatches that had been mis-summarized in the review itself. Obs 67 was "UPDATE must happen after persistence" — but the real issue is that there's no UPDATE; the doc had invented a mechanism that didn't exist. Obs 68 was "⅓ of fields documented, presented as complete" — but the table also contained a `computed_status` row that referred to a field that doesn't exist on `ActivityState`. In both cases the observation's one-line summary was less wrong than the doc it described, and "fixing the doc" meant more than textual change — it meant reading the code carefully enough to describe the actual behaviour. **Takeaway: doc-fix rounds should verify-before-plan the same way behaviour-fix rounds do.** Read the code, understand what the doc is supposed to describe, then write. The "doc-only" framing can mask the real work, which is re-establishing ground truth.

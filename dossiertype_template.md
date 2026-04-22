@@ -41,12 +41,19 @@ version: "1.0"                    # version of this workflow definition
 # If this block is omitted, the workflow has no tombstone capability
 # at all and all tombstone attempts return 403.
 #
+# `allowed_roles` is a flat list of bare role names. The engine's
+# loader (app.py's plugin-registration loop) reads this list and
+# builds the tombstone activity's `authorization.roles` entries
+# from it — one `{role: <name>}` dict per list item. Do NOT write
+# the dict form here; this is consumed as a plain list of strings.
+# Per-role scopes (property-derived, entity-derived) aren't
+# supported for tombstone in the engine today — tombstone is an
+# all-or-nothing capability per role.
+#
 # tombstone:
 #   allowed_roles:
-#     - role: "beheerder"
-#     # Any of the three authorization patterns (direct, scoped,
-#     # entity-derived) described in the activity authorization
-#     # section can be used here.
+#     - "beheerder"
+#     - "archivist"  # any number of role names
 ```
 
 ---
@@ -702,20 +709,30 @@ async def update_search_index(repo, dossier_id, activity_type, status, entities)
 
 ### search_route_factory
 
-Registers workflow-specific search endpoints during app startup.
+Registers workflow-specific search endpoints during app startup. The plugin is free to choose its own URL shape, but the production convention is **workflow-name-first** — `/{workflow}/...` — so that every route registered by the plugin is name-spaced under its workflow and doesn't collide with the engine's built-in `/dossiers/...` routes. The engine's route modules (activities, entities, PROV, archive) live under `/dossiers/{id}/...`; plugin-specific endpoints live under `/{workflow}/...`.
 
 ```python
 def register_search_routes(app, get_user):
-    @app.get("/dossiers/toelatingen/search", tags=["toelatingen"])
-    async def search_toelatingen(
+    # Workflow-specific search lives under /{workflow}/..., NOT under
+    # /dossiers/{workflow}/... — the latter would shadow the engine's
+    # own /dossiers/... routes.
+    @app.get("/{workflow}/dossiers", tags=["{workflow}"])
+    async def search_dossiers(
         q: str = None, gemeente: str = None, status: str = None,
         user: User = Depends(get_user),
     ):
-        results = await es.search(index="dossiers-toelatingen", body=build_query(...))
+        results = await es.search(index="dossiers-{workflow}", body=build_query(...))
         return {"results": results}
+
+    # Admin endpoints follow the same convention. toelatingen uses
+    # /{workflow}/admin/search/recreate, /{workflow}/admin/search/reindex,
+    # /{workflow}/admin/search/reindex-all — see dossier_toelatingen/__init__.py
+    # for the canonical example.
 ```
 
-The `/dossiers` endpoint remains as a basic stub for simple listing.
+Substitute `{workflow}` with the plugin's actual name when registering — FastAPI won't interpret `{workflow}` in the path-decorator string the way it does `{id}` in a handler parameter. It's a placeholder in this template to show the shape; the real plugin code would use `"/toelatingen/dossiers"` literally.
+
+The engine's generic `GET /dossiers` endpoint remains available as a basic stub for cross-workflow listing.
 
 ---
 
@@ -870,7 +887,8 @@ Users without any matching `access` entry get HTTP 403.
 | `PUT` | `/dossiers/{id}/activities` | Execute batch activities atomically |
 | `GET` | `/dossiers/{id}` | Get dossier detail (filtered by access) |
 | `GET` | `/dossiers` | List dossiers (stub — use workflow search) |
-| `GET` | `/dossiers/{workflow}/search` | Workflow-specific search (Elasticsearch) |
+| `GET` | `/{workflow}/dossiers` | Workflow-specific search (Elasticsearch; registered by the plugin's `search_route_factory`) |
+| `POST` | `/{workflow}/admin/search/{recreate,reindex,reindex-all}` | Admin-only index management (plugin-registered) |
 | `GET` | `/dossiers/{id}/entities/{type}` | All versions of an entity type |
 | `GET` | `/dossiers/{id}/entities/{type}/{entity_id}` | All versions of a logical entity |
 | `GET` | `/dossiers/{id}/entities/{type}/{entity_id}/{version_id}` | Single entity version |

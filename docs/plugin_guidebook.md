@@ -764,7 +764,7 @@ Everything a plugin can register:
 | `status_resolvers` | `dict[str, Callable]` | Status resolver name → async function (split-style) |
 | `task_builders` | `dict[str, Callable]` | Task builder name → async function (split-style) |
 | `validators` | `dict[str, Callable]` | Validator name → async function |
-| `relation_validators` | `dict[str, Callable]` | Relation type → async validator |
+| `relation_validators` | `dict[str, Callable]` | Relation type **OR** named validator → async validator. See "Relation-validator keying" below for the three resolution styles. |
 | `field_validators` | `dict[str, Callable]` | Validator name → async function |
 | `task_handlers` | `dict[str, Callable]` | Task function name → async function |
 | `pre_commit_hooks` | `list[Callable]` | Strict hooks (can veto activity) |
@@ -774,3 +774,52 @@ Everything a plugin can register:
 | `constants` | `BaseSettings` | Typed workflow constants (env vars + YAML) |
 
 Most plugins use only `entity_models`, `handlers`, and perhaps `task_handlers`. Everything else is opt-in for when you need it.
+
+### Relation-validator keying
+
+The `relation_validators` dict looks simple in the table above, but the engine's resolver checks **three styles in priority order** when a relation of type `T` is being added/removed by an activity. Plugins may mix styles across activities; the first one that resolves wins.
+
+**Style 1 — per-operation validators (activity-level, recommended):**
+
+```yaml
+activities:
+  - name: oe:beslissen
+    relations:
+      - type: "oe:betreft"
+        kind: domain
+        validators:
+          add: "validate_betreft_target"
+          remove: "validate_betreft_removable"
+```
+
+The `validators` block is a dict with `add` and/or `remove` keys. Each value is a **named validator** that must be registered in the plugin's `relation_validators` dict under that same name (`plugin.relation_validators["validate_betreft_target"]`). Different functions run for add vs remove operations — the usual case when add-side needs to verify the target exists and remove-side needs to verify nothing else depends on it.
+
+**Style 2 — single validator string (activity-level, legacy shorthand):**
+
+```yaml
+activities:
+  - name: oe:beslissen
+    relations:
+      - type: "oe:betreft"
+        validator: "validate_betreft_target"
+```
+
+Single `validator:` key on the declaration fires for all operations (both add and remove). Legacy; prefer Style 1 when add/remove need different checks.
+
+**Style 3 — plugin-level by relation type name (original, fallback):**
+
+```python
+plugin.relation_validators = {
+    "oe:betreft": validate_betreft,
+}
+```
+
+If styles 1 and 2 don't register anything, the resolver falls back to looking up the **relation type itself** as the dict key. Predates activity-level declarations. Still honored for back-compat but doesn't support per-operation split.
+
+**Resolution order** (from `engine/pipeline/relations.py::_resolve_validator`):
+1. Activity-level `validators.{add,remove}` → plugin named-validator lookup.
+2. Activity-level `validator:` string → plugin named-validator lookup.
+3. Plugin-level `relation_validators[<relation_type>]` direct lookup.
+4. None (validation skipped for this relation).
+
+Note the key-space ambiguity in Style 1/2 vs Style 3: the plugin's `relation_validators` dict is used for **both** named-validator lookups (Styles 1/2) *and* by-type lookups (Style 3). Don't register a validator function under a name that collides with a relation type — Style 3's fallback would pick it up for unrelated activities. Convention is to prefix names like `validate_` to avoid collision with `oe:` relation types.

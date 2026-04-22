@@ -88,13 +88,13 @@ Everything goes to the database: generated entities, used links, activity-relati
 
 **Why after the handler?** Because the handler may have added entities to `state.generated` or modified entity content. Persisting before the handler runs would miss those additions.
 
-**Why before status determination?** Because `determine_status` reads the activity's `computed_status` from the YAML and stamps it on the activity row. The activity row must already be persisted (phase 12) for this UPDATE to work.
+**Why before status determination?** Because `determine_status` resolves the activity's status (from YAML literal, handler override, or entity-field mapping) and writes it to `state.activity_row.computed_status`. The activity row must be in the session so the dirty-flag write is picked up on the next flush/commit; phase 12's persistence is what puts the row in the session. This is not a separate UPDATE statement — it's an attribute write on a tracked ORM object that SQLAlchemy batches into the transaction's flush.
 
 ### Phases 15–18: Post-persistence effects
 
 These phases create secondary effects based on the now-persisted activity.
 
-**Status determination (15)** stamps the status on the activity row. Must happen after persistence so the row exists.
+**Status determination (15)** sets `activity_row.computed_status`. Runs after persistence (phase 12) because that's when the row enters the session; the status write is an in-memory attribute set that flushes with the rest of the transaction, not a standalone UPDATE.
 
 **Side effects (16)** are recursive child activities (e.g., `setDossierAccess` fires automatically after `dienAanvraagIn`). They run through the full pipeline themselves, so they need the parent activity's entities to be persisted and visible. A `session.flush()` runs before side effects to ensure the parent's writes are visible within the transaction.
 
@@ -116,7 +116,9 @@ Derives the current dossier status from all activities, computes which activitie
 
 ## The ActivityState object
 
-`ActivityState` is a mutable dataclass that flows through every phase. Each phase reads some fields and writes others. The fields are documented with "set by phase X" comments, but there's no compile-time enforcement. Here's the lifecycle:
+`ActivityState` is a mutable dataclass that flows through every phase. Each phase reads some fields and writes others. The fields are documented with "set by phase X" comments in the class itself (`dossier_engine/engine/state.py`), but there's no compile-time enforcement.
+
+The class has **~37 fields** — ~17 inputs set by the orchestrator from the request, ~20 phase outputs populated as the pipeline runs. The table below is a **curated walkthrough of the fields that matter at phase boundaries**, not an exhaustive listing. The source-of-truth for field-by-field semantics is the class definition at `state.py:ActivityState`; each field there carries a comment describing what phase sets it and what downstream reads it. When adding a new phase or modifying an existing one, read the class directly — duplicating the full field list here would just invite drift.
 
 | Field | Set by | Read by |
 |---|---|---|
@@ -128,8 +130,12 @@ Derives the current dossier status from all activities, computes which activitie
 | `validated_relations` (`list[ValidatedRelation]`) | process_relations | persistence |
 | `validated_domain_relations` (`list[DomainRelationEntry]`) | process_relations | persistence |
 | `validated_remove_relations` (`list[DomainRelationEntry]`) | process_relations | persistence |
+| `activity_row` | create_activity_row | persistence, determine_status, finalization |
 | `handler_result` | run_handler | persistence, task scheduling |
-| `computed_status` | determine_status | finalization |
+| `final_status` | determine_status | finalization, response builder |
+| `current_status` | finalize_dossier | post-activity hook, response builder |
+
+Note that the activity's resolved status lives in two places: `state.final_status` mirrors it for downstream phase consumption, and `state.activity_row.computed_status` is the persisted value (set as an in-memory attribute in phase 15 and flushed with the rest of the transaction — not a separate UPDATE). These are always kept in sync by `determine_status`; readers that need "what did this activity decide" can use either.
 
 The intermediate collections (`used_refs`, `validated_relations`, the two domain-relation lists) are typed as lists of frozen dataclasses. Reading a field a phase has not yet set gets you an empty typed list, and attribute access on items catches most shape bugs at development time rather than runtime. Input collections (`used_items`, `generated_items`, `relation_items`) stay as Pydantic-validated dicts because they come from the HTTP request body. The handler-facing collections (`generated`, `allowed_activities`, `handler_tasks`) remain as dicts — typing those would widen into the plugin API.
 

@@ -1161,7 +1161,7 @@ The test script (`test_requests.sh`) creates 9 dossiers:
 
 - **D4 — Batch explicit ref.** Same shape as D3 but with an explicit `used` reference between the two batched activities, exercising the non-auto-resolve path.
 
-- **D5 — Derivation rules (negative tests).** Five negative cases covering missing derivation chain, stale derivedFrom pointers, cross-entity derivation, unknown parent versions, and the disjoint-invariant check (an attempt to list the same entity in both `used` and `generated` fails with `422 used_generated_overlap`). Also a positive test for external URIs appearing in both `used` and `generated` in the same activity, which is allowed because externals are not PROV entities in the disjoint sense.
+- **D5 — Derivation rules (negative tests).** Six negative cases covering missing derivation chain, stale derivedFrom pointers, cross-entity derivation, unknown parent versions, and two flavors of the disjoint-invariant check: listing the same logical entity in both `used` and `generated` fails with `422 used_generated_overlap`, and the same rule applies symmetrically to external URIs — an external URI that appears in both blocks of the same activity is rejected with the same `kind: "external"` overlap payload. See `invariants.enforce_used_generated_disjoint` and `test_invariants.py::test_external_overlap_by_uri` for the authoritative behaviour.
 
 - **D6 — Stale used + `oe:neemtAkteVan`.** Positive and negative paths for acknowledging newer versions of an entity the activity chose not to revise. Uses `doeVoorstelBeslissing` (a read-only activity anchored to the aanvraag) as the test vehicle because stale-used semantics only apply to activities that inspect an entity they don't themselves revise.
 
