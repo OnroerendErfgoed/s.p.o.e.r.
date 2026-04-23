@@ -1717,3 +1717,123 @@ class TestDossierAccessEntryActivityView:
         assert len(access.access) == 2
         assert access.access[0].activity_view == "own"
         assert access.access[1].activity_view == "all"
+
+
+# =====================================================================
+# Bug 39 / Round 32: TaskEntity.status + TaskEntity.kind contracts
+# =====================================================================
+
+
+class TestTaskEntityStatusAndKind:
+    """Round 32 tightened two fields on ``TaskEntity`` that had been
+    typed as bare ``str`` with the valid values only documented as
+    inline comments: ``status`` (5 values) and ``kind`` (4 values).
+    Same shape as Bug 27's ``DossierAccessEntry.activity_view`` fix,
+    simpler in that there's no policy decision — all nine values
+    are kept, just the types are narrowed.
+
+    Both fields are re-validated at read time via ``context.get_typed``
+    when ``system:task`` content is loaded through the
+    ``plugin.entity_models`` registration (see ``app.py:128``). No
+    production code path exercises that re-validation for tasks
+    today (the worker reads ``task.content`` as a raw dict), but the
+    path exists, which means the tightened types must be correct on
+    any data currently in the DB — not just on the write path. All
+    nine values are actively written by production code and no
+    historical migration introduced outliers, so the tightening is
+    backwards-compatible with existing task entities.
+    """
+
+    # --- status ---
+
+    def test_default_status_is_scheduled(self):
+        """A freshly-constructed ``TaskEntity`` defaults to
+        ``status="scheduled"``. Matches the ``tasks.py::_schedule_recorded_task``
+        production call site which passes ``status="scheduled"``
+        explicitly, and the docstring's lifecycle diagram which
+        starts every task at scheduled."""
+        from dossier_engine.entities import TaskEntity
+        task = TaskEntity(kind="recorded")
+        assert task.status == "scheduled"
+
+    def test_status_accepts_all_five_values(self):
+        """The five statuses in the lifecycle diagram are all
+        valid. Pin every value so a future refactor that drops
+        one by accident goes red here."""
+        from dossier_engine.entities import TaskEntity
+        for status in [
+            "scheduled", "completed", "cancelled",
+            "superseded", "dead_letter",
+        ]:
+            task = TaskEntity(kind="recorded", status=status)
+            assert task.status == status
+
+    def test_status_rejects_unknown_value(self):
+        """Anything outside the five documented statuses is
+        rejected at construction time. Guards against typos and
+        forward-compatibility assumptions."""
+        from pydantic import ValidationError
+
+        from dossier_engine.entities import TaskEntity
+        try:
+            TaskEntity(kind="recorded", status="pending")
+        except ValidationError:
+            return
+        raise AssertionError(
+            "TaskEntity should have rejected status='pending' "
+            "but accepted it. The Literal type on the status "
+            "field must have regressed."
+        )
+
+    # --- kind ---
+
+    def test_kind_accepts_all_four_values(self):
+        """The four task kinds in the ``TaskEntity`` docstring's
+        inline comment are all valid. Pin every value."""
+        from dossier_engine.entities import TaskEntity
+        for kind in [
+            "fire_and_forget", "recorded",
+            "scheduled_activity", "cross_dossier_activity",
+        ]:
+            task = TaskEntity(kind=kind)
+            assert task.kind == kind
+
+    def test_kind_rejects_unknown_value(self):
+        """Anything outside the four documented kinds is rejected.
+        Catches typos at both the YAML-defined task level (via
+        ``tasks.py::process_tasks`` which reads ``task_def.get("kind",
+        "recorded")``) and the HandlerResult-returned task level."""
+        from pydantic import ValidationError
+
+        from dossier_engine.entities import TaskEntity
+        try:
+            TaskEntity(kind="async_fire")
+        except ValidationError:
+            return
+        raise AssertionError(
+            "TaskEntity should have rejected kind='async_fire' "
+            "but accepted it. The Literal type on the kind "
+            "field must have regressed."
+        )
+
+    def test_kind_is_required(self):
+        """``kind`` has no default. The production call site at
+        ``tasks.py:166`` always passes it explicitly, and the
+        ``task_def.get("kind", "recorded")`` default happens one
+        layer up (at the YAML-read level). Pin the no-default
+        shape so a future change that adds a default like
+        ``kind = "recorded"`` has to go through this test
+        deliberately."""
+        from pydantic import ValidationError
+
+        from dossier_engine.entities import TaskEntity
+        try:
+            TaskEntity()  # no kind supplied
+        except ValidationError:
+            return
+        raise AssertionError(
+            "TaskEntity() should have failed — `kind` is "
+            "required and has no default. If you added a "
+            "default, update this test and add reasoning in "
+            "the Round 32 writeup about why."
+        )

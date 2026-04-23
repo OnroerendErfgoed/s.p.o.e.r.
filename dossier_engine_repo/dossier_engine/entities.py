@@ -76,7 +76,10 @@ class TaskEntity(BaseModel):
     full error history lives in the telemetry backend, keyed by
     task_id.
     """
-    kind: str                           # "fire_and_forget", "recorded", "scheduled_activity", "cross_dossier_activity"
+    kind: Literal[
+        "fire_and_forget", "recorded",
+        "scheduled_activity", "cross_dossier_activity",
+    ]
     function: Optional[str] = None      # plugin task function name
     target_activity: Optional[str] = None   # for kinds 3, 4
     target_dossier: Optional[str] = None    # for kind 4 (set by worker after function call)
@@ -84,7 +87,15 @@ class TaskEntity(BaseModel):
     scheduled_for: Optional[str] = None     # ISO datetime — original schedule, immutable
     cancel_if_activities: list[str] = []
     allow_multiple: bool = False
-    status: str = "scheduled"           # scheduled, completed, cancelled, superseded, dead_letter
+    # Bug 39 (Round 32): tightened from ``str`` to ``Literal[...]``.
+    # See the lifecycle diagram in the class docstring for the five
+    # valid values. Legacy DB rows are safe — the set hasn't changed
+    # since the initial schema migration (9d887db892c9) and all five
+    # values are actively written by production code.
+    status: Literal[
+        "scheduled", "completed", "cancelled",
+        "superseded", "dead_letter",
+    ] = "scheduled"
     result: Optional[str] = None        # URI or result data after completion
 
     # Anchor: the specific entity this task is scoped to, used for cancel,

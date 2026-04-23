@@ -10,16 +10,16 @@
 
 | Status | Count | Items |
 |---|---|---|
-| ✅ Fixed & verified | 37 | Bugs 1, 2, 4, 5, 6, 7, 9, 12, 15, 16, 17, 20, 27, 30, 32, 44, 47, 53, 54, 55, 56, 57, 58, 62, 64, 65, 66, 68, 69, 70, 72 (coverage), 73, 74, 75, 76, 77, 79 + Obs-2 (duplicate "external") |
+| ✅ Fixed & verified | 38 | Bugs 1, 2, 4, 5, 6, 7, 9, 12, 15, 16, 17, 20, 27, 30, 32, 39, 44, 47, 53, 54, 55, 56, 57, 58, 62, 64, 65, 66, 68, 69, 70, 72 (coverage), 73, 74, 75, 76, 77, 79 + Obs-2 (duplicate "external") |
 | 🔍 Investigated, not a bug | 1 | Bug 14 — cross-dossier refs are `type=external` rows |
 | 🛑 Deferred / accepted | 5 | Bug 28 (POC auth slated for replacement), Bug 31 (RRN acceptable), Bug 45 (MinIO migration), Bug 63 (403 is correct HTTP), Bug 71 (test activities, deploy-time removal) |
-| 🧪 Test suite | **876/876** passing | engine 811 (unit 330 + integration 481), toelatingen 26, file_service 21, common/signing 18 |
+| 🧪 Test suite | **882/882** passing | engine 817 (unit 336 + integration 481), toelatingen 26, file_service 21, common/signing 18 |
 | 🏃 `test_requests.sh` | **25/25 OK, exit 0, zero deadlocks, zero worker crashes** | D1–D9 green |
 | ✂️ Duplication closed | **D1, D2, D4, D22, D25** | Graph-loader consolidation + audit-emit wrapper |
 | 🧰 Harnesses installed | **3** | Guidebook YAML lint + phase-docstring lint + CI shell-spec wrapper |
 | 🤖 CI wired | **GitHub Actions** | `.github/workflows/ci.yml` — 4 jobs: pytest, shell-spec, doc-harnesses, migrations-append-only |
 | 🎯 Must-fix walk | **Complete** | All 17 fixable must-fix bugs closed; the 5 open rows are deferred/investigated by product decision (Bugs 14, 31, 45, 63, 71) |
-| 📦 Pending | 23 should-fix + 16 lower-priority bugs + 31 observations + 21 dups + 5 meta (partial relief) | See below |
+| 📦 Pending | 22 should-fix + 16 lower-priority bugs + 31 observations + 21 dups + 5 meta (partial relief) | See below |
 
 Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfaced and fixed in the same session as the harness that surfaced it.
 
@@ -78,7 +78,7 @@ Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfac
 | 34 | 4 | `authorize_activity` catches broad `Exception`. |  |
 | 35 | 4 | `reindex_common_too` does 3N queries for N dossiers. |  |
 | 38 | 4 | No per-user authorize cache. |  |
-| 39 | 4 | `TaskEntity.status: str` should be `Literal[...]`. |  |
+| ~~39~~ | 4 | ~~`TaskEntity.status: str` should be `Literal[...]`.~~ | ✅ **Fixed in Round 32.** Tightened to `Literal["scheduled", "completed", "cancelled", "superseded", "dead_letter"] = "scheduled"`. Bundled a parallel tightening of `TaskEntity.kind: str` → `Literal["fire_and_forget", "recorded", "scheduled_activity", "cross_dossier_activity"]` (same file, same shape, same rationale; flagged the scope expansion before coding). Verify-before-plan pass found no policy question or legacy-data risk — all 9 values are actively written, no migration ever changed the set, read-time re-validation path exists (`context.get_typed("system:task")`) but isn't exercised for tasks in production today. 6 regression tests: defaults, accepts-all-valid-values, rejects-unknown for each field, plus a `test_kind_is_required` invariant pin. Paranoia-checked on both directions (revert `status` → 1 red; revert `kind` → 1 red) — the "exactly one red per revert" shape tells me the tests are properly scoped. |
 | 42 | 4 | Field validators take raw dict, no User context. |  |
 | 43 | 4 | `Aanvrager.model_post_init` raises `ValueError` without Pydantic shape. |  |
 | 80 | 4 | `DossierAccess` Pydantic model doesn't reflect the content shape the engine actually reads. Model declares only `access: list[DossierAccessEntry]`, but `routes/access.py::check_audit_access` reads `content.get("audit_access", [])` — a top-level list the model is silent about. Production `setDossierAccess` handler in toelatingen never writes `audit_access`, so today per-dossier audit access falls through to denial and only `global_audit_access` (config.yaml) grants audit views — but the omission from the model means (a) readers can't tell from the model alone what shape the content can take, (b) plugin authors who want per-dossier audit can't discover the feature from the type, (c) any future hardening that sets `model_config = ConfigDict(extra='forbid')` would reject legitimate `audit_access` content. No per-dossier `admin_access` exists — admin is deliberately config-only (`global_admin_access`); worth documenting this in the model's docstring so the omission is intentional rather than accidental drift. Fix: add `audit_access: list[str] = []` field + docstring covering the full shape the engine reads and why `admin_access` is absent. Filed Round 27.5 from user review of access code. |  |
@@ -732,7 +732,7 @@ Concrete behaviour bugs that are each ~30-100 lines of code + tests. Each wants 
 - ~~**Bug 27**~~ — ~~`DossierAccessEntry.activity_view: str` too narrow (should be Literal).~~ ✅ **Shipped in Round 31.** `"related"` mode also removed.
 - 🛑 ~~**Bug 28**~~ — ~~`POCAuthMiddleware` silently overwrites on duplicate usernames.~~ **Deferred — POC-only, slated for replacement with real auth.**
 - **Bug 34** — `authorize_activity` catches broad `Exception`. *Hides real errors.*
-- **Bug 39** — `TaskEntity.status: str` → `Literal[...]`. *Type tightening.*
+- ~~**Bug 39**~~ — ~~`TaskEntity.status: str` → `Literal[...]`.~~ ✅ **Shipped in Round 32** (bundled with `TaskEntity.kind` parallel tightening).
 - **Bug 43** — `Aanvrager.model_post_init` raises ValueError without Pydantic shape. *422 error shape wrong.*
 - **Bug 48** — `.meta` filename not sanitized. *Security-adjacent.*
 - **Bug 50** — Migration fallback uses module-level `SYSTEM_ACTION_DEF` with bare name. *Should use qualified.*
@@ -1425,3 +1425,64 @@ Cat 2 still has Bugs 13, 34, 39, 43, 48, 50, 59, 60, 67 in the medium-priority b
 My recommendation order: **Bug 39** (direct sequel to Bug 27, same type-tightening pattern), then **Bug 48** (security-adjacent is worth landing), then **Bug 13** (small modernization), then **Bug 34**. Bugs 43 and 50 need more reconnaissance before I can order them confidently.
 
 Cat 3 (caching & perf) remains in the wings. If you want a change of pace after these type-tightening and small-fix rounds, that's the next batch-round candidate.
+
+### Round 32 — Bug 39 shipped (with bundled `kind` tightening)
+
+Direct sequel to Bug 27's type-tightening work, on the same file (`entities.py`). Simpler in shape — no policy decision like `"related"`, just narrowing types to match the values the code actually uses.
+
+**Bundled decision (flagged).** The review entry for Bug 39 names only `TaskEntity.status`. While in the same file I noticed `TaskEntity.kind` has the same under-typing shape: `kind: str` with the four valid values (`"fire_and_forget"`, `"recorded"`, `"scheduled_activity"`, `"cross_dossier_activity"`) documented only as an inline comment. Bundled the `kind` tightening into the same round because (a) same file, same fix pattern, (b) leaving them asymmetric would make the file harder to read on next review, and (c) the drive-by scope was genuinely small — no new tests for a fundamentally different concern, just parallel coverage for a sibling field. I flagged the bundling to the user before coding; they approved by implication (continuing past that message). Distinct from Bug 28's id-check scope-widening that I correctly pulled back from — the difference is that `kind` is the same axis as `status` (narrowing one field's type set), while Bug 28's id-check would have been a second class of validation (duplicate detection across a different key).
+
+**Verify-before-plan pass.** Taking the Round 27 lesson ("a type tightening can turn into more than expected"), did a thorough recon before touching code. All clean:
+
+- **All 5 `status` values actively written** by production code (`tasks.py`, `worker.py`). No outliers. No migrations ever changed the set.
+- **All 4 `kind` values actively written.** Default when unspecified at the YAML level is `"recorded"` (set at `tasks.py:95 task_def.get("kind", "recorded")`). The Pydantic field itself has no default — always explicit at construction.
+- **Read-time re-validation path exists but is unexercised for tasks.** `plugin.entity_models["system:task"] = TaskEntity` at `app.py:128` means `context.get_typed("system:task")` *would* re-validate task content via `TaskEntity(**entity.content)`. No production call site does that today — worker and routes read `task.content` as a raw dict. But the path exists, so the tightened types must be correct on any data currently in the DB, not just on new writes. The value sets haven't changed since the initial schema migration (`9d887db892c9`), so legacy data is safe.
+- **No test uses outlier values.** Only the documented sets appear across all test files.
+
+No surprises. No policy question. No legacy-data risk. Pure narrow-the-type fix.
+
+**Shipped:**
+- `entities.py:79` — `kind: str` → `kind: Literal["fire_and_forget", "recorded", "scheduled_activity", "cross_dossier_activity"]`. No default (was already required). Inline comment removed — the valid values are now in the type itself.
+- `entities.py:87` — `status: str = "scheduled"` → `status: Literal["scheduled", "completed", "cancelled", "superseded", "dead_letter"] = "scheduled"`. Default preserved. Inline comment removed. Short comment above pointing to the lifecycle diagram in the class docstring and explaining the legacy-data safety argument (no migration ever changed the set).
+
+**Tests added (+6 in `test_refs_and_plugin.py::TestTaskEntityStatusAndKind`):**
+
+- `test_default_status_is_scheduled` — pins the default so a future refactor has to go through this test to change it.
+- `test_status_accepts_all_five_values` — pins every lifecycle value so a future narrowing that drops one goes red here with a clear failure on that value.
+- `test_status_rejects_unknown_value` — the tightening pin. Fails pre-fix, passes post-fix.
+- `test_kind_accepts_all_four_values` — same shape as `status`.
+- `test_kind_rejects_unknown_value` — the tightening pin for `kind`.
+- `test_kind_is_required` — pins the no-default invariant. The production call site always passes `kind` explicitly; YAML-level defaulting happens one layer up in `tasks.py`. If a future change adds a Pydantic default it has to go through this test deliberately.
+
+**Paranoia check — two-direction revert.**
+
+Each revert: remove one field's `Literal` back to `str`, run the test class, confirm exactly *one* test red (the matching `rejects_unknown_*`). Restore. Repeat for the other field.
+
+- Revert `status` only: 1 red / 5 green. Red test: `test_status_rejects_unknown_value`. Error message: *"TaskEntity should have rejected status='pending' but accepted it. The Literal type on the status field must have regressed."*
+- Revert `kind` only: 1 red / 5 green. Red test: `test_kind_rejects_unknown_value`. Parallel error message.
+- Both restored: 6/6 green.
+
+The *"exactly one red per revert"* shape is the healthy signal — each test is scoped to the specific invariant, not accidentally coupled to the other field.
+
+**Verification:**
+- Engine unit: **330 → 336** (+6).
+- Engine integration: **481** (unchanged).
+- Toelatingen / common / file_service unchanged: **26 / 18 / 21**.
+- **Total: 882 / 882 passing** (was 876).
+
+**Totals after Round 32:** **38 bugs fixed** (+1, Bug 39). Should-fix table: **22 open** (-1). Test suite grew 876 → 882.
+
+### Where to go next
+
+Cat 2 remaining priority items (same list as post-Round-31, minus Bug 39):
+
+1. **Bug 48** — `.meta` filename not sanitized. Security-adjacent. Worth prioritizing.
+2. **Bug 13** — `@app.on_event("startup")` modernization. Small fix (lifespan handler pattern).
+3. **Bug 34** — `authorize_activity` catches broad `Exception`. Hides real errors.
+4. **Bug 43** — `Aanvrager.model_post_init` raises `ValueError` without Pydantic shape. 422 error shape wrong. Needs a verify-before-plan pass.
+5. **Bug 50** — Migration fallback uses module-level `SYSTEM_ACTION_DEF` with bare name. Migration-tooling concern.
+6. **Bug 59** — broader plugin-load validation (large-ish round if tackled in full).
+7. **Bug 60** — [check entry].
+8. **Bug 67** — [check entry].
+
+My order doesn't shift: **Bug 48 next** (security axis, worth landing), then **Bug 13**, then **Bug 34**, then recon for 43/50. Cat 3 (caching batch) remains the alternative for a change of pace.
