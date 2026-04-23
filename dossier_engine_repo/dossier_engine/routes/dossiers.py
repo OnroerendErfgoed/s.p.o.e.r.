@@ -44,19 +44,19 @@ from uuid import UUID
 import logging
 
 from fastapi import Depends, FastAPI, HTTPException
-from sqlalchemy import select
 
 from dossier_common.signing import sign_token, token_to_query_string
 
 from ..auth import User
 from ..db import Repository, get_session_factory
-from ..db.models import AssociationRow, DossierRow
+from ..db.models import DossierRow
 from ..engine import (
     compute_eligible_activities,
     derive_status,
     filter_by_user_auth,
 )
 from ..file_refs import inject_download_urls
+from ..prov_json import load_dossier_graph_rows
 from ._models import DossierDetailResponse
 from .access import check_dossier_access, get_visibility_from_entry
 
@@ -178,15 +178,32 @@ def register(app: FastAPI, *, registry, get_user, global_access) -> None:
                     visible_entity_version_ids.add(e.id)
 
             # Activity log filtered per the calling user's view mode.
+            # Bug 9 (Round 29): pre-load activities + associations + used
+            # rows into per-activity dicts via ``load_dossier_graph_rows``
+            # instead of calling per-activity async helpers in the
+            # visibility loop. The previous shape issued two DB
+            # round-trips per activity (``_user_is_agent`` +
+            # ``get_used_entity_ids_for_activity``) which turned a
+            # dossier with N activities into O(N) queries whenever the
+            # user's ``activity_view`` was ``"own"`` or ``"related"``.
+            # The ``prov.py`` endpoints already used this pattern since
+            # Round 5's D1/D2 consolidation; dossier-detail was the
+            # straggler. The dict-lookup closures match the signatures
+            # ``is_activity_visible`` expects, so the visibility logic
+            # itself is unchanged.
             from ._activity_visibility import parse_activity_view, is_activity_visible
             parsed_view = parse_activity_view(activity_view_mode)
-            activities = await repo.get_activities_for_dossier(dossier_id)
+            graph_rows = await load_dossier_graph_rows(session, dossier_id)
+            activities = graph_rows.activities
+            assoc_by_activity = graph_rows.assoc_by_activity
+            used_by_activity = graph_rows.used_by_activity
 
             async def _is_agent(act_id, uid):
-                return await _user_is_agent(session, act_id, uid)
+                assocs = assoc_by_activity.get(act_id, [])
+                return any(a.agent_id == uid for a in assocs)
 
             async def _used_ids(act_id):
-                return await repo.get_used_entity_ids_for_activity(act_id)
+                return {u.entity_id for u in used_by_activity.get(act_id, [])}
 
             activity_list = []
             for a in activities:
@@ -287,13 +304,3 @@ def register(app: FastAPI, *, registry, get_user, global_access) -> None:
             "total": result.get("total", 0),
             **({"reason": result["reason"]} if "reason" in result else {}),
         }
-
-
-async def _user_is_agent(session, activity_id: UUID, user_id: str) -> bool:
-    """Return True if `user_id` has an association row for `activity_id`."""
-    result = await session.execute(
-        select(AssociationRow)
-        .where(AssociationRow.activity_id == activity_id)
-        .where(AssociationRow.agent_id == user_id)
-    )
-    return result.scalar_one_or_none() is not None

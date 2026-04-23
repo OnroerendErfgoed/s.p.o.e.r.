@@ -10,16 +10,16 @@
 
 | Status | Count | Items |
 |---|---|---|
-| ✅ Fixed & verified | 33 | Bugs 1, 2, 5, 6, 7, 12, 15, 16, 17, 30, 32, 44, 47, 53, 54, 55, 56, 57, 58, 62, 64, 65, 66, 68, 69, 70, 72 (coverage), 73, 74, 75, 76, 77, 79 + Obs-2 (duplicate "external") |
+| ✅ Fixed & verified | 34 | Bugs 1, 2, 5, 6, 7, 9, 12, 15, 16, 17, 30, 32, 44, 47, 53, 54, 55, 56, 57, 58, 62, 64, 65, 66, 68, 69, 70, 72 (coverage), 73, 74, 75, 76, 77, 79 + Obs-2 (duplicate "external") |
 | 🔍 Investigated, not a bug | 1 | Bug 14 — cross-dossier refs are `type=external` rows |
 | 🛑 Deferred / accepted | 4 | Bug 31 (RRN acceptable), Bug 45 (MinIO migration), Bug 63 (403 is correct HTTP), Bug 71 (test activities, deploy-time removal) |
-| 🧪 Test suite | **851/851** passing | engine 786 (unit 307 + integration 479), toelatingen 26, file_service 21, common/signing 18 |
+| 🧪 Test suite | **854/854** passing | engine 789 (unit 307 + integration 482), toelatingen 26, file_service 21, common/signing 18 |
 | 🏃 `test_requests.sh` | **25/25 OK, exit 0, zero deadlocks, zero worker crashes** | D1–D9 green |
 | ✂️ Duplication closed | **D1, D2, D4, D22, D25** | Graph-loader consolidation + audit-emit wrapper |
 | 🧰 Harnesses installed | **3** | Guidebook YAML lint + phase-docstring lint + CI shell-spec wrapper |
 | 🤖 CI wired | **GitHub Actions** | `.github/workflows/ci.yml` — 4 jobs: pytest, shell-spec, doc-harnesses, migrations-append-only |
 | 🎯 Must-fix walk | **Complete** | All 17 fixable must-fix bugs closed; the 5 open rows are deferred/investigated by product decision (Bugs 14, 31, 45, 63, 71) |
-| 📦 Pending | 27 should-fix + 16 lower-priority bugs + 31 observations + 21 dups + 5 meta (partial relief) | See below |
+| 📦 Pending | 26 should-fix + 16 lower-priority bugs + 31 observations + 21 dups + 5 meta (partial relief) | See below |
 
 Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfaced and fixed in the same session as the harness that surfaced it.
 
@@ -60,7 +60,7 @@ Note: Bug 75 was discovered *by* harness 2 on its first run — a new bug surfac
 | # | Pass | Summary | Status |
 |---|------|---------|--------|
 | 4 | 2 | `Session` type annotation never imported. |  |
-| 9 | 2 | N+1 in dossier detail view. |  |
+| ~~9~~ | 2 | ~~N+1 in dossier detail view.~~ | ✅ **Fixed in Round 29.** `routes/dossiers.py::get_dossier` was calling per-activity `_user_is_agent` + `get_used_entity_ids_for_activity` in the visibility-filter loop, turning N activities into O(N) SELECTs under `activity_view: "own"` or `"related"`. Swapped for `load_dossier_graph_rows` (Round 5's consolidation already used by `routes/prov.py`) with dict-lookup closures. Measured 11 activities: **16 → 10 SELECTs** post-fix, independent of N. 3 regression tests added (2 behaviour pins + 1 query-count ceiling at 12). Removed dead `_user_is_agent` helper + unused imports. `get_all_latest_entities` kept as-is — it returns latest-per-entity_id which `graph_rows.entities` does not, and deduplicating client-side would be more code for no perf win. |
 | ~~12~~ | 2 | ~~`_parse_scheduled_for` silently returns None on unparseable dates.~~ | ✅ **Already fixed & tested.** Discovered during M2 Stage 2 startup: `worker.py:_parse_scheduled_for` was already implementing log-and-defer via `datetime.max.replace(tzinfo=timezone.utc)` on malformed ISO, with a 12-case `TestParseScheduledFor` in `test_worker_helpers.py` including explicit regression guards. The review had been carrying a stale open-bug entry; verified end-to-end (parses valid forms, returns None for genuine-empty, returns aware `datetime.max` for malformed with logger.error). No code change this round — bookkeeping correction only. |
 | 13 | 2 | Deprecated `@app.on_event("startup")`. |  |
 | — | 2 | Alembic subprocess has no timeout. |  |
@@ -726,7 +726,7 @@ Standalone factual corrections to docstrings, README, and templates. Low risk, l
 Concrete behaviour bugs that are each ~30-100 lines of code + tests. Each wants its own round with verify-plan-fix-test-ship:
 
 - **Bug 4** — `Session` type annotation never imported. *Surface: typing only, runtime-safe but IDE-visible.*
-- **Bug 9** — N+1 in dossier detail view. *Sev 2 but directly user-visible as page-load latency.*
+- ~~**Bug 9**~~ — ~~N+1 in dossier detail view.~~ ✅ **Shipped in Round 29.**
 - **Bug 13** — Deprecated `@app.on_event("startup")`. *Modernization, small fix.*
 - **Bug 20** — `_PendingEntity` missing several fields → `AttributeError`. *Sev 3, can crash on specific input shapes.*
 - **Bug 27** — `DossierAccessEntry.activity_view: str` too narrow (should be Literal). *Type tightening.*
@@ -1176,3 +1176,50 @@ Round 26's writeup said the three unwired validators (`validate_workflow_version
 Cat 3 (caching & perf batch) remains the top recommendation — Bug 38 + Obs 75/76/77/78, sharing the "cache what's expensively re-computed" pattern. Obs 96 is the smaller alternative, now with the framing correction above worth folding into the writeup when it's addressed. Both were already in position at Round 27's handoff; nothing in Round 28 changes their relative priority.
 
 The `field_validators` separate-YAML-block decision (Obs 95 design call #1 above) is worth remembering if a future plugin wants to add a similar registry whose keys leak into user-facing URLs or other external surfaces — the pattern is *"key = external identifier, value = dotted path, resolved at load."*
+
+### Round 29 — Bug 9 (N+1 in dossier detail view)
+
+User chose Cat 2 cherry-pick one-by-one over the Round 28 recommendation of Cat 3. Bug 9 was first — `GET /dossiers/{id}` issued one `_user_is_agent` query per activity in the dossier under `activity_view: "own"` or `"related"`, turning a dossier with N activities into O(N) read-path queries. Invisible to admin users (their roles matched `global_access` with `activity_view: "all"`, short-circuiting the per-activity loop). Acute for aanvragers and any role-scoped user who hit the own/related branches.
+
+**Scope discipline.** User proposed bundling the fix with removal of the `"related"` mode entirely ("it doesn't make any sense"). I pushed back: `"related"` is the `DossierAccessEntry` Pydantic default (`entities.py:16`), is actively tested (`test_route_helpers.py:598`), and — under policy framing — is the transparency-oriented mode (citizen sees activities that operated on their entity, not just their own submissions). Production toelatingen doesn't write `"related"` today, but that's latent capability rather than mistake. Bug 79 (Round 27.5) was the mirror-image bug — a defensive behaviour the code was doing correctly, with a "this looks wrong" comment that led to it getting reverted. Didn't want to make the same mistake in reverse. Obs 92 already exists for "`activity_view` mode complexity reduction" if that work is genuinely wanted; Bug 27 (Literal tightening) is the natural place to settle which modes stay. User agreed to Bug 9 alone.
+
+**Fix shape.** `routes/prov.py` already solved this exact problem in Round 5 via `load_dossier_graph_rows` in `prov_json.py` — four bulk queries (activities / entities / associations / used) plus one agent-URI lookup, with pre-indexed `assoc_by_activity` and `used_by_activity` dicts. Dossier-detail was the straggler that never adopted the consolidation.
+
+**Shipped:**
+- `routes/dossiers.py::get_dossier` — replaced `get_activities_for_dossier` + the two async closures that each issued per-activity queries with `load_dossier_graph_rows` at the top of the activity loop, then dict-lookup closures `_is_agent` (walks `assoc_by_activity.get(act_id, [])`) and `_used_ids` (walks `used_by_activity.get(act_id, [])`). Closure signatures match `is_activity_visible`'s expected callable shape, so the visibility logic itself is untouched — this is a pure read-pattern swap.
+- Removed the now-dead module-level `_user_is_agent(session, activity_id, user_id)` helper at the bottom of the file. Removed the now-unused `select` / `AssociationRow` imports.
+- The `get_all_latest_entities(dossier_id)` call at line 137 kept as-is. `load_dossier_graph_rows` returns *all* entity versions (audit-scoped), while `get_all_latest_entities` returns only the latest per `entity_id` — the dossier-detail response wants the latter. Deduplication on the client side would be more code for no perf win. Scoped out deliberately.
+
+**Tests added (+3 in `test_http_routes.py`):**
+- `TestDossierDetailActivityViewFiltering` (2 behavior-pinning tests):
+  - `test_own_mode_filters_to_activities_where_user_is_agent` — seeds three activities (bootstrap systemAction as system, one as citizen, one as system), grants citizen `activity_view: "own"`, asserts only the citizen's activity is visible. Pins the `"own"` filter behaviour.
+  - `test_related_mode_includes_activities_touching_visible_entities` — seeds three activities (A generates aanvraag as citizen, B unrelated as admin, C uses aanvraag as admin), grants citizen `activity_view: "related"` with `view: ["oe:aanvraag"]`, asserts A and C visible, B hidden. Pins the `"related"` filter including the "used a visible entity" case that's the whole point of the mode.
+- `TestDossierDetailQueryCount` (1 perf ceiling test):
+  - `test_query_count_bounded_under_own_mode_with_many_activities` — seeds 11 activities, grants `activity_view: "own"`, hooks SQLAlchemy's `before_cursor_execute` event to count SELECTs during the HTTP request, asserts `select_count <= 12`. Measured pre-fix: 16. Measured post-fix: 10 (independent of N). Ceiling of 12 gives 2 queries of headroom for future incidental growth while still catching any regression that re-introduces per-activity DB round-trips.
+
+**`citizen` user added to test app.** `_build_test_app()` already registered `alice` (role `oe:reader`) and `admin` (role `oe:admin`), both of which match `global_access` entries with `activity_view: "all"`. Under `check_dossier_access`, global_access is checked first and short-circuits — so the pre-existing users could never exercise the per-dossier access path where `activity_view: "own"` / `"related"` lives. This was also why the N+1 wasn't caught by existing tests: the buggy code path wasn't reachable with the existing fixture. Added a third POC user `citizen` with role `aanvrager` (deliberately NOT in `global_access`), so per-dossier access is consulted. Additive-only change — no other test references `citizen`.
+
+**Process lesson — "test passes unexpectedly" is a diagnostic, not a green light.**
+First pass of the new tests passed against the unfixed handler. That was wrong — the N+1 was still there and the ceiling was set to catch it. Caught by force-failing the assertion (`assert select_count < 0`) to read the actual count. Turned out the fixture users' roles matched `global_access` so the buggy branch wasn't being hit. Lesson: when a "this should fail" test passes, don't trust it — force a failure to verify the test is exercising the code path you think it is. Round 25's paranoia discipline applies to tests too, not just to production code.
+
+**Paranoia check ✓.** Reverted just the handler (restored `get_activities_for_dossier` + per-activity closures); behaviour tests stayed green (they pin behaviour, not query count); query-count test went red with the exact expected message: *"dossier detail issued 16 SELECTs for a dossier with 11 activities — N+1 regression suspected."* Restored the fix; all 3 green. The test is genuinely catching the bug, not coincidentally passing.
+
+**Verification:**
+- Engine unit: **307** (unchanged).
+- Engine integration: **482** (was 479; +3 new Bug-9 tests).
+- Toelatingen / common / file_service unchanged at **26 / 18 / 21**.
+- **Total: 854 / 854 passing** (was 851).
+- Measured query count: 11 activities under `"own"` mode — **16 SELECTs pre-fix, 10 post-fix**. Ratio confirms the fix is O(1) and not merely "a bit better" — the 6-query reduction decomposes cleanly as 11 `_is_agent` selects eliminated minus 5 queries `load_dossier_graph_rows` adds.
+
+**Totals after Round 29:** **34 bugs fixed** (was 33 — Bug 9 added). Must-fix table unchanged (Bug 9 is sev-2 should-fix). Should-fix table: **26 open** (was 27 — Bug 9 closed). Observations unchanged. Test suite grew 851 → 854.
+
+### Where to go next
+
+Cat 2 cherry-picks continue per user's preference — one-by-one, sev-ordered. Priority remaining in the review's "top 4": Bugs 20, 27, 28. My recommendation order, based on what I've seen in this round:
+
+1. **Bug 28** — `POCAuthMiddleware` silently overwrites on duplicate usernames. Boot-time validation gap; similar "fail loudly on config error" shape as Bug 79 (Round 27.5). Small surface, high leverage.
+2. **Bug 20** — `_PendingEntity` missing fields → `AttributeError`. Sev-3 crash risk; needs a verify-before-plan pass to find which input shapes trigger it.
+3. **Bug 27** — `DossierAccessEntry.activity_view: str` too narrow (should be `Literal`). Type tightening. **This is also the natural place to settle the `"related"` question** — the `Literal[...]` declaration forces a decision on which modes stay. If you still want to kill `"related"`, that's the round.
+4. **Bug 4** — unused `Session` import. Trivial, good "close a ticket cheaply" round if appetite is low.
+
+Cat 3 (caching & perf) remains in the wings but unchanged in priority — user's Cat 2 walk is the active track.
