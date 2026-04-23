@@ -32,8 +32,17 @@ version: "1.0"                    # version of this workflow definition
 # 422. Load-time validation (Bug 78, Round 26) enforces the rules
 # below; a plugin that violates them fails to start.
 #
-# Validators are declared at activity level, not here. This file just
-# names the types and their kinds.
+# Workflow-level relation entries accept ONLY these keys:
+#   type, kind, from_types, to_types, description
+# Any other key (including activity-level ones like `validator`,
+# `validators`, `operations`) is rejected at load time with a clear
+# error message. This is `_WORKFLOW_RELATION_KEYS` in plugin.py.
+#
+# Validators are declared at ACTIVITY level, not here. This file just
+# names the types and their kinds. At the activity level, forbidden
+# keys go the other way: `kind`, `from_types`, `to_types`, `description`
+# are workflow-level-only and rejected if they appear on an activity's
+# relation opt-in (`_ACTIVITY_RELATION_FORBIDDEN_KEYS`).
 #
 # relations:
 #   - type: "oe:neemtAkteVan"
@@ -142,6 +151,76 @@ Your plugin's `create_plugin()` instantiates the constants class with these YAML
 
 ---
 
+## Field Validators (lightweight, client-facing)
+
+```yaml
+# Declares named validators that the engine exposes at
+# POST /{workflow}/validate/{validator_name}. Used for frontend-driven
+# field validation between activities — "does this erfgoedobject URI
+# resolve?", "is this handeling allowed for this type?".
+#
+# Authenticated endpoints — any logged-in user, regardless of role,
+# may call them. The auth gate is purely DoS/enumeration-surface
+# reduction; there's no role-based access logic inside.
+#
+# Shape: `dict[url_segment, dotted_path_OR_FieldValidator]`. The KEY
+# leaks into the public URL, so keep it URL-safe (lowercase, hyphens
+# or underscores, no slashes, no spaces). The VALUE is either:
+#   * A dotted path string. Legacy/simpler shape. No request/response
+#     typing — the handler receives a raw dict and returns a dict.
+#   * A `FieldValidator` dataclass instance (plugin_guidebook.md:265
+#     has the authoring story). Supports typed request_model /
+#     response_model Pydantic classes so the endpoint gets proper
+#     OpenAPI docs and input validation.
+#
+# field_validators:
+#   # Legacy dotted-path form:
+#   erfgoedobject: "your_plugin.validators.validate_erfgoedobject"
+#
+#   # Typed FieldValidator form (instantiated in plugin code, referenced
+#   # here by the same URL-segment key):
+#   handeling: "your_plugin.validators.handeling"   # exports a FieldValidator
+```
+
+The engine resolves each dotted path at plugin load time (ImportError if broken). URL-segment keys that collide with other validators in the same plugin are a plugin-author error; no load-time check.
+
+---
+
+## Reference Data (static lookup lists)
+
+```yaml
+# Static reference data served at:
+#   GET /{workflow}/reference              (returns everything)
+#   GET /{workflow}/reference/{list_name}  (returns one list)
+#
+# Used for frontend dropdowns — bijlagetypes, documenttypes, categorieën,
+# etc. Sub-millisecond endpoint (no DB hit; served straight from the
+# in-memory plugin config). **Public** (no auth required) by product
+# decision — these are shared dropdown data that don't leak dossier
+# state or enumerable references.
+#
+# Shape: `dict[list_name, list]`. The list_name key is the path segment
+# the client requests; the value is whatever payload the plugin wants
+# to return (typically a list of dicts, but any JSON-serializable
+# structure works — the engine returns it verbatim under `{"items": ...}`).
+#
+# reference_data:
+#   bijlagetypes:
+#     - code: "plan"
+#       label: "Plattegrond"
+#     - code: "foto"
+#       label: "Foto"
+#   documenttypes:
+#     - code: "aanvraag"
+#       label: "Aanvraagformulier"
+#     - code: "advies"
+#       label: "Advies"
+```
+
+A request for `GET /{workflow}/reference/unknown_list` returns a 404 listing the available keys — handy for debugging.
+
+---
+
 ## Roles
 
 ```yaml
@@ -155,6 +234,17 @@ Your plugin's `create_plugin()` instantiates the constants class with these YAML
 #
 # Activities define allowed_roles + default_role so the client
 # doesn't need to specify a role in most cases.
+#
+# ⚠ CONVENTION-ONLY BLOCK ⚠
+# The engine does NOT read this workflow-level `roles:` block. It
+# is declared here for human readers — so someone auditing the YAML
+# can see the full cast of roles at a glance — but role resolution
+# actually happens through the per-activity `allowed_roles`,
+# `default_role`, and `authorization.roles` fields plus the role
+# strings carried in users' session data. A typo here has zero
+# runtime effect; a role used in an activity but missing from this
+# list is NOT a load-time error. See the "Open follow-ups" section
+# at the end of this file for the bug this surfaces.
 
 roles:
   - name: ""                      # e.g. "oe:aanvrager", "oe:behandelaar", "oe:ondertekenaar"
@@ -167,6 +257,18 @@ roles:
 
 ```yaml
 # Simulates what your auth framework provides in production.
+#
+# ⚠ POC-ONLY — NOT PRODUCTION ⚠
+# This block exists because the current auth implementation
+# (POCAuthMiddleware) looks users up by a plaintext X-POC-User
+# header. Production will replace this with JWT/OAuth via the
+# auth.mode setting in config.yaml. When that migration lands
+# (Bug 28), this block becomes dead config. Don't invest in
+# elaborate role hierarchies here — keep it minimal.
+#
+# Usernames must be UNIQUE across all plugins' poc_users blocks.
+# The middleware builds a dict keyed by username, so the last
+# duplicate wins silently. Bug 28 tracks that behavior.
 #
 # In production, the user object comes from your auth framework (JWT/OAuth/session):
 #   user:
@@ -182,14 +284,15 @@ roles:
 
 poc_users:
 
-  - id: ""                        # UUID
-    username: ""                  # used in X-POC-User header
+  - id: ""                        # UUID. Stored as str — int also tolerated.
+    username: ""                  # used in X-POC-User header. MUST BE UNIQUE.
     type: ""                      # "persoon", "medewerker", "systeem"
     name: ""                      # display name
-    roles:
+    roles:                        # optional, default []
       - ""                        # TECHNICAL role strings from the auth system
-    properties:                   # key-value pairs, must match what side effects reference
+    properties:                   # optional, default {}. must match what side effects reference
       field_name: "value"
+    # uri: ""                     # optional, default None
 ```
 
 ---
@@ -203,6 +306,13 @@ poc_users:
 # Entity types use a prefixed naming convention: "prefix:name"
 # e.g. "oe:aanvraag", "gov:besluit", "sub:motivatie"
 # The prefix IS the entity type everywhere — in the DB, in refs, in the YAML.
+#
+# Load-time behavior:
+#   * `model:` and every path in `schemas:` resolve via importlib at
+#     plugin load. A bad dotted path is a fail-fast ImportError.
+#   * A missing `type:` silently skips the entire entry (plugin.py:137).
+#     Worth being explicit about — no load-time error surfaces.
+#   * `cardinality:` — see the fallback note below.
 
 entity_types:
   - type: ""                      # e.g. "oe:aanvraag", "gov:motivatie"
@@ -213,9 +323,20 @@ entity_types:
                                   # "multiple" = many logical entities per dossier
                                   #   - auto_resolve returns all of them
                                   #   - client specifies which one via derivedFrom for revisions
-    revisable: true               # can new versions be created?
+                                  #
+                                  # ⚠ FALLBACK: anything other than the literal
+                                  # strings "single" or "multiple" (including typos
+                                  # like "signle", "Single", or an omitted value)
+                                  # silently resolves to "single" at is_singleton()
+                                  # lookup time (plugin.py:988). See Open follow-ups.
+    revisable: true               # ⚠ CONVENTION-ONLY: this field is NOT read by
+                                  # the engine. Revision capability is actually
+                                  # determined by the per-activity `entities:` block
+                                  # and the presence of `derivedFrom` refs. Kept
+                                  # here for human readability. See Open follow-ups.
     model: ""                     # Python import path to the Pydantic model
                                   # e.g. "dossier_subsidie.entities.Aanvraag"
+                                  # Dotted path; resolved at plugin load.
 
     # --- Schema versioning (optional) ---
     # If this entity type has evolved over time and old rows need to
@@ -229,6 +350,12 @@ entity_types:
     # rows written through activities that declare version discipline
     # (see the activity-level `entities:` block) are stamped with a version
     # from this map.
+    #
+    # Shape: `dict[version_string, dotted_path_to_Pydantic_model]`.
+    # Every activity-level `new_version`/`allowed_versions` reference is
+    # cross-checked against this map at plugin load time by
+    # `validate_workflow_version_references` — a version used but not
+    # declared here fails fast.
     #
     # schemas:
     #   v1: "dossier_subsidie.entities.AanvraagV1"
@@ -297,24 +424,72 @@ authorization:
 #
 # No overlap: an entity is either used OR generated, never both.
 # This eliminates double edges in the PROV graph.
+#
+# Auto-qualification of activity names (plugin.py:1111-1126):
+# Activity `name:` values AND every reference-to-another-activity-name
+# (in requirements.activities, forbidden.activities, side_effects[*].activity,
+# tasks[*].cancel_if_activities, tasks[*].target_activity) get the
+# workflow's default ontology prefix automatically prepended if they're
+# not already qualified. Both `dienAanvraagIn` and `oe:dienAanvraagIn`
+# work and are equivalent — choose the style you prefer and keep it
+# consistent. Qualified form is less magical; bare form is terser.
 # =======================================================================
 
 activities:
 
   - name: ""                      # e.g. "dienAanvraagIn"
     label: ""                     # human readable, e.g. "Dien aanvraag in"
-    description: ""
+    description: ""               # ⚠ pure documentation; engine doesn't read this
 
     # --- Dossier Creation ---
-    can_create_dossier: false     # true = this activity can start a new dossier
+    can_create_dossier: false     # true = this activity can start a new dossier.
+                                  # When a can_create_dossier activity is the
+                                  # first one for a new dossier, the workflow-
+                                  # rules check is skipped on that first
+                                  # invocation (preconditions.py:165-167) — by
+                                  # design, since there are no prior activities
+                                  # or statuses to check against. Authorization
+                                  # still runs normally.
 
     # --- Client Callable ---
     # client_callable: false      # if false, only triggered by side_effects (system activity)
-                                  # defaults to true if omitted
+                                  # and is hidden from /eligible + /allowed lists.
+                                  # Default is true. Note: the engine checks
+                                  # `is False` specifically, so anything other
+                                  # than the literal `false` (including absence
+                                  # and the string "false") resolves to true.
+
+    # --- Built-in (reserved) ---
+    # built_in: true              # ⚠ RESERVED. Do NOT set this on your own
+                                  # activities. The engine sets it on the
+                                  # activities it injects (systemAction,
+                                  # tombstone). Some invariants are relaxed
+                                  # for built-in activities; setting it on a
+                                  # plugin-defined activity will cause those
+                                  # invariants to quietly not apply.
 
     # --- Functional Roles ---
-    # What role(s) the agent plays when performing this activity.
-    # Used in PROV associations. If the client omits the role, default_role is used.
+    # The activity's role model is a three-way concept worth untangling:
+    #
+    # allowed_roles       = which role *strings* a client request may declare
+    #                       in its `role:` field when invoking this activity.
+    #                       Empty list means no enforcement. Not related to
+    #                       user permissions — just declaration restrictions.
+    #
+    # default_role        = the role recorded when the client request omits
+    #                       `role:`. The engine picks this value.
+    #
+    # authorization.roles = WHICH USERS may invoke this activity. Fully
+    #                       orthogonal to the above two — this checks the
+    #                       user's session roles, not the declared role on
+    #                       the request.
+    #
+    # Common case: `allowed_roles: ["oe:aanvrager"]` + `default_role:
+    # "oe:aanvrager"` + authorization that lets the citizen-user role
+    # invoke it. Client sends no `role:`, engine defaults to aanvrager,
+    # authorization verifies the session is allowed.
+    #
+    # Used in PROV associations (`wasAssociatedWith ... role:`).
     allowed_roles: ["oe:aanvrager"]     # list of allowed functional roles
     default_role: "oe:aanvrager"        # used when client omits role from request
 
@@ -377,21 +552,47 @@ activities:
     # criteria (when to split vs keep a monolithic handler).
 
     # --- Authorization ---
+    # WHO (not which role-string) is allowed to execute this activity.
+    # Orthogonal to `allowed_roles`/`default_role` (which constrain the
+    # role *declared on the request*); this block checks the user.
+    #
+    # Default if the `authorization:` block is omitted: `access:
+    # "authenticated"` with no role restrictions. Any logged-in user
+    # can run the activity.
     authorization:
       access: ""                  # "everyone", "authenticated", "roles"
+                                  # Default: "authenticated" when the block is
+                                  # present but `access:` is missing/empty.
       roles:
         # Pattern 1: Direct match
+        # User must have the exact string in their session roles.
         - role: ""
         #
         # Pattern 2: Scoped match
+        # Engine resolves `<role>:<value-from-entity>` and checks against
+        # the user's session roles. Only applicable when a dossier exists
+        # (not for can_create_dossier activities — there's no entity
+        # to resolve against).
         # - role: "gemeente-toevoeger"
         #   scope:
         #     from_entity: "oe:aanvraag"
         #     field: "content.gemeente"
         #
         # Pattern 3: Entity-derived match
+        # The entity field value IS the role string (no `role:` prefix).
+        # Same dossier-exists constraint as Pattern 2.
         # - from_entity: "oe:aanvraag"
         #   field: "content.toegewezen_rol"
+        #
+        # ⚠ LOAD-TIME VALIDATION GAP (Bug 34 recon):
+        # `scope:` dict typos — `feild:` for `field:`, missing `from_entity:`,
+        # wrong key names — are NOT caught at plugin load. At runtime the
+        # authorize_activity function catches any exception inside the
+        # scope resolution and turns it into "this role entry doesn't
+        # match, try the next one" — meaning a typo silently produces a
+        # 403 for legitimate users. If authorization behaves oddly, check
+        # scope dict keys against this template's names exactly.
+        # See Open follow-ups for the tracking issue.
 
     # --- Workflow Rules ---
     requirements:
@@ -412,24 +613,68 @@ activities:
     # Only for existing entities (references) or external URIs.
     # No content here — content goes in the "generated" block.
     #
-    # Resolution logic:
-    #   1. Client sends ref         → engine validates it exists
-    #   2. Client omits + auto_resolve → server resolves latest version
-    #   3. Client omits + required  → 422 error
-    #   4. Client omits + not required → not included
+    # ⚠ AUTO-RESOLVE IS SYSTEM-CALLER-ONLY.
+    # The `auto_resolve: "latest"` flag below is consulted ONLY when
+    # the caller is `Caller.SYSTEM` (the worker executing a scheduled
+    # task or cross-dossier activity) or during side-effect execution
+    # (where the engine acts on behalf of the triggering user).
+    #
+    # For client-triggered activities — i.e. ordinary PUT requests
+    # from the API — `auto_resolve:` is IGNORED. The client must send
+    # explicit refs for every entity the activity needs. If the client
+    # omits a ref, the corresponding slot is silently left empty: the
+    # engine does NOT raise 422, does NOT look up the latest version,
+    # does NOT consult the `required:` field. Downstream handlers /
+    # validators may then raise (or, worse, silently fall through).
+    #
+    # See Open follow-ups #12 and #13 for:
+    #   * The `required: true` field below not being read by the
+    #     engine today (it's documentation-only).
+    #   * The fact that the client-omits-declared-used-slot case
+    #     silently succeeds rather than raising 422 (probably a bug).
+    #
+    # Resolution behavior per caller type:
+    #
+    #   Client caller (normal API PUT):
+    #     - Client sends ref → engine validates it exists.
+    #     - Client omits ref → slot silently left empty.
+    #       (`auto_resolve` and `required` both IGNORED.)
+    #
+    #   System caller (worker for tasks, side effects):
+    #     - Explicit ref → validated.
+    #     - Omitted + `auto_resolve: "latest"` → engine resolves via
+    #       trigger scope → anchor → dossier singleton lookup.
+    #     - Omitted + no `auto_resolve` → slot left empty.
+    #
+    # Designing a client activity's `used:` block:
+    #   Treat this as the authoritative list of what the CLIENT must
+    #   send. Don't expect auto-resolve to cover for a forgetful
+    #   client. If you want "the latest aanvraag" in a client-facing
+    #   activity, have the client pass the ref it's working with.
     used:
       # Local entity reference
-      - type: ""                  # entity type, e.g. "oe:aanvraag"
-        required: false           # is this reference required in the request?
-        auto_resolve: "latest"    # if omitted by client, server resolves latest version
-                                  # null = no auto-resolve
-        description: ""           # shown in API docs
+      - type: ""                  # entity type, e.g. "oe:aanvraag". REQUIRED —
+                                  # missing key crashes with KeyError at runtime
+                                  # (Open follow-up #9).
+        required: false           # ⚠ READ FOR OPENAPI DOCS ONLY — not enforced
+                                  # at request time. Client-facing activities do
+                                  # NOT get a 422 when the client omits a
+                                  # declared used ref, regardless of this value.
+                                  # See Open follow-up #12. Setting `true` does
+                                  # change the generated API docs label though,
+                                  # so it's worth setting accurately.
+        auto_resolve: "latest"    # Only consulted for Caller.SYSTEM (worker)
+                                  # and side-effect resolution. IGNORED for
+                                  # client-triggered activities.
+                                  # null = no auto-resolve (also the default).
+        description: ""           # documentary only — rendered in OpenAPI docs
+                                  # but not otherwise consumed.
 
       # External entity (URI)
       # - type: "object"
       #   external: true          # engine only records the URI, no existence check
-      #   required: false
-      #   description: ""
+      #   required: false         # (see note above — OpenAPI-docs-only, not enforced)
+      #   description: ""         # (see note above — documentary only)
 
     # --- Generates: entity types this activity can create ---
     # A list of entity type strings.
@@ -506,21 +751,58 @@ activities:
     #       remove: "validate_gerelateerd_remove"
 
     # --- Status ---
-    # What status this activity sets on the dossier.
-    # Can be:
-    #   - a string: "ingediend"
-    #   - null: no status change (handler may set it via HandlerResult.status)
-    #   - a mapping: derive from entity content
+    # What status this activity sets on the dossier. Three forms:
+    #
+    # (a) String — the literal status to apply:
+    #     status: "ingediend"
+    #
+    # (b) null / absent — no status change from YAML. The handler may
+    #     still set status via `HandlerResult.status` or a `status_resolver`
+    #     (see the split-style hooks section above).
+    #
+    # (c) Dict — data-driven: derive the status from a generated entity's
+    #     content. Useful when the outcome depends on what the user submitted.
+    #
     #     status:
-    #       from_entity: "oe:besluit"
-    #       field: "content.uitkomst"
+    #       from_entity: "oe:besluit"       # entity type to read
+    #       field: "content.uitkomst"        # dot-notation path
     #       mapping:
     #         toegekend: "besluit_toegekend"
     #         afgewezen: "besluit_afgewezen"
+    #
+    # Precedence when multiple sources are set:
+    #   1. YAML `status:` (string or dict form) takes precedence over
+    #      `status_resolver:` and over `HandlerResult.status`.
+    #   2. `HandlerResult.status` + `status_resolver:` together raise a
+    #      clear 500 (split_hooks.py:73-82). YAML `status:` + either of
+    #      the other two does NOT raise — the YAML silently wins.
+    #
+    # ⚠ LOAD-TIME VALIDATION GAP (Obs 59):
+    # Dict-form typos — `feild:` for `field:`, `mappings:` for `mapping:`,
+    # missing `from_entity:` — are NOT caught at plugin load. At runtime
+    # they raise KeyError inside finalize_dossier and surface as HTTP 500
+    # mid-activity. If you use the dict form, double-check the three
+    # required keys against this template.
     status: ""
 
     validators: []                # list of {name: "validator_fn_name"}
+                                  # Cross-entity validators that run post-
+                                  # handler, pre-commit. Each name resolves
+                                  # to a dotted path via plugin.validators
+                                  # (set up by build_callable_registries).
+
     side_effects: []              # list of {activity: "SystemActivityName"}
+                                  # Activities to trigger after this one
+                                  # completes. Two forms accepted:
+                                  #  - bare string (legacy, normalized to
+                                  #    {activity: <n>} at load).
+                                  #  - dict with optional `condition:` or
+                                  #    `condition_fn:` gating (mutex).
+                                  # Bare strings are back-compat — new code
+                                  # should use the dict form so condition/
+                                  # condition_fn gates are easy to add
+                                  # later. See the side_effects section
+                                  # further below for condition shapes.
 
     # --- Tasks ---
     # Tasks are created as system:task entities with full PROV trail.
@@ -546,6 +828,20 @@ activities:
     # supersedes any existing scheduled one. true = multiple can coexist.
 
     tasks:
+
+      # `kind:` must be one of: "fire_and_forget", "recorded",
+      # "scheduled_activity", "cross_dossier_activity". The Pydantic
+      # TaskEntity model enforces this at entity-construction time (Bug
+      # 39, Round 32 — `kind: Literal[...]`). However, YAML → TaskEntity
+      # construction happens at runtime, not plugin load, so a YAML typo
+      # here crashes mid-activity with a Pydantic ValidationError rather
+      # than failing fast at startup. Same with `status:` inside a task
+      # entity. See Open follow-ups.
+      #
+      # `target_activity:` / `cancel_if_activities` entries: auto-qualified
+      # but NOT cross-checked against this workflow's own `activities:`
+      # list at load time. A typo like "mySetfyyysCorrection" only
+      # surfaces when the worker tries to execute the target.
 
       # --- Type 1: Fire-and-forget ---
       # Runs inline during activity execution. No entity, no PROV.
@@ -989,3 +1285,197 @@ a heritage permit ("toelating beschermd erfgoed") workflow with:
 - Post-activity search index hook (Elasticsearch stub)
 - Workflow-specific search endpoint (/dossiers/toelatingen/search)
 - Forbidden rules: dienAanvraagIn cannot be called twice
+
+---
+
+## Open follow-ups / known issues
+
+**Scope note.** This section captures known drift and bugs that surfaced
+during the exhaustive cross-reference of this template against the engine
+code (`docs/workflow-yaml-inventory.md` — 826 lines, produced as the
+input to this rewrite). Items listed here are NOT papered over by the
+template rewrite itself — they're real engine or design issues that need
+separate fixes. Keeping them visible here so future plugin authors
+don't waste time debugging documented behavior that doesn't actually work,
+and so the next cleanup round has a punch-list.
+
+### 1. `relation_types` block is unused (plugin.py:243)
+
+The engine has a dormant code path at `plugin.py:240-256` that reads
+`workflow.get("relation_types", [])` and scans each entry for validator
+dotted paths. But toelatingen's production YAML uses `relations:`
+(not `relation_types:`), and `validate_relation_declarations` +
+runtime dispatch both operate on `relations:`. The `relation_types`
+scan reads nothing in production.
+
+Likely dead code from a mid-refactor where both key names were in play.
+Needs a decision: delete the scan, or if `relation_types:` was intended
+as the canonical name, rename consistently and update this template.
+Do not use `relation_types:` in any workflow YAML until resolved.
+
+### 2. Workflow-level `roles:` is not enforced by the engine
+
+The `## Roles` section above is flagged as convention-only because the
+engine never reads `workflow.get("roles")`. A typo in a role name here
+has zero effect; a role used in an activity's `allowed_roles` /
+`authorization.roles` but missing from this list is NOT a load-time
+error. If the project wants this list to be enforced, it's a new feature
+(not a bug fix); if not, the `roles:` block probably shouldn't live at
+workflow top-level at all.
+
+### 3. `entity_types[*].revisable` is not read by the engine
+
+Same shape as Finding 2. The `revisable: true/false` field is documented
+in this template and allowed by the test-suite's key allow-list
+(`test_guidebook_yaml.py`), but no engine code reads it. Revision
+capability is determined at runtime by the per-activity `entities:`
+block plus whether the request carries a `derivedFrom` ref. The field
+here is cosmetic. Either wire it up as a hard load-time enforcement
+(activity tries to revise a non-revisable entity → 422) or remove from
+the contract.
+
+### 4. Entity type `cardinality:` silently falls back to `"single"`
+
+`plugin.py:988` resolves the value as `c if c in ("single", "multiple")
+else "single"`. A typo like `"signle"`, `"Single"`, `"many"`, or an
+omitted value all resolve to `"single"`. This silently changes
+auto-resolve behavior and singleton lookup semantics without surfacing
+an error. Either tighten to a load-time `Literal["single", "multiple"]`
+check (rejecting unknowns), or document the fallback (done above, in
+the Entity Types section).
+
+### 5. Variable-name collision: `act` in archive.py
+
+`dossier_engine/archive.py` uses the variable name `act` for two
+different things: workflow-level activity definitions (dicts from YAML)
+AND PROV-JSON activity rows (dicts from DB representation). Confusing
+when grepping for "all keys consumed on a workflow activity" — shows up
+as false positives for keys like `time` and `agent` that are only on the
+PROV-JSON form. Worth renaming one of the two (e.g. `act_row` vs
+`act_def`) for legibility.
+
+### 6. 🐛 YAML `status:` silently overrides `status_resolver:`
+
+When both a YAML `status:` (any form) AND a `status_resolver:` are
+declared on the same activity, the YAML wins and the resolver's
+return value is ignored (`finalization.py:98` reads `activity_def.get("status")`
+first). The symmetric case — `HandlerResult.status` + `status_resolver`
+together — DOES raise a clear 500 at `split_hooks.py:73-82`. This
+asymmetry is a footgun: authors refactoring a handler to split out
+status into a resolver may leave a stale `status:` in YAML and see
+the resolver silently ignored. Fix options:
+  * Raise at load time when both YAML `status:` and `status_resolver:`
+    are set (cleanest; fail-fast).
+  * Raise at runtime in finalization, symmetric to split_hooks.
+  * Document the precedence explicitly (done above — but a proper
+    fix is preferable).
+
+### 7. Load-time validation gaps for YAML → Pydantic-entity boundaries
+
+Three Pydantic models have been tightened to `Literal[...]` on their
+string enum fields (TaskEntity.kind, TaskEntity.status — Bug 39, Round 32;
+DossierAccessEntry.activity_view — Bug 27, Round 31). But YAML →
+entity construction happens at runtime, not at plugin load, so a YAML
+typo still crashes mid-activity rather than failing fast at startup.
+
+Specific gaps:
+  * `activities[*].tasks[*].kind` — YAML typo only crashes when the
+    activity runs.
+  * `activities[*].status` dict form — YAML typos in `from_entity:`,
+    `field:`, `mapping:` crash inside `finalize_dossier` (Obs 59).
+  * `activities[*].authorization.roles[*].scope` dict typos crash
+    inside `authorize_activity` where they're swallowed by a broad
+    `except Exception` (Bug 34).
+
+Pattern is the same: add a `validate_*` function in plugin.py that walks
+the relevant YAML structure and rejects malformed shapes at plugin load.
+Existing `validate_side_effect_conditions` is the template to mirror.
+
+### 8. No cross-reference validation of activity name references
+
+Names in `tasks[*].target_activity`, `tasks[*].cancel_if_activities`,
+`side_effects[*].activity`, `requirements.activities`,
+`forbidden.activities` are auto-qualified (given the workflow's default
+prefix) but NOT cross-checked against the workflow's own `activities:`
+list at load time. A typo like `target_activity: "mySetfsysCorrection"`
+resolves at runtime with a misleading error.
+
+Additive load-time validator: walk every activity-name reference, check
+it exists in `{act["name"] for act in workflow["activities"]}`. Similar
+shape to the ones listed in Finding 7.
+
+### 9. `used[*]` required `type:` is a bracket read, not a `.get`
+
+`used.py:150` does `etype = used_def["type"]` — missing or null `type:`
+crashes with KeyError rather than a clean load-time error with the
+activity name. Small fix: use `.get` with an early raise, or add a
+load-time shape check for `used[*]` entries.
+
+### 10. `namespaces` re-register behavior undocumented
+
+If a per-plugin `namespaces:` entry uses a prefix already registered
+(by the engine or at app-level), the current behavior is undocumented
+in this template. Need to trace `NamespaceRegistry.register()` to
+determine if it's silent-accept, silent-overwrite, or reject. Whatever
+it does, the template should state it.
+
+### 11. `generates:` shape ambiguity
+
+Documented as `list[str]` and used as such in production YAML, but the
+engine's check pattern (`entity_type not in allowed_types`) technically
+allows either list-of-strings OR list-of-dicts (dicts silently falsify
+the `in` test and skip the check). Either tighten at load to reject
+dicts in `generates:`, or document the dict form and what it means.
+The current ambiguity is a latent bug waiting for someone to "improve"
+the YAML by adding per-type metadata under `generates:`.
+
+### 12. 🐛 Client callers that omit declared `used` refs don't get a 422
+
+Surfaced during this template rewrite. The prior template claimed:
+
+  *"Client omits + required → 422 error"*
+  *"Client omits + auto_resolve → server resolves latest version"*
+
+Neither claim is true for client callers. `used.py:56` runs auto-resolve
+**only when `state.caller == Caller.SYSTEM`**. For the client path, a
+missing declared `used` slot silently succeeds: no auto-resolve, no
+422, just an empty slot in `state.resolved_entities`. Downstream handlers
+might then raise AttributeError or silently fall through — either way,
+the failure mode is opaque to the API client.
+
+This is both a design question (should the engine enforce `required:`
+for client callers?) and a documentation question (the old template
+described the intended behavior as if it were real). The rewrite now
+documents the actual behavior, but a proper fix is probably to add a
+client-side required-check in `_resolve_explicit` that raises 422 when
+a `required: true` slot wasn't supplied. That would make `required:`
+functional for the first time.
+
+Scope decision: the caller-class split is by design (system callers
+legitimately need auto-resolve; clients shouldn't be allowed to skip
+explicit references). The bug is the silent empty slot, not the absence
+of auto-resolve.
+
+### 13. `used[*].required` is read for OpenAPI docs only, not runtime
+
+Similar shape to Findings 2 and 3 (`roles:`, `revisable:`) but with a
+small caveat. The `required:` field appears in every `used` entry but
+no runtime code reads it for enforcement. It IS read at
+`_typed_doc.py:80` to render the field label in the auto-generated
+OpenAPI docs ("**required**" vs "optional"). So setting `required: true`
+makes the API docs say the field is required — but the engine doesn't
+actually enforce that at request time (see Finding 12). Purely
+cosmetic for behavior; documentary for API docs. If Finding 12 is
+fixed by wiring up a client-side required-check, `required:` finally
+becomes functional. Until then it's contract-by-convention.
+
+`used[*].description` IS read the same way — included in the OpenAPI
+field documentation. Also cosmetic for behavior.
+
+---
+
+**Inventory source.** The full enumeration of every YAML key the engine
+reads, with file:line references, defaults, and template-coverage flags,
+lives in `docs/workflow-yaml-inventory.md`. Refer there when adding new
+engine consumers or removing dormant ones — that file is the
+source-of-truth for "does the engine actually read this key?".
