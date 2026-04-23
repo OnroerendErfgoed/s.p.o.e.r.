@@ -128,7 +128,7 @@ def register_prov_routes(
             # don't push it down into the query because the same
             # loader is used by four endpoints and the filter is a
             # timeline-specific concern.
-            from ..prov_json import load_dossier_graph_rows
+            from ..db.graph_loader import load_dossier_graph_rows
             graph_rows = await load_dossier_graph_rows(session, dossier_id)
             activities = graph_rows.activities
             all_entities = graph_rows.entities

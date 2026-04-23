@@ -1,153 +1,40 @@
 """
-PROV-JSON document builder + graph data loader.
+PROV-JSON document builder.
 
-Two exports live here, both working on the same four rowsets
-(activities, entities, associations, used):
-
-* ``load_dossier_graph_rows`` — fetches the four rowsets plus the
-  agent lookup. Shared by ``/prov`` (which feeds them into the
-  PROV-JSON builder), the static-SVG ``/archive`` (same), the
-  interactive ``/prov/graph/columns`` (which runs its own layout
-  algorithm), and ``/prov/graph/timeline`` (same, after applying
-  per-user access filtering).
-
-* ``build_prov_graph`` — assembles the PROV-JSON document. Calls
-  ``load_dossier_graph_rows`` internally; endpoints that want the
-  raw rowsets for their own rendering skip this.
-
-Prior to this consolidation, the four endpoints each had their own
-slight variation of the same four ``select()`` queries + their own
-agent-URI lookup helper. Duplication D1 in the review. Centralising
-here means index-choice changes and Bug 14's cross-dossier-used fix
-both happen in one spot.
+Assembles the PROV-JSON document from a dossier's graph rows. The
+row-loading concern (``load_dossier_graph_rows`` + ``DossierGraphRows``)
+moved to ``db/graph_loader.py`` in Round 30.5 — other endpoints
+(``routes/prov.py``, ``routes/prov_columns.py``,
+``routes/dossiers.py``) need the same rowsets without the PROV-JSON
+document-building, so the loader lives in a neutral home. ``build_prov_graph``
+calls it internally and adds the PROV-JSON structure on top.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from uuid import UUID
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .db.models import (
-    ActivityRow, AgentRow, AssociationRow, EntityRow,
-    Repository, UsedRow,
-)
+from .db.graph_loader import DossierGraphRows, load_dossier_graph_rows
+from .db.models import AgentRow, EntityRow
 from .prov_iris import (
     activity_qname, agent_qname, agent_type_value,
     entity_qname, prov_prefixes, prov_type_value,
 )
 
 
-@dataclass
-class DossierGraphRows:
-    """The four rowsets that make up a dossier's provenance graph,
-    plus the agent lookup.
-
-    Ordering:
-    * ``activities`` — in insertion order (the repo's default).
-    * ``entities``   — by ``created_at`` ascending.
-    * ``associations`` and ``used`` — unordered; callers that care
-      about order should re-sort.
-
-    Index helpers (`by_activity`, `entity_by_id`, `agent_rows`) are
-    pre-computed so callers that need them don't re-index. Small
-    extra cost for callers that don't, negligible at dossier scale.
-    """
-    activities: list[ActivityRow]
-    entities: list[EntityRow]
-    associations: list[AssociationRow]
-    used: list[UsedRow]
-    agent_rows: dict[str, AgentRow]
-
-    # Derived indexes — filled in by the loader after the selects.
-    assoc_by_activity: dict[UUID, list[AssociationRow]] = field(
-        default_factory=dict
-    )
-    used_by_activity: dict[UUID, list[UsedRow]] = field(
-        default_factory=dict
-    )
-    entity_by_id: dict[UUID, EntityRow] = field(default_factory=dict)
-
-
-async def load_dossier_graph_rows(
-    session: AsyncSession, dossier_id: UUID,
-) -> DossierGraphRows:
-    """Load every row needed to render or export a dossier's PROV graph.
-
-    Four queries + one agent-lookup query — same set every rendering
-    endpoint needs. Returns a ``DossierGraphRows`` with pre-built
-    indexes so callers can walk the structure without re-indexing.
-
-    This is the "audit" load: all activities, all entities, no
-    per-user filter. Endpoints that want a user-visible subset (the
-    timeline graph) filter the result by entity type / activity
-    visibility rather than asking the DB for a reduced rowset —
-    keeps the loader simple and the filter concern colocated with
-    the access-check call that defines it.
-    """
-    repo = Repository(session)
-
-    activities = await repo.get_activities_for_dossier(dossier_id)
-
-    entities_result = await session.execute(
-        select(EntityRow)
-        .where(EntityRow.dossier_id == dossier_id)
-        .order_by(EntityRow.created_at)
-    )
-    entities = list(entities_result.scalars().all())
-
-    activity_ids = [a.id for a in activities]
-    if activity_ids:
-        assoc_result = await session.execute(
-            select(AssociationRow)
-            .where(AssociationRow.activity_id.in_(activity_ids))
-        )
-        associations = list(assoc_result.scalars().all())
-        used_result = await session.execute(
-            select(UsedRow).where(UsedRow.activity_id.in_(activity_ids))
-        )
-        used = list(used_result.scalars().all())
-    else:
-        associations = []
-        used = []
-
-    # Indexes.
-    assoc_by_activity: dict[UUID, list[AssociationRow]] = {}
-    for a in associations:
-        assoc_by_activity.setdefault(a.activity_id, []).append(a)
-
-    used_by_activity: dict[UUID, list[UsedRow]] = {}
-    for u in used:
-        used_by_activity.setdefault(u.activity_id, []).append(u)
-
-    entity_by_id = {e.id: e for e in entities}
-
-    # Agent URI lookup. AssociationRow carries agent_id but not the
-    # canonical URI — that lives on AgentRow. Entities referenced
-    # via wasAttributedTo need the same lookup.
-    agent_ids: set[str] = {
-        a.agent_id for assocs in assoc_by_activity.values() for a in assocs
-    }
-    agent_ids |= {e.attributed_to for e in entities if e.attributed_to}
-    agent_rows: dict[str, AgentRow] = {}
-    if agent_ids:
-        agent_result = await session.execute(
-            select(AgentRow).where(AgentRow.id.in_(agent_ids))
-        )
-        agent_rows = {a.id: a for a in agent_result.scalars().all()}
-
-    return DossierGraphRows(
-        activities=activities,
-        entities=entities,
-        associations=associations,
-        used=used,
-        agent_rows=agent_rows,
-        assoc_by_activity=assoc_by_activity,
-        used_by_activity=used_by_activity,
-        entity_by_id=entity_by_id,
-    )
+# ``DossierGraphRows`` and ``load_dossier_graph_rows`` moved to
+# ``db/graph_loader.py`` in Round 30.5. They're imported above and
+# re-exported here under their original names for any caller that
+# used the historical ``from dossier_engine.prov_json import
+# load_dossier_graph_rows`` path.  New callers should import from
+# ``dossier_engine.db.graph_loader`` directly.
+__all__ = [
+    "DossierGraphRows",
+    "load_dossier_graph_rows",
+    "build_prov_graph",
+]
 
 
 def agent_key_resolver(agent_rows: dict[str, AgentRow]):

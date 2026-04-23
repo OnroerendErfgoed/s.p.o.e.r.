@@ -1283,3 +1283,42 @@ Cat 2 cherry-pick track continues. My recommendation order for the remaining pri
 2. **Bug 4** — unused `Session` import. Trivial closer.
 
 After those, Cat 2 still has Bugs 34, 39, 43, 48, 50, 59, 60, 67 — the longer tail. Cat 3 (caching batch) also remains available.
+
+### Round 30.5 — `load_dossier_graph_rows` moved to `db/graph_loader.py`
+
+User flagged the Round 29 fix: *"Are you sure what the graph fetches matches what the DB queries did? And if so, split the function somewhere else — it's a bit nasty to use functions from prov_json in dossiers."* Both fair points.
+
+**(1) Correctness verification.** Did a careful axis-by-axis comparison of old vs new data-fetch behaviour:
+
+- **Activities list** — old and new both call `repo.get_activities_for_dossier(dossier_id)`, same repo helper, same caching. Identical output.
+- **`_is_agent(act_id, uid)` closure** — old did `select(AssociationRow).where(activity_id == act_id).where(agent_id == uid)` per activity, returned `is not None`. New does `any(a.agent_id == uid for a in assoc_by_activity.get(act_id, []))` over the preloaded rows. The preload filter is `AssociationRow.activity_id.in_(activity_ids)` where `activity_ids = [a.id for a in activities]` — so for every activity in the visibility loop, the preloaded list holds exactly the same rows the old per-activity query would have returned. **Equivalent for the call pattern.**
+- **`_used_ids(act_id)` closure** — old did `select(UsedRow.entity_id).where(activity_id == act_id)`. New does `{u.entity_id for u in used_by_activity.get(act_id, [])}` over preloaded `UsedRow` objects. Same preload filter, same rows. **Equivalent.**
+
+**One honest caveat** I glossed over in the Round 29 writeup: the handler still calls `repo.get_all_latest_entities(dossier_id)` at line 137 (for the `currentEntities` response field), and `load_dossier_graph_rows` *also* loads entities (as `graph_rows.entities`, all versions). So the post-fix handler now makes **two entity queries per request** where the pre-fix code made one. That's not a behavior regression but it is a small inefficiency — the net query count still dropped 16 → 10 for N=11 activities, which was the point of the fix, but there's ~1 query of waste hiding in that number. Deduplicating `graph_rows.entities` client-side ("latest per `entity_id`") is possible and adds ~5 lines, but would couple the handler to knowledge about entity versioning that it currently delegates to the repo. Scoped out of Round 30.5; flagged here for honesty and as a candidate cleanup if a future round touches this handler.
+
+**(2) Architectural move.** `load_dossier_graph_rows` was in `prov_json.py` but isn't PROV-specific — it's a general DB-layer utility that fetches a dossier's graph rows with pre-built per-activity indexes. Three route modules plus one JSON builder use it. Having unrelated handlers reach into `prov_json.py` to get their rowsets was awkward by name and fragile — any future reshape of `prov_json.py` would force changes to callers that have nothing to do with PROV-JSON.
+
+**Shipped:**
+- New module `dossier_engine/db/graph_loader.py` — owns `DossierGraphRows` dataclass and `load_dossier_graph_rows` function. Verbatim move plus an updated module docstring explaining the callers and the Round 30.5 provenance.
+- `dossier_engine/prov_json.py` — now a pure PROV-JSON document builder. Imports `DossierGraphRows` and `load_dossier_graph_rows` from `db.graph_loader`, re-exports them under the historical names via `__all__` so the old import path still works for any external caller. Removed 7 now-unused imports (`dataclass`, `field`, `select`, `ActivityRow`, `AssociationRow`, `Repository`, `UsedRow`).
+- Four caller import sites updated to pull from the new home directly: `routes/dossiers.py`, `routes/prov.py`, `routes/prov_columns.py`, and `tests/integration/test_prov_endpoints.py` (two locations). The pattern: new code imports from `db.graph_loader`; the `prov_json` re-export is the back-compat cushion.
+
+**Why a re-export, given no callers need it?** It's a cheap move that respects Hyrum's Law — the function was a public-looking member of `prov_json` for as long as it existed, and external consumers of the package (none in this repo today, but this is a library-shaped codebase) might have noticed. Keeping the re-export for one release buys safety with no coupling cost; a future round can remove it after confirming nothing reaches in via the historical path.
+
+**Obs 97 alignment.** Round 27.5's "codebase legibility" observation flagged that module organization was getting muddled (*"the number of files per module is growing to a point where it is not clear at all"*). Adding `db/graph_loader.py` is a small move in the right direction for that observation — the DB concerns are now colocated under `db/`, and the PROV-JSON module is focused on its one job. Not a full answer to Obs 97 but a step.
+
+**Paranoia check ✓.** Temporarily changed `routes/dossiers.py`'s `load_dossier_graph_rows` import to a non-existent name (`load_dossier_graph_rows_NOPE`) in the `db.graph_loader` path. The app-level import chain failed at collection time with `ImportError: cannot import name 'load_dossier_graph_rows_NOPE' from 'dossier_engine.db.graph_loader'` — proving the route actually resolves through the new home, not through the `prov_json` re-export. Restored; tests green.
+
+**Verification:**
+- Test count unchanged at **857 / 857** passing (pure refactor — no new tests, no behavior change). Unit 310, integration 482, toelatingen 26, common 18, file_service 21.
+- All 8 callers verified: 4 production imports updated, 2 test imports updated, 2 internal references (within `prov_json.py` itself) now pull from the shared import.
+
+**Totals after Round 30.5:** Unchanged from Round 30 — still 35 fixed, 5 deferred, 25 should-fix open, 857/857 passing. Obs 97 partially addressed (still open, but with a bit of progress noted).
+
+### Process note — when the architectural criticism arrives mid-flight
+
+Round 29 shipped Bug 9 with a shortcut (`routes/dossiers.py` importing from `prov_json.py`). User spotted it on review. Two things worth naming:
+
+1. **Fast turnaround on architectural feedback is better than batching.** The user's pushback arrived after Round 29 shipped but before Round 30.5 picked up — the right response was "do the split now, while the Bug 9 story is still in working memory," not "add it to a backlog." Round 30.5 took ~15 minutes; delaying it would have accumulated interest in the form of "future me has to re-understand why routes/dossiers imports from prov_json."
+
+2. **The original fix was right; the home was wrong.** Worth being explicit that user's correctness question and user's architecture question were separable — correctness confirmed in (1), architecture fixed in (2). If the correctness check had found a real gap, Round 30.5 would have been a different, bigger round. Keeping the two questions distinct mattered.

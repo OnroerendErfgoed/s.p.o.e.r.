@@ -55,8 +55,8 @@ from ..engine import (
     derive_status,
     filter_by_user_auth,
 )
+from ..db.graph_loader import load_dossier_graph_rows
 from ..file_refs import inject_download_urls
-from ..prov_json import load_dossier_graph_rows
 from ._models import DossierDetailResponse
 from .access import check_dossier_access, get_visibility_from_entry
 

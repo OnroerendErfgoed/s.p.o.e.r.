@@ -81,7 +81,7 @@ def register_columns_graph(
             # pre-built indexes. Layout-specific processing happens
             # below on the returned rows; the SQL concern is owned
             # by ``load_dossier_graph_rows``.
-            from ..prov_json import load_dossier_graph_rows
+            from ..db.graph_loader import load_dossier_graph_rows
             graph_rows = await load_dossier_graph_rows(session, dossier_id)
             activities = graph_rows.activities
             all_entities = graph_rows.entities

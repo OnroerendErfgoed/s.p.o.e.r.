@@ -872,7 +872,7 @@ class TestSharedGraphLoader:
         ``used_by_activity``, ``entity_by_id``) so callers don't
         re-index. Confirm they're populated for a non-empty
         dossier."""
-        from dossier_engine.prov_json import load_dossier_graph_rows
+        from dossier_engine.db.graph_loader import load_dossier_graph_rows
         act_id, ent_id, ver_id = await _bootstrap_with_entity(repo)
         await _commit(repo)
 
@@ -894,7 +894,7 @@ class TestSharedGraphLoader:
         without errors. Important because the loader short-circuits
         the associations/used queries when there are no activities
         — that branch needs coverage."""
-        from dossier_engine.prov_json import load_dossier_graph_rows
+        from dossier_engine.db.graph_loader import load_dossier_graph_rows
         await repo.create_dossier(D1, "test")
         await _commit(repo)
 
