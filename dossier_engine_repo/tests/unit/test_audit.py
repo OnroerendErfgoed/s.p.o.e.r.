@@ -39,7 +39,7 @@ def _reload_audit_module():
     accumulate across tests."""
     import logging
     logging.getLogger("dossier.audit").handlers.clear()
-    import dossier_engine.audit as audit_mod
+    import dossier_engine.observability.audit as audit_mod
     return importlib.reload(audit_mod)
 
 

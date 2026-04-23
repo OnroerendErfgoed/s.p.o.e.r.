@@ -2,7 +2,7 @@
 Unit tests for domain-relation ref expansion and classification.
 """
 
-from dossier_engine.prov_iris import expand_ref, classify_ref
+from dossier_engine.prov.iris import expand_ref, classify_ref
 
 
 class TestExpandRef:

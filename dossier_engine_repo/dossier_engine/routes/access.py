@@ -65,7 +65,7 @@ from __future__ import annotations
 import logging
 from uuid import UUID
 from fastapi import HTTPException
-from ..audit import emit_dossier_audit
+from ..observability.audit import emit_dossier_audit
 from ..db.models import Repository
 from ..auth import User
 

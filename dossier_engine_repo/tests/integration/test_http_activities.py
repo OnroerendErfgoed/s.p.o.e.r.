@@ -644,7 +644,7 @@ class TestAuditEmitIsPostCommit:
         one `dossier.created` (or `.updated`) audit event. Pin the
         happy-path count so a regression that double-emits or
         drops-emits would fail here."""
-        import dossier_engine.routes.activities as activities_mod
+        import dossier_engine.routes.activities.run as activities_mod
         captured: list[dict] = []
         monkeypatch.setattr(
             activities_mod, "emit_dossier_audit",
@@ -686,7 +686,7 @@ class TestAuditEmitIsPostCommit:
         first item's `dossier.created` was already on disk by the
         time the second raised, so the log claimed an item that
         never committed."""
-        import dossier_engine.routes.activities as activities_mod
+        import dossier_engine.routes.activities.run as activities_mod
         captured: list[dict] = []
         monkeypatch.setattr(
             activities_mod, "emit_dossier_audit",
@@ -745,7 +745,7 @@ class TestAuditEmitIsPostCommit:
         committed activity. Pins the count so a refactor that
         skipped per-item emission (e.g. emitting once for the
         whole batch) would fail here."""
-        import dossier_engine.routes.activities as activities_mod
+        import dossier_engine.routes.activities.run as activities_mod
         captured: list[dict] = []
         monkeypatch.setattr(
             activities_mod, "emit_dossier_audit",
@@ -813,7 +813,7 @@ class TestAuditEmitIsPostCommit:
         so the setup activity's emit doesn't pollute the capture —
         we're only measuring the denial path.
         """
-        import dossier_engine.routes.activities as activities_mod
+        import dossier_engine.routes.activities.run as activities_mod
 
         await _commit(repo)
         # Bootstrap — createStuff as aanvrager creates the dossier

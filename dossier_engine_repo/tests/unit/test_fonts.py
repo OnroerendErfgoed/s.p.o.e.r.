@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from dossier_engine.fonts import find_font, check_fonts_available
+from dossier_engine.archive.fonts import find_font, check_fonts_available
 
 
 class TestFindFont:
@@ -58,7 +58,7 @@ class TestFindFont:
         operator should install — not a generic 'file not found'."""
         # Replace the candidate list with nonsense paths so the
         # search exhausts without finding anything.
-        from dossier_engine import fonts
+        from dossier_engine.archive import fonts
         monkeypatch.setattr(fonts, "_CANDIDATES", {
             style: ["/nonexistent/" + s + ".ttf" for s in [style]]
             for style in fonts._CANDIDATES
@@ -119,7 +119,7 @@ class TestCheckFontsAvailable:
         startup: you learn about the broken archive path at app
         boot, not on the first archive request that happens to
         hit in production."""
-        from dossier_engine import fonts
+        from dossier_engine.archive import fonts
         # Break only the bold style.
         patched = dict(fonts._CANDIDATES)
         patched["bold"] = ["/nonexistent/DejaVuSans-Bold.ttf"]

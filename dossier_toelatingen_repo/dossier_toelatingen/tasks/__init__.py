@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 
-from dossier_engine.audit import emit_dossier_audit
+from dossier_engine.observability.audit import emit_dossier_audit
 from dossier_engine.engine import ActivityContext
 
 logger = logging.getLogger("toelatingen.tasks")

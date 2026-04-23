@@ -46,7 +46,7 @@ async def check_idempotency(state: ActivityState) -> dict | None:
     # Match by local name to tolerate legacy rows stored with a bare
     # name (pre-qualification) being re-replayed after the engine
     # started normalizing names to qualified form.
-    from ...activity_names import local_name
+    from ...prov.activity_names import local_name
     if local_name(existing.type) != local_name(state.activity_def["name"]):
         raise ActivityError(409, "Activity ID already exists with different type")
 

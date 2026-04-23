@@ -59,7 +59,7 @@ from ..engine import (
 )
 from ..db.graph_loader import load_dossier_graph_rows
 from ..file_refs import inject_download_urls
-from ._models import DossierDetailResponse
+from ._helpers.models import DossierDetailResponse
 from .access import check_dossier_access, get_visibility_from_entry
 
 _log = logging.getLogger("dossier.routes.dossiers")
@@ -196,7 +196,7 @@ def register(app: FastAPI, *, registry, get_user, global_access) -> None:
             # straggler. The dict-lookup closures match the signatures
             # ``is_activity_visible`` expects, so the visibility logic
             # itself is unchanged.
-            from ._activity_visibility import parse_activity_view, is_activity_visible
+            from ._helpers.activity_visibility import parse_activity_view, is_activity_visible
             parsed_view = parse_activity_view(activity_view_mode)
             graph_rows = await load_dossier_graph_rows(session, dossier_id)
             activities = graph_rows.activities
@@ -238,7 +238,7 @@ def register(app: FastAPI, *, registry, get_user, global_access) -> None:
             # field names and can produce accidental rule matches
             # against built-in rules that key on the static `status`
             # slot.
-            from ..audit import emit_dossier_audit
+            from ..observability.audit import emit_dossier_audit
             emit_dossier_audit(
                 action="dossier.read",
                 user=user,

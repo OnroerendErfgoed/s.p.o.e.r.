@@ -27,7 +27,7 @@ from ...auth import User
 from ...db.models import Repository
 from ...plugin import Plugin
 from ..lookups import lookup_singleton
-from .status import derive_status
+from ._helpers.status import derive_status
 
 
 async def authorize_activity(

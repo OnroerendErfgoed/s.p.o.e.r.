@@ -30,8 +30,8 @@ import logging
 
 from ..state import ActivityState
 from .authorization import _resolve_field
-from .eligibility import compute_eligible_activities, filter_by_user_auth
-from .status import derive_status
+from ._helpers.eligibility import compute_eligible_activities, filter_by_user_auth
+from ._helpers.status import derive_status
 
 _log = logging.getLogger("dossier.engine")
 

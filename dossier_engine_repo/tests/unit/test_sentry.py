@@ -39,7 +39,7 @@ def _reload_sentry_module():
     ``_initialized=False``. The module holds that flag at module
     level, which matches production behavior (one process, one init)
     but means tests have to reset explicitly."""
-    import dossier_engine.sentry as sentry_mod
+    import dossier_engine.observability.sentry as sentry_mod
     return importlib.reload(sentry_mod)
 
 

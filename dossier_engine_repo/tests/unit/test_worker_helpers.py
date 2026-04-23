@@ -158,10 +158,12 @@ class TestComputeNextAttemptAt:
 
     def _pin_jitter(self, monkeypatch, value: float):
         """Force `random.uniform(-0.1, 0.1)` to return `value` in the
-        worker module's namespace."""
-        import dossier_engine.worker as worker_mod
+        worker failure module's namespace — _compute_next_attempt_at
+        lives in ``dossier_engine.worker.failure`` after the Round 34
+        split, and `import random` is in that module."""
+        import dossier_engine.worker.failure as failure_mod
         monkeypatch.setattr(
-            worker_mod.random, "uniform", lambda a, b: value
+            failure_mod.random, "uniform", lambda a, b: value
         )
 
     def test_first_attempt_with_zero_jitter(self, monkeypatch):

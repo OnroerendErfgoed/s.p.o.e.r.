@@ -46,7 +46,7 @@ from dossier_common.signing import sign_token, token_to_query_string
 from ..auth import User
 from ..db import Repository, get_session_factory
 from ..file_refs import inject_download_urls
-from ._serializers import entity_version_dict
+from ._helpers.serializers import entity_version_dict
 from .access import check_dossier_access, get_visibility_from_entry
 
 

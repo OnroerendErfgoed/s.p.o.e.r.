@@ -8,7 +8,7 @@ import pytest
 from uuid import UUID
 
 from dossier_engine.engine.refs import EntityRef
-from dossier_engine.namespaces import (
+from dossier_engine.prov.namespaces import (
     NamespaceRegistry,
     namespaces,
     set_namespaces,

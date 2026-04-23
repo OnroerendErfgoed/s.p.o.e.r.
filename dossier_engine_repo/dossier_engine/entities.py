@@ -25,7 +25,7 @@ class DossierAccessEntry(BaseModel):
     # it at write time (operators get a validation error on
     # ``setDossierAccess``) and ``parse_activity_view`` deny-safes it
     # at read time for any legacy entry already in the DB. See
-    # ``routes/_activity_visibility.py`` module docstring for the
+    # ``routes/_helpers/activity_visibility.py`` module docstring for the
     # read-path semantics.
     activity_view: Union[Literal["all", "own"], list[str], dict] = "own"
 

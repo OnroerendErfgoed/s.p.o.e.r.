@@ -172,3 +172,50 @@ If you need to add a new phase to the pipeline:
 5. Write a unit test that constructs an `ActivityState` fixture and calls your phase function directly — no HTTP, no database needed for the phase's own logic.
 6. Write an integration test that exercises the phase through the full HTTP path.
 7. Update this document.
+
+## Module layout (after Round 34 reorg)
+
+The pipeline phases live under `engine/pipeline/`, which was
+reorganized in Round 34 to reduce flat-directory crowding:
+
+```
+engine/pipeline/
+├── preconditions.py     — phases 1–2, 5
+├── authorization.py     — phases 3–4
+├── used.py              — phase 6
+├── handlers.py          — phase 13
+├── split_hooks.py       — phase 4.5 (status_resolver + task_builders)
+├── generated.py         — phase 8
+├── validators.py        — phase 10
+├── tasks.py             — phases 17–18
+├── finalization.py      — phase 20
+├── persistence.py       — phases 12, 14
+├── tombstone.py         — phase 11 (alternative flow)
+├── relations/           — phase 9 (split package)
+│   ├── declarations.py      YAML introspection + _validate_ref_types
+│   ├── process.py           process_relations entry + parse helpers
+│   └── dispatch.py          per-kind handlers + validator dispatch
+├── side_effects/        — phase 16 (split package)
+│   ├── execute.py           execute_side_effects recursion
+│   └── helpers.py           _condition_met, _auto_resolve_used,
+│                            _persist_se_generated
+└── _helpers/            — cross-phase utilities (Round 34 grouping)
+    ├── eligibility.py       compute_eligible_activities,
+    │                        filter_by_user_auth, derive_allowed_activities
+    ├── status.py            derive_status (used by phases 3, 15, 20)
+    ├── invariants.py        enforce_used_generated_disjoint
+    └── identity.py          resolve_handler_generated_identity
+```
+
+The orchestrator in `engine/__init__.py` imports from each of these
+directly and calls them in phase order. The `relations/` and
+`side_effects/` sub-packages were split in Round 34 because they
+were the two largest phase modules (588 and 463 lines) and each
+decomposed naturally into 2–3 single-concern files.
+
+`_helpers/` exists because four utilities (`eligibility`, `status`,
+`invariants`, `identity`) are called from multiple phases rather
+than being phases themselves. Grouping them under a leading-underscore
+package name keeps the phase-by-phase list at the top of
+`pipeline/` uncluttered while still signalling "engine-internal,
+not part of the plugin contract."

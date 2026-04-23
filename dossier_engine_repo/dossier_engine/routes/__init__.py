@@ -35,8 +35,8 @@ from . import reference as _reference_routes
 # Back-compat re-exports — leaf module symbols under the names the
 # pre-Stage-6 monolith used. New code should import from the leaf
 # modules directly.
-from ._errors import activity_error_to_http as _activity_error_to_http
-from ._models import (
+from ._helpers.errors import activity_error_to_http as _activity_error_to_http
+from ._helpers.models import (
     ActivityRequest,
     ActivityResponse,
     AssociatedWith,
@@ -52,8 +52,8 @@ from ._models import (
     UsedItem,
     UsedResponse,
 )
-from ._serializers import entity_version_dict as _entity_version_dict
-from ._typed_doc import (
+from ._helpers.serializers import entity_version_dict as _entity_version_dict
+from ._helpers.typed_doc import (
     build_activity_description as _build_activity_description,
     format_entity_schemas_for_doc as _format_entity_schemas_for_doc,
 )

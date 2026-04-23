@@ -42,8 +42,8 @@ from dossier_engine.auth import User
 from dossier_engine.db.models import Repository, AssociationRow
 from dossier_engine.engine.errors import ActivityError
 from dossier_engine.file_refs import FileId, inject_download_urls
-from dossier_engine.routes._errors import activity_error_to_http
-from dossier_engine.routes._serializers import entity_version_dict
+from dossier_engine.routes._helpers.errors import activity_error_to_http
+from dossier_engine.routes._helpers.serializers import entity_version_dict
 from dossier_engine.routes.access import (
     check_dossier_access, get_visibility_from_entry,
 )

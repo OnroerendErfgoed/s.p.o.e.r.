@@ -29,7 +29,7 @@ from sqlalchemy import text
 from dossier_engine.auth import User
 from dossier_engine.db.models import Repository, AssociationRow
 from dossier_engine.engine.context import HandlerResult
-from dossier_engine.engine.pipeline.eligibility import (
+from dossier_engine.engine.pipeline._helpers.eligibility import (
     compute_eligible_activities, filter_by_user_auth,
     derive_allowed_activities,
 )
@@ -40,7 +40,7 @@ from dossier_engine.engine.pipeline.finalization import (
 from dossier_engine.engine.pipeline.persistence import (
     create_activity_row, persist_outputs,
 )
-from dossier_engine.engine.pipeline.status import derive_status
+from dossier_engine.engine.pipeline._helpers.status import derive_status
 from dossier_engine.engine.state import (
     ActivityState, Caller, UsedRef, ValidatedRelation,
 )

@@ -7,7 +7,7 @@ plugin validators, since `tombstone` is a built-in and exists in every
 workflow). This module owns that validation.
 
 Tombstones are exempt from most cross-block invariants (notably the
-disjoint `used`/`generated` rule in `pipeline/invariants.py`) because
+disjoint `used`/`generated` rule in `pipeline/_helpers/invariants.py`) because
 they operate on multiple historical versions of the same logical
 entity by design — that's what redaction means. The shape rules below
 encode the constraints that DO apply.
@@ -65,7 +65,7 @@ async def validate_tombstone(state: ActivityState) -> None:
     # Match by local name so the built-in activity resolves whether
     # stored as bare ``tombstone`` (old YAML) or qualified
     # ``oe:tombstone`` (after normalization in PluginRegistry.register).
-    from ...activity_names import local_name
+    from ...prov.activity_names import local_name
     if local_name(state.activity_def.get("name", "")) != "tombstone":
         return
 

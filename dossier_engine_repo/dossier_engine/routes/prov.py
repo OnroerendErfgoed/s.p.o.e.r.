@@ -84,10 +84,10 @@ def register_prov_routes(
             )
 
             # Build the PROV-JSON document. All the rowset loading
-            # and graph construction lives in ``dossier_engine.prov_json``
+            # and graph construction lives in ``dossier_engine.prov.json_ld``
             # — the /prov endpoint and the /archive endpoint share
             # the same builder so their shapes can't drift apart.
-            from ..prov_json import build_prov_graph
+            from ..prov.json_ld import build_prov_graph
             return await build_prov_graph(session, dossier_id)
 
     @app.get(
@@ -164,7 +164,7 @@ def register_prov_routes(
             # Apply per-user activity_view filtering from dossier_access.
             visible_entity_version_ids = set(e.id for e in all_entities)
 
-            from ._activity_visibility import parse_activity_view, is_activity_visible
+            from ._helpers.activity_visibility import parse_activity_view, is_activity_visible
             parsed_view = parse_activity_view(activity_view_mode)
 
             async def _is_agent_graph(act_id, uid):
@@ -444,7 +444,7 @@ def register_prov_routes(
             # Build the PROV-JSON document. Same builder the /prov
             # endpoint uses — so the graph shape embedded in the PDF
             # and the graph shape served from /prov can't drift apart.
-            from ..prov_json import build_prov_graph
+            from ..prov.json_ld import build_prov_graph
             prov = await build_prov_graph(session, dossier_id)
 
             from ..archive import generate_archive
@@ -467,7 +467,7 @@ def register_prov_routes(
             # the dossier. Highest-priority event for compliance; a
             # dedicated action name so the SIEM can retain and alert
             # on exports separately from ordinary reads.
-            from ..audit import emit_dossier_audit
+            from ..observability.audit import emit_dossier_audit
             emit_dossier_audit(
                 action="dossier.exported",
                 user=user,

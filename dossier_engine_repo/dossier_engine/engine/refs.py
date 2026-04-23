@@ -143,7 +143,7 @@ def _parse_full_entity_iri(ref: str) -> "EntityRef | None":
     """
     # Late import to avoid circular dependency: prov_iris imports
     # this module for reverse expansion.
-    from ..prov_iris import DOSSIER_BASE
+    from ..prov.iris import DOSSIER_BASE
 
     # DOSSIER_BASE looks like "https://.../dossiers/{dossier_id}/".
     # Strip the placeholder to get the bare prefix every platform

@@ -317,7 +317,7 @@ async def cancel_matching_tasks(state: ActivityState) -> None:
         # the qualified name on the current activity definition
         # (``oe:vervolledigAanvraag``). Plugin authors can write
         # either form without caring about normalization.
-        from ...activity_names import local_name
+        from ...prov.activity_names import local_name
         current_local = local_name(state.activity_def["name"])
         cancel_locals = {local_name(n) for n in cancel_list}
         if current_local not in cancel_locals:

@@ -44,7 +44,7 @@ from uuid import uuid4
 
 from ..context import ActivityContext, HandlerResult
 from ..state import ActivityState
-from ._identity import resolve_handler_generated_identity
+from ._helpers.identity import resolve_handler_generated_identity
 
 
 async def run_handler(state: ActivityState) -> None:

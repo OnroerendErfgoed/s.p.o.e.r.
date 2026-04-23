@@ -716,7 +716,7 @@ class TestProvJsonSharedBuilder:
         could drift from a shared helper — now the endpoint *is*
         a one-line call to the helper, so any divergence would be
         a code change, not a behavioural drift."""
-        from dossier_engine.prov_json import build_prov_graph
+        from dossier_engine.prov.json_ld import build_prov_graph
         await _bootstrap_with_entity(repo)
         await _commit(repo)
 
@@ -749,7 +749,7 @@ class TestProvJsonSharedBuilder:
         version had both. After consolidation, both paths include
         endedAtTime. Guard against a future drift that silently
         removes it."""
-        from dossier_engine.prov_json import build_prov_graph
+        from dossier_engine.prov.json_ld import build_prov_graph
         await _bootstrap_with_entity(repo)
         await _commit(repo)
 
@@ -768,7 +768,7 @@ class TestProvJsonSharedBuilder:
         output. Consumers can distinguish "no such facts exist"
         from "section deliberately filtered" — empty present-key
         pollutes that signal."""
-        from dossier_engine.prov_json import build_prov_graph
+        from dossier_engine.prov.json_ld import build_prov_graph
         await repo.create_dossier(D1, "test")
         await _commit(repo)
 

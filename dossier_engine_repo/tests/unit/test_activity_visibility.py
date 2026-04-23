@@ -33,7 +33,7 @@ timeline and investigate; the alternative (silently remap to
 """
 from __future__ import annotations
 
-from dossier_engine.routes._activity_visibility import (
+from dossier_engine.routes._helpers.activity_visibility import (
     ActivityViewMode, parse_activity_view,
 )
 

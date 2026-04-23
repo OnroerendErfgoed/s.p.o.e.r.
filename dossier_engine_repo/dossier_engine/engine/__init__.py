@@ -19,12 +19,12 @@ from .errors import ActivityError, CardinalityError
 from .lookups import lookup_singleton, resolve_from_trigger, resolve_from_prefetched
 from .refs import ENTITY_REF_PATTERN, EntityRef, is_external_uri
 from .pipeline.authorization import authorize_activity, validate_workflow_rules, _resolve_field
-from .pipeline.eligibility import (
+from .pipeline._helpers.eligibility import (
     compute_eligible_activities,
     derive_allowed_activities,
     filter_by_user_auth,
 )
-from .pipeline.status import derive_status
+from .pipeline._helpers.status import derive_status
 from .pipeline.preconditions import (
     authorize,
     check_idempotency,
@@ -41,7 +41,7 @@ from .pipeline.finalization import (
 )
 from .pipeline.handlers import run_handler
 from .pipeline.split_hooks import run_split_hooks
-from .pipeline.invariants import enforce_used_generated_disjoint
+from .pipeline._helpers.invariants import enforce_used_generated_disjoint
 from .pipeline.persistence import create_activity_row, persist_outputs
 from .pipeline.relations import process_relations
 from .pipeline.side_effects import execute_side_effects
@@ -64,7 +64,7 @@ from .state import ActivityState, Caller
 #  imported at the top from .pipeline.authorization)
 #
 # (derive_status, compute_eligible_activities, filter_by_user_auth,
-#  derive_allowed_activities are imported from .pipeline.status and
+#  derive_allowed_activities are imported from .pipeline._helpers.status and
 #  .pipeline.eligibility)
 
 

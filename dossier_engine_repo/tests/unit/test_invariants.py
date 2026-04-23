@@ -28,7 +28,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from dossier_engine.engine.errors import ActivityError
-from dossier_engine.engine.pipeline.invariants import (
+from dossier_engine.engine.pipeline._helpers.invariants import (
     enforce_used_generated_disjoint,
 )
 from dossier_engine.engine.state import UsedRef
