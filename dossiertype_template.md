@@ -643,7 +643,7 @@ activities:
     #   System caller (worker for tasks, side effects):
     #     - Explicit ref → validated.
     #     - Omitted + `auto_resolve: "latest"` → engine resolves via
-    #       trigger scope → anchor → dossier singleton lookup.
+    #       trigger scope → dossier singleton lookup.
     #     - Omitted + no `auto_resolve` → slot left empty.
     #
     # Designing a client activity's `used:` block:

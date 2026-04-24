@@ -40,14 +40,13 @@ async def resolve_used(state: ActivityState) -> None:
        effects). For every entry in the activity definition's `used`
        block that has `auto_resolve: latest` and wasn't supplied
        explicitly, try to find the entity via (in order) the informing
-       activity's scope, the worker-supplied anchor, or a dossier-wide
-       singleton lookup. Auto-resolved entries are appended to
-       `state.used_refs` with `auto_resolved: True` for downstream
-       awareness.
+       activity's scope or a dossier-wide singleton lookup. Auto-resolved
+       entries are appended to `state.used_refs` with `auto_resolved: True`
+       for downstream awareness.
 
     Reads:  state.used_items, state.repo, state.dossier_id,
             state.activity_def, state.caller, state.informed_by,
-            state.anchor_entity_id, state.anchor_type, state.plugin
+            state.plugin
     Writes: state.used_refs, state.resolved_entities,
             state.used_rows_by_ref
     Raises: 422 on invalid refs, missing entities, or cross-dossier refs.
@@ -119,11 +118,7 @@ async def _auto_resolve_for_system_caller(state: ActivityState) -> None:
        trigger's generated and used lists are prefetched once for the
        whole loop to avoid N×2 queries.
 
-    2. **Anchor** — for worker-executed scheduled tasks, an anchor
-       entity may have been supplied at task scheduling time. If the
-       anchor's type matches what we need, use it.
-
-    3. **Singleton lookup** — for entity types declared as singletons,
+    2. **Singleton lookup** — for entity types declared as singletons,
        fall back to whatever the dossier's most recent version of that
        type is.
 
@@ -159,11 +154,6 @@ async def _auto_resolve_for_system_caller(state: ActivityState) -> None:
             entity = await resolve_from_prefetched(
                 state.repo, state.dossier_id,
                 trigger_generated_rows, trigger_used_rows, etype,
-            )
-
-        if entity is None and state.anchor_entity_id is not None and state.anchor_type == etype:
-            entity = await state.repo.get_latest_entity_by_id(
-                state.dossier_id, state.anchor_entity_id,
             )
 
         if entity is None and state.plugin.is_singleton(etype):

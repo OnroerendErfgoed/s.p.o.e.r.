@@ -160,8 +160,6 @@ class ActivityState:
     informed_by: str | None = None
     skip_cache: bool = False
     caller: Caller = Caller.CLIENT
-    anchor_entity_id: UUID | None = None
-    anchor_type: str | None = None
 
     # The wall-clock instant the orchestrator started executing this
     # activity. Used as `started_at` on the activity row and for any

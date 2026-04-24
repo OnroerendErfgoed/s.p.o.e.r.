@@ -63,8 +63,7 @@ async def resolve_from_trigger(
 ) -> EntityRow | None:
     """Resolve an entity of `entity_type` from a triggering activity's scope.
 
-    Used by side-effect auto-resolve and task anchor auto-fill. Resolution
-    order:
+    Used by side-effect auto-resolve. Resolution order:
 
     1. Entities **generated** by the trigger. These represent the state
        AFTER the trigger ran, so they take precedence.

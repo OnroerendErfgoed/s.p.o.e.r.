@@ -236,9 +236,10 @@ class TestFindRelatedEntity:
         class.
 
         Why both: if the fix accidentally converted all Nones to
-        exceptions, the caller's 'proceed unanchored' path would
-        stop working. These tests ensure 'no result' stays a
-        quiet None return, distinct from the noisy raise."""
+        exceptions, callers that rely on a quiet None to mean
+        "no result available" would stop working. These tests
+        ensure 'no result' stays a quiet None return, distinct
+        from the noisy raise."""
         # No-match case: walker exhausts the frontier with no target.
         boot = await _bootstrap(repo)
         act_a = await _make_activity(repo, "a")

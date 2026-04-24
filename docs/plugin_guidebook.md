@@ -413,7 +413,6 @@ activities:
       - kind: "scheduled_activity"
         target_activity: "trekAanvraagIn"
         scheduled_for: "+60d"
-        anchor_type: "oe:aanvraag"
         cancel_if_activities: ["vervolledigAanvraag", "neemBeslissing"]
 ```
 
@@ -421,7 +420,6 @@ Fields:
 
 - `target_activity` — the activity the engine will emit when the task fires.
 - `scheduled_for` — when.
-- `anchor_type` — the entity type whose current version will be used as the `used` entity when the engine runs the target activity. Without this, the target activity runs unanchored (no entities used).
 - `cancel_if_activities` — list of activity types that, if any of them runs before the scheduled time, cancel this task. Prevents the "aanvraag was completed, but the 60-day auto-withdraw still fired" footgun.
 
 No Python function needed — the engine handles everything. The target activity must exist in the same workflow.
@@ -444,7 +442,6 @@ async def handle_dienAanvraagIn(context, content):
             "kind": "scheduled_activity",
             "target_activity": "trekAanvraagIn",
             "scheduled_for": deadline,
-            "anchor_type": "oe:aanvraag",
             "cancel_if_activities": ["vervolledigAanvraag"],
         }],
     )
@@ -493,11 +490,11 @@ The worker:
 
 #### Supersession — what happens when you schedule the same task twice
 
-By default, scheduling a new task with the same `target_activity` (or `function`) and same anchored entity supersedes any existing scheduled task. The prior task's content is rewritten to `status: superseded` so the worker skips it. This makes the "update the deadline" pattern work naturally — just call the scheduling activity again and the new deadline wins.
+By default, scheduling a new task with the same `target_activity` (or `function`) supersedes any existing scheduled task in the same dossier. The prior task's content is rewritten to `status: superseded` so the worker skips it. Only one scheduled instance of a given target per dossier is ever on the worker's queue at a time. This makes the "update the deadline" pattern work naturally — just call the scheduling activity again and the new deadline wins.
 
 Set `allow_multiple: true` on the task declaration to opt out — then multiple scheduled tasks with the same shape coexist. Most plugins don't need this; the default is usually what you want.
 
-Supersession and cancellation both require an anchor. If a task doesn't have an `anchor_type` (and no handler-supplied `anchor_entity_id`), it can't be superseded or cancelled — it will fire exactly as scheduled.
+`allow_multiple` only governs scheduling. Cancellation (via `cancel_if_activities`) still fires on every matching task regardless — a task being allowed to coexist with others doesn't change whether the event it's waiting on has fired.
 
 ### Workflow rules — `requirements` and `forbidden`
 
@@ -988,7 +985,7 @@ Kinds 2-4 produce `system:task` entities and survive server restarts. Kind 1 doe
   function: "my_plugin.tasks.fn_name"
 ```
 
-No `scheduled_for`, `anchor_type`, or `cancel_if_activities` — fire_and_forget runs once, inline, synchronously during the activity's task-processing phase.
+No `scheduled_for` or `cancel_if_activities` — fire_and_forget runs once, inline, synchronously during the activity's task-processing phase.
 
 **Function signature:** `async def fn(ctx: ActivityContext) -> None`.
 
@@ -1004,7 +1001,6 @@ No `scheduled_for`, `anchor_type`, or `cancel_if_activities` — fire_and_forget
 - kind: "recorded"
   function: "my_plugin.tasks.fn_name"
   scheduled_for: "+20d"           # optional
-  anchor_type: "oe:aanvraag"      # optional — used to anchor deduplication
 ```
 
 **Function signature:** `async def fn(ctx: ActivityContext) -> None`.
@@ -1021,13 +1017,12 @@ No `scheduled_for`, `anchor_type`, or `cancel_if_activities` — fire_and_forget
 - kind: "scheduled_activity"
   target_activity: "trekAanvraagIn"
   scheduled_for: "+60d"
-  anchor_type: "oe:aanvraag"                      # optional — seeds target's `used`
   cancel_if_activities: ["vervolledigAanvraag"]   # optional — cancelling activities
 ```
 
 **No function needed.** The engine runs the named activity automatically.
 
-**Semantics:** at the scheduled time, if no activity in `cancel_if_activities` has run in the dossier since the task was created, the engine invokes `target_activity` as the system user with `anchor_type`'s latest version as the used entity. PROV records the scheduling activity as `wasInformedBy` of the resulting activity.
+**Semantics:** at the scheduled time, if no activity in `cancel_if_activities` has run in the dossier since the task was created, the engine invokes `target_activity` as the system user. The target activity's `used` block is filled in by the engine's normal auto-resolve (trigger scope → singleton fallback). PROV records the scheduling activity as `wasInformedBy` of the resulting activity.
 
 **Use for:** time-driven state transitions. The "auto-withdraw after 60 days of inactivity" pattern.
 
@@ -1060,14 +1055,12 @@ All three worker-backed kinds share a set of optional fields. `fire_and_forget` 
 | Field | Type | Purpose |
 |---|---|---|
 | `scheduled_for` | `str` | When to fire. Relative `"+Nd"/"+Nh"/"+Nm"/"+Nw"` or absolute ISO 8601. Omit for immediate. |
-| `anchor_type` | `str` | Entity type whose latest version scopes this task. Auto-resolves against the triggering activity's used+generated; can be overridden with `anchor_entity_id`. Scoped tasks participate in supersession and cancellation checks against the anchored entity. |
-| `anchor_entity_id` | `str` (UUID) | Explicit anchor override. Used by handler-built tasks that need a specific entity rather than auto-resolution. |
-| `cancel_if_activities` | `list[str]` | Activity types that cancel this task if they run on the anchored entity before the scheduled time. Requires an anchor. |
-| `allow_multiple` | `bool` | Default `false`. When `false`, scheduling a new task with the same `target_activity` (or `function`) and same `anchor_entity_id` supersedes any existing scheduled task — the prior's content is rewritten with `status: superseded`. When `true`, multiple scheduled tasks with the same shape coexist. |
+| `cancel_if_activities` | `list[str]` | Activity types that cancel this task if they run in the dossier before the scheduled time. |
+| `allow_multiple` | `bool` | Default `false`. When `false`, scheduling a new task with the same `target_activity` (or `function`) in the same dossier supersedes any existing scheduled task — the prior's content is rewritten with `status: superseded`. When `true`, multiple scheduled tasks with the same shape coexist. `allow_multiple` only governs scheduling; cancellation still fires on every matching task regardless. |
 
-**Supersession.** With `allow_multiple: false` (the default), the common "update the deadline" pattern works naturally — call the scheduling activity twice and the second call's task replaces the first.
+**Supersession.** With `allow_multiple: false` (the default), the common "update the deadline" pattern works naturally — call the scheduling activity twice and the second call's task replaces the first. Only one scheduled instance of a given target per dossier is ever on the worker's queue at a time.
 
-**Cancellation.** Requires two conditions: the canceling activity must be in `cancel_if_activities`, AND it must actually advance the anchored entity (generate a new version of it). Merely consulting the anchor via `used` is not enough. Prevents the "aanvraag was completed but the 60-day auto-withdraw still fired" footgun.
+**Cancellation.** The canceling activity must be in the task's `cancel_if_activities` list and must run in the same dossier before the scheduled time. Prevents the "aanvraag was completed but the 60-day auto-withdraw still fired" footgun.
 
 ### Scheduling-format grammar
 
@@ -1294,7 +1287,7 @@ Registered automatically when certain conditions hold. Don't declare these in `a
 
 | Activity | When registered | Purpose |
 |---|---|---|
-| `systemAction` | Always | Initial bootstrap activity every dossier has. Used by the engine to anchor cross-dossier references and to seed the PROV graph. |
+| `systemAction` | Always | Initial bootstrap activity every dossier has. Used by the engine as the attachment point for cross-dossier references and to seed the PROV graph. |
 | `oe:tombstone` | When workflow declares `tombstone:` block | GDPR-style redaction. |
 
 ## Glossary of error shapes

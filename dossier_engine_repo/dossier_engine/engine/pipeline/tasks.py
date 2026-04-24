@@ -18,35 +18,24 @@ handler-appended (`HandlerResult.tasks`). Tasks fall into four kinds:
 * **cross_dossier_activity** — same as scheduled_activity but the
   worker is expected to dispatch it against a different dossier.
 
-Three pieces of cross-cutting machinery apply to recorded /
+Two pieces of cross-cutting machinery apply to recorded /
 scheduled / cross-dossier tasks:
 
-1. **Anchors.** A task may declare an `anchor_type` in YAML (or the
-   handler may supply an explicit `anchor_entity_id`). The anchor
-   entity_id scopes the task to a specific logical entity — only
-   activities that touch that entity will trigger cancellation
-   (step 16) or supersession (in `process_tasks`). Auto-resolution
-   walks `resolve_from_trigger` over the activity's used+generated
-   to find a matching entity; if no anchor candidate exists and one
-   was declared, we raise 500 — the handler must provide it.
+1. **Supersession.** Unless `allow_multiple: true`, scheduling a new
+   task with the same `target_activity` as an existing scheduled task
+   in this dossier supersedes the old one — its content is rewritten
+   with `status: superseded` so it won't be picked up by the worker.
+   Only one scheduled instance of a given `target_activity` per dossier
+   can be queued at a time.
 
-2. **Supersession.** Unless `allow_multiple: true`, scheduling a new
-   task with the same `target_activity` and same `anchor_entity_id`
-   as an existing scheduled task supersedes the old one — its
-   content is rewritten with `status: superseded` so it won't be
-   picked up by the worker.
-
-3. **Cancellation** (step 16). After the new tasks are written, walk
+2. **Cancellation** (step 16). After the new tasks are written, walk
    every existing `system:task` entity in the dossier and check
    whether the canceling activity (the one we just ran) is in its
-   `cancel_if_activities` list. If so, AND the canceling activity
-   actually advanced the task's anchored entity (generated a new
-   version of it), AND the task was scheduled before this activity
-   started, mark it cancelled.
-
-The "must have generated a new version" clause is critical: it means
-that merely *consulting* an entity (putting it in `used`) is not
-enough to cancel a scheduled task. State must actually advance.
+   `cancel_if_activities` list. If so, AND the task was scheduled
+   before this activity started, mark it cancelled. `allow_multiple`
+   does not affect cancellation — a task being allowed to coexist
+   with others of its type doesn't change whether the event it's
+   waiting on has fired.
 """
 
 from __future__ import annotations
@@ -57,7 +46,6 @@ from uuid import UUID, uuid4
 
 from ..context import ActivityContext, HandlerResult
 from ..errors import ActivityError
-from ..lookups import resolve_from_trigger
 from ..state import ActivityState
 from ...db.models import EntityRow
 from ...entities import TaskEntity
@@ -73,19 +61,15 @@ async def process_tasks(state: ActivityState) -> None:
 
     * **fire_and_forget**: invoke the registered task_handler function
       inline, swallowing any exception.
-    * **other kinds**: resolve the anchor (handler override → engine
-      auto-fill), supersede any existing scheduled task with the same
-      target+anchor (unless `allow_multiple`), then write a new
-      `system:task` entity carrying the full task descriptor.
+    * **other kinds**: supersede any existing scheduled task with the
+      same `target_activity` (unless `allow_multiple`), then write a
+      new `system:task` entity carrying the full task descriptor.
 
     Reads:  state.activity_def, state.handler_result, state.plugin,
             state.repo, state.dossier_id, state.activity_id,
             state.resolved_entities
     Writes: nothing on `state` directly; persists `system:task`
             entities to the database.
-    Raises: 500 if a task declared `anchor_type` but the activity
-            didn't touch any entity of that type and the handler
-            didn't supply an explicit `anchor_entity_id`.
     """
     all_task_defs = list(state.activity_def.get("tasks", []))
     if isinstance(state.handler_result, HandlerResult):
@@ -144,9 +128,7 @@ async def _fire_and_forget(state: ActivityState, task_def: dict) -> None:
 async def _schedule_recorded_task(
     state: ActivityState, task_def: dict, task_kind: str,
 ) -> None:
-    """Resolve anchor, handle supersession, persist the task entity."""
-    anchor_entity_id = await _resolve_anchor(state, task_def)
-
+    """Handle supersession and persist the task entity."""
     # Resolve scheduled_for: accepts "+20d"/"+2h"/"+45m"/"+3w" relative
     # offsets (resolved against state.now) or absolute ISO 8601. Raises
     # ValueError on a malformed value so YAML typos fail loudly at
@@ -171,8 +153,6 @@ async def _schedule_recorded_task(
         allow_multiple=task_def.get("allow_multiple", False),
         result_activity_id=str(uuid4()),
         status="scheduled",
-        anchor_entity_id=str(anchor_entity_id) if anchor_entity_id else None,
-        anchor_type=task_def.get("anchor_type"),
     )
 
     if not task_content.allow_multiple and task_content.target_activity:
@@ -189,56 +169,17 @@ async def _schedule_recorded_task(
     )
 
 
-async def _resolve_anchor(state: ActivityState, task_def: dict) -> UUID | None:
-    """Resolve a task's anchor entity_id.
-
-    Order:
-    1. Handler override (`task_def["anchor_entity_id"]`)
-    2. Engine auto-fill via `resolve_from_trigger` (looks at what
-       this activity used or generated, finds the first row matching
-       the declared anchor_type)
-    3. None — only allowed when no anchor_type was declared
-
-    If anchor_type was declared but neither the handler nor
-    auto-resolution can produce an entity_id, raise 500. This is a
-    workflow misconfiguration: the activity asked for a task scoped
-    to an anchor it doesn't actually touch.
-    """
-    handler_anchor = task_def.get("anchor_entity_id")
-    if handler_anchor is not None:
-        return UUID(str(handler_anchor))
-
-    anchor_type = task_def.get("anchor_type")
-    if not anchor_type:
-        return None
-
-    anchor_row = await resolve_from_trigger(
-        state.repo, state.activity_id, state.dossier_id, anchor_type,
-    )
-    if anchor_row is not None:
-        return anchor_row.entity_id
-
-    # Anchor required but unresolvable — fail loud.
-    raise ActivityError(
-        500,
-        f"Cannot resolve anchor for task "
-        f"{task_def.get('target_activity') or task_def.get('function')}: "
-        f"activity '{state.activity_def['name']}' did not touch any "
-        f"entity of type '{anchor_type}'. The handler must supply "
-        f"anchor_entity_id explicitly.",
-    )
-
-
 async def _supersede_matching(
     state: ActivityState, new_task: TaskEntity,
 ) -> None:
-    """Mark any existing scheduled task with the same target+anchor as
-    superseded.
+    """Mark any existing scheduled task with the same target_activity
+    as superseded.
 
-    Two tasks supersede each other only if they share both
-    `target_activity` and `anchor_entity_id` (None == None matches
-    global-scope tasks). The supersession writes a new revision of the
-    existing task entity with `status: superseded`.
+    Two tasks supersede each other when they share `target_activity`
+    within the same dossier. The supersession writes a new revision of
+    the existing task entity with `status: superseded`, so only one
+    scheduled instance of a given target per dossier is ever on the
+    worker's queue at a time.
 
     Uses a flat `get_entities_by_type` query and dedupes in Python
     instead of a SQL GROUP BY — faster for the small task lists we
@@ -258,10 +199,8 @@ async def _supersede_matching(
             continue
         if existing.content.get("target_activity") != new_task.target_activity:
             continue
-        if existing.content.get("anchor_entity_id") != new_task.anchor_entity_id:
-            continue
 
-        # Same target, same anchor → supersede.
+        # Same target → supersede.
         superseded_content = dict(existing.content)
         superseded_content["status"] = "superseded"
         await state.repo.create_entity(
@@ -280,17 +219,16 @@ async def cancel_matching_tasks(state: ActivityState) -> None:
     """Walk every existing scheduled task and cancel those whose
     `cancel_if_activities` includes the activity we just ran.
 
-    Cancellation is anchor-scoped: an anchored task is cancelled only
-    if the canceling activity actually generated a new version of the
-    anchored entity (state must have advanced — merely consulting the
-    entity via `used` is not enough). None-anchored tasks are global-
-    scope and cancel whenever the target activity runs.
+    Cancellation fires whenever the canceling activity runs in the same
+    dossier. `allow_multiple` does not affect cancellation — a task
+    being allowed to coexist with others of its type doesn't change
+    whether the event it's waiting on has fired.
 
     Tasks created at-or-after this activity's start time are skipped
     — we don't cancel tasks the activity itself just scheduled.
 
     Reads:  state.repo, state.dossier_id, state.activity_def,
-            state.activity_id, state.generated, state.now
+            state.activity_id, state.now
     Writes: nothing on `state`; persists cancellation revisions of
             `system:task` entities.
     """
@@ -300,10 +238,6 @@ async def cancel_matching_tasks(state: ActivityState) -> None:
         existing = latest_by_eid.get(row.entity_id)
         if existing is None or row.created_at > existing.created_at:
             latest_by_eid[row.entity_id] = row
-
-    # The set of logical entity_ids this activity generated — used for
-    # the anchor-scope check below.
-    advanced_entity_ids: set[UUID] = {g["entity_id"] for g in state.generated}
 
     for task_entity in latest_by_eid.values():
         if not task_entity.content:
@@ -322,29 +256,6 @@ async def cancel_matching_tasks(state: ActivityState) -> None:
         cancel_locals = {local_name(n) for n in cancel_list}
         if current_local not in cancel_locals:
             continue
-
-        # Anchor scope: anchored tasks only cancel when this activity
-        # actually advanced the task's anchored entity.
-        anchor_id_str = task_entity.content.get("anchor_entity_id")
-        if anchor_id_str is not None:
-            try:
-                task_anchor_id = UUID(anchor_id_str)
-            except (ValueError, TypeError):
-                # Data corruption: the engine wrote this via
-                # ``str(anchor_entity_id)`` (see ``_schedule_recorded_task``),
-                # so a malformed value here means the row was tampered
-                # with or the schema changed incompatibly. Log loudly
-                # so it surfaces in Sentry; the skip is a safe default
-                # (cancellation simply doesn't fire) but the cause
-                # needs investigating.
-                _log.error(
-                    "Malformed anchor_entity_id %r on task %s — "
-                    "skipping cancellation check",
-                    anchor_id_str, task_entity.id,
-                )
-                continue  # malformed anchor — skip
-            if task_anchor_id not in advanced_entity_ids:
-                continue  # this activity didn't advance the anchor entity
 
         # Skip tasks created at-or-after this activity's start. Don't
         # cancel things this activity itself just scheduled.

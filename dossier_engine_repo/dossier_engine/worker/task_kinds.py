@@ -182,11 +182,6 @@ async def _process_scheduled_activity(
 ) -> None:
     """Type 3 — scheduled activity: execute an activity in the same
     dossier at the scheduled time, then record completion.
-
-    The target activity runs with the task's anchor (if any) passed
-    through so the engine's auto-resolve can locate the anchored
-    entity even when the informing activity's scope didn't cover
-    every needed type.
     """
     target_activity_type = task.content.get("target_activity")
     result_activity_id = UUID(task.content["result_activity_id"])
@@ -196,10 +191,6 @@ async def _process_scheduled_activity(
         raise ValueError(
             f"Activity definition not found: {target_activity_type}"
         )
-
-    task_anchor_id_str = task.content.get("anchor_entity_id")
-    task_anchor_type = task.content.get("anchor_type")
-    task_anchor_id = UUID(task_anchor_id_str) if task_anchor_id_str else None
 
     await execute_activity(
         plugin=plugin,
@@ -213,8 +204,6 @@ async def _process_scheduled_activity(
         generated_items=[],
         informed_by=str(task.generated_by) if task.generated_by else None,
         caller=Caller.SYSTEM,
-        anchor_entity_id=task_anchor_id,
-        anchor_type=task_anchor_type,
     )
     await repo.session.flush()
 

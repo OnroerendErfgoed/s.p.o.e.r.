@@ -255,8 +255,8 @@ async def handle_beslissing(context: ActivityContext, content: dict | None) -> H
 # Each function has a single, documented responsibility. The status
 # resolver reads used entities and returns a status string. The task
 # builder decides whether to schedule a trekAanvraagIn task and, if
-# so, resolves the anchor entity and computes the deadline from
-# plugin constants. Both are independently testable.
+# so, computes the deadline from plugin constants. Both are
+# independently testable.
 
 
 async def resolve_beslissing_status(context: ActivityContext) -> str | None:
@@ -290,8 +290,7 @@ async def schedule_trekAanvraag_if_onvolledig(
     context: ActivityContext,
 ) -> list[dict]:
     """When a beslissing is ``onvolledig``, schedule a
-    trekAanvraagIn task anchored to the aanvraag, cancellable by
-    vervolledigAanvraag.
+    trekAanvraagIn task cancellable by vervolledigAanvraag.
 
     Returns an empty list in every other case. Separating "do I
     schedule?" into its own function makes the scheduling condition
@@ -308,75 +307,26 @@ async def schedule_trekAanvraag_if_onvolledig(
 async def _build_trekAanvraag_task(context: ActivityContext) -> dict | None:
     """Build the trekAanvraagIn task dict.
 
-    Shared between the legacy handler path and the split-style task
-    builder so behaviour stays identical. Resolves the anchor entity
-    (via used, then via lineage walk from the beslissing) and reads
-    the deadline days from plugin constants.
-
-    Bug 54 (Round 25) behaviour: if the lineage walk detects ambiguity
-    (beslissing lineage touches multiple distinct aanvragen at one
-    activity — a structural signal that shouldn't happen in
-    well-formed data), log a WARNING with the candidate entity IDs
-    and proceed with an unanchored task. This is intentionally
-    permissive — the task still goes out, just without an anchor —
-    because crashing the activity on a structural-data anomaly is
-    too strong a response for the one caller that exists today.
-    Operators get a log line to triage from. Stricter callers should
-    let ``LineageAmbiguous`` propagate.
+    Reads the deadline days from plugin constants and returns a task
+    descriptor for the engine's scheduler. Supersession on the engine
+    side matches by `target_activity` within the dossier, so scheduling
+    this task a second time simply revises the first — there can only
+    be one scheduled trekAanvraagIn per dossier at a time.
     """
-    import logging
     from datetime import datetime, timezone, timedelta
-    from dossier_engine.lineage import find_related_entity, LineageAmbiguous
-
-    _logger = logging.getLogger(__name__)
-
-    aanvraag_row = context.get_used_row("oe:aanvraag")
-    if aanvraag_row is None:
-        beslissing_row = context.get_used_row("oe:beslissing")
-        if beslissing_row is not None:
-            try:
-                aanvraag_row = await find_related_entity(
-                    context.repo,
-                    context.dossier_id,
-                    beslissing_row,
-                    "oe:aanvraag",
-                )
-            except LineageAmbiguous as exc:
-                # Operators: a beslissing's lineage reached an activity
-                # that touched >1 distinct aanvraag. The task still
-                # goes out unanchored; the underlying data anomaly
-                # needs human triage. Log enough context to find it.
-                _logger.warning(
-                    "trekAanvraagIn task: lineage ambiguous for "
-                    "beslissing %s in dossier %s — activity %s "
-                    "touched %d aanvragen (%s). Proceeding with "
-                    "unanchored task.",
-                    beslissing_row.entity_id,
-                    context.dossier_id,
-                    exc.activity_id,
-                    len(exc.candidate_entity_ids),
-                    exc.candidate_entity_ids,
-                )
-                aanvraag_row = None
-
-    anchor_entity_id = str(aanvraag_row.entity_id) if aanvraag_row else None
 
     deadline_days = context.constants.aanvraag_deadline_days
     deadline = (
         datetime.now(timezone.utc) + timedelta(days=deadline_days)
     ).isoformat()
 
-    task = {
+    return {
         "kind": "scheduled_activity",
         "target_activity": "trekAanvraagIn",
         "scheduled_for": deadline,
         "cancel_if_activities": ["vervolledigAanvraag"],
         "allow_multiple": False,
-        "anchor_type": "oe:aanvraag",
     }
-    if anchor_entity_id is not None:
-        task["anchor_entity_id"] = anchor_entity_id
-    return task
 
 
 async def duid_behandelaar_aan(context: ActivityContext, content: dict | None) -> HandlerResult:

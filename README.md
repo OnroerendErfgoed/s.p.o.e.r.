@@ -359,7 +359,7 @@ Four types of tasks, all modeled as `system:task` entities with full PROV:
 | 3 | `scheduled_activity` | Worker executes an activity at a scheduled time |
 | 4 | `cross_dossier_activity` | Worker executes an activity in another dossier |
 
-Tasks can be defined statically in YAML or appended conditionally by handlers at runtime. Scheduled tasks can be anchored to an entity via `anchor_entity_id`/`anchor_type`, which lets the engine locate the anchored entity even when the triggering activity didn't directly touch it — crucial when `cancel_if_activities` cancels a task based on a later activity that doesn't share the original scope.
+Tasks can be defined statically in YAML or appended conditionally by handlers at runtime. Only one scheduled task of a given `target_activity` per dossier can be queued at a time — scheduling a second one supersedes the first (unless `allow_multiple: true`). Scheduled tasks declare `cancel_if_activities` to name activities whose execution should cancel the task before the worker picks it up.
 
 ### Worker
 
@@ -401,7 +401,7 @@ python -m dossier_engine.worker --requeue-dead-letters --task=<entity_uuid>
 python -m dossier_engine.worker --requeue-dead-letters --dossier=<uuid> --task=<entity_uuid>
 ```
 
-The requeue writes a fresh revision of each dead-lettered task with `status = "scheduled"`, `attempt_count = 0`, and `next_attempt_at = null`. The original `scheduled_for` is preserved as the historical record of when the task was first queued, and `last_attempt_at` is preserved so operators can still see when the task last tried. All other task content (function name, anchor, target_activity, etc.) is carried forward unchanged.
+The requeue writes a fresh revision of each dead-lettered task with `status = "scheduled"`, `attempt_count = 0`, and `next_attempt_at = null`. The original `scheduled_for` is preserved as the historical record of when the task was first queued, and `last_attempt_at` is preserved so operators can still see when the task last tried. All other task content (function name, target_activity, etc.) is carried forward unchanged.
 
 Each dossier's requeue is audited as a single `systemAction` activity that generates N task revisions plus one `system:note` explaining the scope and listing the requeued task entity_ids. Running `--requeue-dead-letters` once with 50 dead letters spread across 10 dossiers produces 10 audit entries, one per dossier, each listing the tasks requeued in that dossier. The systemAction is a first-class activity in the PROV graph — an auditor walking the dossier's history sees exactly when each requeue happened and which tasks were affected.
 
@@ -1156,7 +1156,7 @@ The test script (`test_requests.sh`) creates 9 dossiers:
 
 - **D1 — Brugge, RRN aanvrager.** `dienAanvraagIn` → `neemBeslissing(onvolledig)` → `vervolledigAanvraag` → `neemBeslissing(goedgekeurd)`. Exercises the happy path with direct decisions and file upload/download URL injection.
 
-- **D2 — Gent, KBO aanvrager, separate signer.** `dienAanvraagIn` → `doeVoorstelBeslissing(onvolledig)` → `tekenBeslissing` (signs) → `vervolledigAanvraag` → `bewerkAanvraag` → `doeVoorstelBeslissing(goedgekeurd)` → `tekenBeslissing` (declines) → `doeVoorstelBeslissing(goedgekeurd)` → `tekenBeslissing` (signs). Exercises the proposal-and-sign flow, decline/retry, and the anchor mechanism used by D7.
+- **D2 — Gent, KBO aanvrager, separate signer.** `dienAanvraagIn` → `doeVoorstelBeslissing(onvolledig)` → `tekenBeslissing` (signs) → `vervolledigAanvraag` → `bewerkAanvraag` → `doeVoorstelBeslissing(goedgekeurd)` → `tekenBeslissing` (declines) → `doeVoorstelBeslissing(goedgekeurd)` → `tekenBeslissing` (signs). Exercises the proposal-and-sign flow, decline/retry, and the task-cancellation end-to-end flow verified by D7.
 
 - **D3 — Batch auto-resolve.** `dienAanvraagIn` → BATCH[`bewerkAanvraag` + `doeVoorstelBeslissing`]. The second activity in the batch auto-resolves the revised aanvraag from the first activity's generated entities via the repo flush between batch steps.
 
@@ -1164,9 +1164,9 @@ The test script (`test_requests.sh`) creates 9 dossiers:
 
 - **D5 — Derivation rules (negative tests).** Six negative cases covering missing derivation chain, stale derivedFrom pointers, cross-entity derivation, unknown parent versions, and two flavors of the disjoint-invariant check: listing the same logical entity in both `used` and `generated` fails with `422 used_generated_overlap`, and the same rule applies symmetrically to external URIs — an external URI that appears in both blocks of the same activity is rejected with the same `kind: "external"` overlap payload. See `invariants.enforce_used_generated_disjoint` and `test_invariants.py::test_external_overlap_by_uri` for the authoritative behaviour.
 
-- **D6 — Stale used + `oe:neemtAkteVan`.** Positive and negative paths for acknowledging newer versions of an entity the activity chose not to revise. Uses `doeVoorstelBeslissing` (a read-only activity anchored to the aanvraag) as the test vehicle because stale-used semantics only apply to activities that inspect an entity they don't themselves revise.
+- **D6 — Stale used + `oe:neemtAkteVan`.** Positive and negative paths for acknowledging newer versions of an entity the activity chose not to revise. Uses `doeVoorstelBeslissing` (a read-only activity that inspects the aanvraag) as the test vehicle because stale-used semantics only apply to activities that inspect an entity they don't themselves revise.
 
-- **D7 — Anchor mechanism.** Verifies that D2's `trekAanvraagIn` scheduled task is anchored to the aanvraag and gets cancelled by `vervolledigAanvraag` even though `vervolledigAanvraag` doesn't list the task in its used block.
+- **D7 — Task cancellation.** Verifies that D2's `trekAanvraagIn` scheduled task (scheduled when `doeVoorstelBeslissing` returned `onvolledig`) gets cancelled by `vervolledigAanvraag` — the end-to-end cancel-on-activity-fires flow.
 
 - **D8 — Schema versioning.** Exercises per-activity `new_version` / `allowed_versions` declarations. A v1 aanvraag is revised to v2 by an activity that declares `allowed_versions: [v1, v2]`. A subsequent activity that declares `allowed_versions: [v2]` is then tried against the v1 parent and rejected with `422 unsupported_schema_version`.
 

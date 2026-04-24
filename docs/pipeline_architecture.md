@@ -98,7 +98,7 @@ These phases create secondary effects based on the now-persisted activity.
 
 **Side effects (16)** are recursive child activities (e.g., `setDossierAccess` fires automatically after `dienAanvraagIn`). They run through the full pipeline themselves, so they need the parent activity's entities to be persisted and visible. A `session.flush()` runs before side effects to ensure the parent's writes are visible within the transaction.
 
-**Task scheduling (17)** processes both YAML-declared and handler-appended tasks. It runs after the handler (which may append tasks) and after persistence (because task entities need the activity's generated entities to exist for anchor resolution). The supersession logic (`_supersede_matching`) queries existing `system:task` entities — if we scheduled tasks before persisting the current activity's entities, the anchor resolution would fail.
+**Task scheduling (17)** processes both YAML-declared and handler-appended tasks. It runs after the handler (which may append tasks) and after persistence (so the activity's generated entities are visible to downstream queries). The supersession logic (`_supersede_matching`) queries existing `system:task` entities and marks any scheduled task with the same `target_activity` as superseded — only one scheduled instance of a given target per dossier is ever on the worker's queue at a time.
 
 **Task cancellation (18)** cancels existing scheduled tasks whose `cancel_if_activities` includes the activity we just ran. This must run after the current activity's tasks are scheduled (phase 17), otherwise we might cancel a task and then immediately re-create it.
 
@@ -124,7 +124,7 @@ The class has **~37 fields** — ~17 inputs set by the orchestrator from the req
 |---|---|---|
 | `dossier` | ensure_dossier | authorize, workflow_rules, finalization |
 | `used_refs` (`list[UsedRef]`) | resolve_used | enforce_disjoint, persistence |
-| `resolved_entities` | resolve_used | handlers, task anchor resolution |
+| `resolved_entities` | resolve_used | handlers |
 | `used_rows_by_ref` | resolve_used | relation validators |
 | `generated` | process_generated, handler | persistence, validators, task scheduling |
 | `validated_relations` (`list[ValidatedRelation]`) | process_relations | persistence |

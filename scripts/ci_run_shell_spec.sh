@@ -5,7 +5,7 @@
 #
 # M4/M5 relief for `test_requests.sh` specifically: the shell spec
 # is our most comprehensive end-to-end test (1585 lines, 25 OK
-# assertions, D1–D9 covering aanvraag/beslissing/tombstone/anchor/
+# assertions, D1–D9 covering aanvraag/beslissing/tombstone/cancellation/
 # schema-versioning/lineage) but it only runs when a human
 # remembers to invoke it. This wrapper makes that trivial from CI:
 # single command, deterministic teardown, exit code that tools can

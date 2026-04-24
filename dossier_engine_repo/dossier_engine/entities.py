@@ -42,7 +42,7 @@ class TaskEntity(BaseModel):
         scheduled → scheduled → ...     (transient failure, retry with backoff)
         scheduled → dead_letter         (exhausted max_attempts, terminal)
         scheduled → cancelled           (cancel_if_activities triggered)
-        scheduled → superseded          (replaced by another task with same anchor)
+        scheduled → superseded          (replaced by another task with the same target_activity)
 
     Retry semantics. On execution failure, the worker increments
     `attempt_count` and either:
@@ -97,15 +97,6 @@ class TaskEntity(BaseModel):
         "superseded", "dead_letter",
     ] = "scheduled"
     result: Optional[str] = None        # URI or result data after completion
-
-    # Anchor: the specific entity this task is scoped to, used for cancel,
-    # supersede, and allow_multiple matching. Stored as strings so the Pydantic
-    # model is JSON-round-trippable through the database. `anchor_type` records
-    # the entity type the anchor is bound to, so worker-executed scheduled tasks
-    # can use it as an auto-resolve fallback for multi-cardinality used types
-    # that match the anchor's type.
-    anchor_entity_id: Optional[str] = None
-    anchor_type: Optional[str] = None
 
     # Retry policy state. All optional with sensible defaults so existing
     # tasks in the database continue to deserialize without migration.

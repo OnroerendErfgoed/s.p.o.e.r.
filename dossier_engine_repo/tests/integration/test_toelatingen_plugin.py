@@ -399,7 +399,6 @@ class TestHandleBeslissing:
         assert task["kind"] == "scheduled_activity"
         assert task["target_activity"] == "trekAanvraagIn"
         assert task["cancel_if_activities"] == ["vervolledigAanvraag"]
-        assert task["anchor_type"] == "oe:aanvraag"
 
     async def test_signed_no_beslissing_returns_ondertekend(self, repo):
         """Handtekening=signed but no beslissing entity exists →

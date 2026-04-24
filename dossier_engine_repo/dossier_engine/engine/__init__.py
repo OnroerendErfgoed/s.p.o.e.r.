@@ -92,8 +92,6 @@ async def execute_activity(
     relation_items: list[dict] | None = None,
     remove_relation_items: list[dict] | None = None,
     caller: Caller = Caller.CLIENT,
-    anchor_entity_id: UUID | None = None,
-    anchor_type: str | None = None,
 ) -> dict:
     """
     Execute an activity.
@@ -107,12 +105,6 @@ async def execute_activity(
         scheduled task). Auto-resolve of used entities only runs for
         system callers. Plain strings `"client"` and `"system"` still
         work because `Caller` inherits from `str`.
-    anchor_entity_id / anchor_type: set by the worker when executing a
-        scheduled task. If the activity's used block needs an entity of
-        type `anchor_type` and `resolve_from_trigger` can't find it,
-        the engine falls back to `get_latest_entity_by_id(anchor_entity_id)`.
-        Ensures scheduled tasks can locate their anchored entity even when
-        it wasn't touched by the informing activity.
     """
     if generated_items is None:
         generated_items = []
@@ -141,8 +133,6 @@ async def execute_activity(
         informed_by=informed_by,
         skip_cache=skip_cache,
         caller=caller,
-        anchor_entity_id=anchor_entity_id,
-        anchor_type=anchor_type,
         now=now,
     )
 
@@ -233,14 +223,13 @@ async def execute_activity(
     )
 
     # Process all tasks the activity declared (YAML + handler-appended).
-    # Resolves anchors, supersedes existing scheduled tasks with the
-    # same target+anchor (unless allow_multiple), persists `system:task`
-    # entities for the worker to pick up.
+    # Supersedes existing scheduled tasks with the same target_activity
+    # (unless allow_multiple), persists `system:task` entities for the
+    # worker to pick up.
     await process_tasks(state)
 
     # Cancel any prior scheduled tasks whose `cancel_if_activities`
-    # includes the activity we just ran. Anchor-scoped: only cancels
-    # if this activity actually advanced the anchored entity.
+    # includes the activity we just ran.
     await cancel_matching_tasks(state)
 
     # Plugin-declared synchronous pre-commit hooks. These run AFTER
