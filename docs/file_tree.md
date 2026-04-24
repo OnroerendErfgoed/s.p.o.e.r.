@@ -516,7 +516,7 @@ engine/
 ├── lookups.py         — lookup_singleton, resolve_from_trigger, resolve_from_prefetched
 ├── refs.py            — EntityRef parsing + canonical string format
 ├── response.py        — build_replay_response (for idempotent PUT replays)
-├── scheduling.py      — resolve_scheduled_for (+20d / ISO 8601 parsing)
+├── scheduling.py      — resolve_scheduled_for (signed offsets / ISO 8601 / entity field forms)
 ├── state.py           — ActivityState (the mutable state threaded through phases)
 └── pipeline/          — the per-phase implementations
 ```
@@ -696,22 +696,38 @@ response (activity identity + dossier state + allowed activities);
 `used` and `generated` come back empty because replay doesn't re-execute
 them. Called from `pipeline/preconditions.py::check_idempotency`.
 
-### `engine/scheduling.py` (95 lines)
+### `engine/scheduling.py` (271 lines)
 
-`resolve_scheduled_for(value, now)` — parses a task's `scheduled_for`
-declaration. Two accepted forms:
+`resolve_scheduled_for(value, now, resolved_entities)` — parses a
+task's `scheduled_for` declaration. Four accepted forms:
 
-- Relative offset: `+20d` / `+2h` / `+45m` / `+3w`. Resolved against
-  `now`. `+` prefix is mandatory (bare `20d` would be confusing).
-- Absolute ISO 8601: `2026-05-01T12:00:00Z` or with an explicit
-  offset. Naive datetimes are normalized to UTC.
+- **Signed relative offset** — `+20d` / `-7d` / `+2h` / `+45m` / `+3w`.
+  Resolved against `now`. Sign is mandatory (bare `20d` would be
+  ambiguous with entity-field paths). Negative offsets resolve to
+  the past; the worker picks up past-dated tasks on its next poll.
+- **Absolute ISO 8601** — `2026-05-01T12:00:00Z` or with an explicit
+  offset. Naive datetimes are normalized to UTC; the original string
+  is preserved verbatim when it was already timezone-aware.
+- **Entity field reference** — a dict `{from_entity, field}` that
+  reads an ISO datetime (or date-only) string from an entity in
+  `state.resolved_entities`. Same `from_entity`/`field` idiom
+  authorization and finalization use. The value can be an ISO
+  string, a date-only string (→ midnight UTC), or a Python
+  `datetime` already (for handler-built tasks).
+- **Entity field + offset** — the dict form plus an `offset` key
+  containing a signed relative offset. The reminder idiom:
+  `{from_entity: oe:aanvraag, field: expires_at, offset: "-7d"}`
+  resolves to 7 days before the permit expiry.
 
-Anything depending on entity content (e.g. "30 days after the
-aanvraag's registration date") is computed in a handler and supplied
-via `HandlerResult.tasks[...].scheduled_for` — YAML templating over
-entity fields is deliberately not supported. A malformed value
-raises `ValueError` so typos fail loudly at activity execution
-rather than silently scheduling for "now".
+The entity form fails loud with `ValueError` when the type isn't
+in `resolved_entities` (activity didn't declare it in its
+used/generated block), when the field is missing or null, or when
+the value isn't a parseable datetime. `_schedule_recorded_task`
+wraps these as 500 `ActivityError` at activity execution so YAML
+authors get a clear error location. Complex scheduling logic that
+doesn't fit the DSL — multiple entities, business-day math —
+belongs in a handler; the handler returns a pre-formatted ISO
+string via `HandlerResult.tasks[...].scheduled_for`.
 
 ### `engine/state.py` (275 lines)
 
@@ -992,8 +1008,11 @@ Cross-cutting machinery:
   a given target per dossier is ever on the worker's queue at a
   time. Skipped when `allow_multiple: true`.
 - **Scheduled-for resolution** — delegates to
-  `engine.scheduling.resolve_scheduled_for` for `+20d` / ISO 8601
-  parsing. A malformed value raises 500 at activity execution so
+  `engine.scheduling.resolve_scheduled_for` for signed-offset / ISO
+  8601 / entity field-reference parsing. `state.resolved_entities`
+  is passed through so the dict form (`{from_entity, field}`) can
+  read datetime fields from entities the activity used or
+  generated. A malformed value raises 500 at activity execution so
   YAML typos fail loudly.
 
 `cancel_matching_tasks(state)` runs after the new tasks are written.

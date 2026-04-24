@@ -1,33 +1,56 @@
 """
 Parsing for ``scheduled_for`` values on task declarations.
 
-Two accepted forms:
+Four accepted forms:
 
-* **Relative offset** — ``+20d``, ``+2h``, ``+45m``, ``+3w``.
-  Resolves against the activity's ``now`` timestamp. Useful for
-  YAML task declarations that want "20 days from when this
-  activity runs". The ``+`` prefix is required and unambiguous
-  (a bare ``20d`` would be confusing).
+* **Relative offset** — ``+20d``, ``+2h``, ``+45m``, ``+3w``, or the
+  negative equivalents (``-7d`` for "seven days ago / before").
+  Resolves against the activity's ``now`` timestamp. The most common
+  YAML case — "20 days from when this activity runs". Both ``+`` and
+  ``-`` signs are accepted; the worker's ``scheduled_for <= now``
+  check handles already-past times (a past-dated task fires
+  immediately on the next worker poll).
 
 * **Absolute ISO 8601** — ``2026-05-01T12:00:00Z``,
-  ``2026-05-01T12:00:00+00:00``. Useful when you genuinely know
-  the wall-clock time (calibration dates, regulatory cutoffs).
+  ``2026-05-01T12:00:00+00:00``. Useful when you genuinely know the
+  wall-clock time (calibration dates, regulatory cutoffs).
 
-For anything that depends on entity content — "30 days after the
-aanvraag's registration date" — compute the deadline in a handler
-and return it in ``HandlerResult.tasks[0]["scheduled_for"]`` as an
-ISO string. YAML templating over entity fields is deliberately not
-supported; handlers have full Python and real types.
+* **Entity field reference** — a dict ``{from_entity, field}`` that
+  reads an ISO datetime (or date-only) string from an entity already
+  resolved for this activity. The entity must be in
+  ``state.resolved_entities``, i.e. in this activity's ``used`` or
+  ``generated`` block. Dot-notation paths like ``content.expires_at``
+  work the same way as ``from_entity`` does in authorization and
+  finalization.
+
+* **Entity field + offset** — the same dict plus an ``offset`` key
+  containing a relative offset string (``+20d`` / ``-7d``). Resolves
+  to the field value shifted by the offset. Use this for "7 days
+  before the permit expires" (``{from_entity: ..., field: ...,
+  offset: "-7d"}``).
+
+The two dict forms use the same ``from_entity``/``field`` idiom plugin
+authors already know from authorization scopes, finalization status
+mappings, and side-effect conditions.
+
+For schedules that depend on more than one entity or need Python-level
+computation, build the ``scheduled_for`` inside a handler and return
+it as a pre-formatted ISO string. The DSL covers the common cases;
+handlers cover everything else.
 """
 
 from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta, timezone
+from typing import Any, Mapping
 
 
+# ``[+-]`` makes the sign mandatory — a bare ``20d`` would be
+# ambiguous with entity-field paths and we want all relative forms to
+# carry their sign explicitly.
 _OFFSET_PATTERN = re.compile(
-    r"^\+(?P<value>\d+)(?P<unit>[mhdw])$"
+    r"^(?P<sign>[+-])(?P<value>\d+)(?P<unit>[mhdw])$"
 )
 
 _UNIT_KWARGS = {
@@ -38,58 +61,211 @@ _UNIT_KWARGS = {
 }
 
 
-def resolve_scheduled_for(
-    value: str | None, now: datetime,
-) -> str | None:
-    """Resolve a ``scheduled_for`` task-field value.
+def _parse_offset(offset_str: str) -> timedelta:
+    """Parse ``+20d`` / ``-7d`` / ``+45m`` etc. into a timedelta.
 
-    Returns an ISO 8601 datetime string suitable for storage in the
-    task entity's JSON content, or None if ``value`` is None / empty.
-
-    * ``None`` / empty → None (task is immediately due).
-    * Relative offset (``+20d``, ``+45m``) → ``(now + delta).isoformat()``.
-    * ISO 8601 absolute → returned as-is (the worker parses it at
-      dispatch time via ``_parse_scheduled_for``).
-
-    Raises ValueError on a malformed value — a silent fallthrough
-    would produce a task that's immediately due, which is rarely
-    what the author intended.
+    Raises ValueError with a grammar-reminder message on any input
+    that doesn't match the offset pattern. Keeps the error single-
+    sourced: every scheduled_for code path that involves an offset
+    ends up here.
     """
-    if not value:
+    m = _OFFSET_PATTERN.match(offset_str)
+    if not m:
+        raise ValueError(
+            f"Invalid offset {offset_str!r}: expected a signed "
+            f"duration like '+20d', '-7d', '+2h', '+45m', '+3w' "
+            f"(units: m=minutes, h=hours, d=days, w=weeks; sign "
+            f"is required)"
+        )
+    amount = int(m.group("value"))
+    unit_key = _UNIT_KWARGS[m.group("unit")]
+    delta = timedelta(**{unit_key: amount})
+    return delta if m.group("sign") == "+" else -delta
+
+
+def _parse_iso(value: str) -> datetime:
+    """Parse an ISO 8601 datetime or date-only string into an
+    aware UTC datetime.
+
+    Accepts:
+      - ``2026-05-01T12:00:00Z``
+      - ``2026-05-01T12:00:00+00:00``
+      - ``2026-05-01T12:00:00`` (naive → treated as UTC)
+      - ``2026-05-01`` (date-only → midnight UTC)
+
+    Raises ValueError on anything else. Used both for the absolute
+    form and for reading datetime fields off entities.
+    """
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)  # lets ValueError propagate as-is
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _read_datetime_from_entity(
+    resolved_entities: Mapping[str, Any],
+    entity_type: str,
+    field_path: str,
+) -> datetime:
+    """Resolve an entity field to an aware UTC datetime.
+
+    `resolved_entities` is the activity's state.resolved_entities:
+    a dict of entity_type → entity-like object (either a persisted
+    row or a ``_PendingEntity``). Each has a ``.content`` dict we
+    walk with dot notation, matching how authorization / finalization
+    read entity fields.
+
+    Accepts the same field-value shapes as ``_parse_iso``, plus
+    an already-parsed ``datetime`` (in case a handler stuffed one
+    directly into ``content`` before Pydantic serialized it). Every
+    other shape (ints, None, missing field, missing entity) raises
+    ValueError with a context-specific message so the 500 the engine
+    wraps this in points the plugin author at the actual problem.
+    """
+    entity = resolved_entities.get(entity_type)
+    if entity is None:
+        raise ValueError(
+            f"scheduled_for references entity type {entity_type!r} "
+            f"but this activity doesn't use or generate it. Add "
+            f"{entity_type!r} to the activity's 'used' or 'generated' "
+            f"block, or compute the deadline in a handler instead."
+        )
+
+    # Import locally to avoid a module-level circular (authorization
+    # imports from the engine package, engine's pipeline depends on
+    # scheduling).
+    from .pipeline.authorization import _resolve_field
+
+    content = getattr(entity, "content", None)
+    if content is None:
+        raise ValueError(
+            f"scheduled_for entity {entity_type!r} has no content "
+            f"to read field {field_path!r} from"
+        )
+
+    raw = _resolve_field(content, field_path)
+    if raw is None:
+        raise ValueError(
+            f"scheduled_for field {field_path!r} on {entity_type!r} "
+            f"is null or missing; a datetime is required"
+        )
+
+    if isinstance(raw, datetime):
+        dt = raw
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    if isinstance(raw, str):
+        try:
+            return _parse_iso(raw)
+        except ValueError as e:
+            raise ValueError(
+                f"scheduled_for field {field_path!r} on {entity_type!r} "
+                f"is {raw!r}; expected an ISO 8601 datetime or date "
+                f"(e.g. '2026-05-01T12:00:00Z' or '2026-05-01')"
+            ) from e
+
+    raise ValueError(
+        f"scheduled_for field {field_path!r} on {entity_type!r} is "
+        f"{type(raw).__name__}; expected an ISO 8601 string"
+    )
+
+
+def resolve_scheduled_for(
+    value: str | dict | None,
+    now: datetime,
+    resolved_entities: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Resolve a ``scheduled_for`` task-field value to an ISO 8601
+    string (or None for "immediately due").
+
+    Accepts four forms:
+
+    1. ``None`` / empty string → None.
+    2. String with a sign prefix (``+20d`` / ``-7d``) → relative to
+       ``now``.
+    3. String ISO 8601 datetime → passes through (naive normalized
+       to UTC).
+    4. Dict ``{from_entity, field}`` (optionally with ``offset``)
+       → reads the datetime from the entity and optionally shifts.
+
+    `resolved_entities` only needs to be supplied when the caller
+    might pass the dict form. Unit tests for the string forms can
+    omit it. The task-scheduling phase always supplies
+    ``state.resolved_entities``.
+
+    Raises ValueError on any malformed value — a silent fallthrough
+    would produce a task that's immediately due, which is rarely
+    what the author intended. Callers (``_schedule_recorded_task``)
+    wrap this in a 500 ``ActivityError`` so YAML typos fail loudly
+    at activity execution.
+    """
+    if value is None:
         return None
+
+    # Dict form — entity field reference, optionally with offset.
+    if isinstance(value, dict):
+        if resolved_entities is None:
+            # A dict arrived but the caller isn't plumbing entities
+            # through — programming error on the engine side.
+            raise ValueError(
+                f"scheduled_for dict form {value!r} requires "
+                f"resolved_entities, but none were supplied"
+            )
+        try:
+            entity_type = value["from_entity"]
+            field_path = value["field"]
+        except KeyError as e:
+            raise ValueError(
+                f"scheduled_for dict form requires 'from_entity' and "
+                f"'field' keys; got {value!r}"
+            ) from e
+        base = _read_datetime_from_entity(
+            resolved_entities, entity_type, field_path,
+        )
+        offset_str = value.get("offset")
+        if offset_str:
+            base = base + _parse_offset(offset_str)
+        return base.isoformat()
+
+    # From here the value must be a string.
+    if not isinstance(value, str):
+        raise ValueError(
+            f"scheduled_for must be a string or a dict, got "
+            f"{type(value).__name__}: {value!r}"
+        )
 
     s = value.strip()
     if not s:
         return None
 
-    # Relative offset form.
+    # Relative offset form (signed).
     m = _OFFSET_PATTERN.match(s)
     if m:
-        amount = int(m.group("value"))
-        unit_key = _UNIT_KWARGS[m.group("unit")]
-        delta = timedelta(**{unit_key: amount})
-        return (now + delta).isoformat()
+        return (now + _parse_offset(s)).isoformat()
 
-    # Absolute ISO 8601 form. Parse to validate, but return the
-    # original string to preserve whatever timezone suffix the
-    # author wrote (worker normalizes at parse time).
-    iso = s
-    if iso.endswith("Z"):
-        iso_check = iso[:-1] + "+00:00"
-    else:
-        iso_check = iso
+    # Absolute ISO 8601 form. Parse to validate. Preserve the
+    # original string when it was already timezone-aware (so ``Z``
+    # stays ``Z``, ``+02:00`` stays ``+02:00``), normalize when it
+    # was naive so the stored string is always unambiguous.
+    # We detect "aware" by parsing once and checking `tzinfo` on the
+    # result — a cheaper heuristic like "does the string end in Z"
+    # misses offset suffixes.
     try:
-        dt = datetime.fromisoformat(iso_check)
+        s_for_parse = s[:-1] + "+00:00" if s.endswith("Z") else s
+        dt = datetime.fromisoformat(s_for_parse)
     except ValueError as e:
         raise ValueError(
             f"Invalid scheduled_for value {value!r}: expected an ISO "
-            f"8601 datetime (e.g. '2026-05-01T12:00:00Z') or a "
-            f"relative offset (e.g. '+20d', '+2h', '+45m', '+3w')"
+            f"8601 datetime (e.g. '2026-05-01T12:00:00Z'), a signed "
+            f"relative offset (e.g. '+20d', '-7d', '+2h', '+45m', "
+            f"'+3w'), or a dict {{from_entity, field, offset?}}"
         ) from e
 
-    # Naive datetimes are treated as UTC; return a normalized form
-    # so downstream code doesn't have to handle naive again.
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-        return dt.isoformat()
+        return dt.replace(tzinfo=timezone.utc).isoformat()
     return value

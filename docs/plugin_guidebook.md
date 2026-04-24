@@ -449,6 +449,8 @@ async def handle_dienAanvraagIn(context, content):
 
 Handler-built tasks have the same shape as YAML-declared tasks. The difference is who chooses the parameters.
 
+When the deadline is simply a fixed offset from a datetime already on an entity (e.g. *"30 days after the aanvraag was registered"*), you don't need a handler — the `{from_entity, field, offset}` dict form of `scheduled_for` covers that directly in YAML (see *Scheduling formats* below). Reach for a handler only when the logic involves runtime config (as above), computation across more than one entity, or Python-level arithmetic the DSL doesn't express.
+
 #### Cross_dossier_activity tasks
 
 ```yaml
@@ -482,11 +484,21 @@ The worker:
 
 #### Scheduling formats
 
-`scheduled_for` accepts:
+`scheduled_for` accepts four forms:
 
-- **Relative offset** — `+Nd` / `+Nh` / `+Nm` / `+Nw` (days, hours, minutes, weeks). The `+` is required; it's what tells the parser this is an offset rather than a malformed date.
+- **Relative offset** — `+Nd` / `+Nh` / `+Nm` / `+Nw` (days, hours, minutes, weeks). The sign is required and can be `+` or `-`; it's what tells the parser this is an offset rather than a malformed date. Resolved against the activity's start time. Negative offsets resolve to a time in the past, which the worker picks up on its next poll — useful for "fire immediately" semantics or for deadlines that have already elapsed.
 - **Absolute ISO 8601** — `"2026-12-31T23:59:59Z"`, `"2026-05-01T12:00:00+02:00"`.
+- **Entity field reference** — a dict reading a datetime from an entity this activity uses or generates:
+  ```yaml
+  scheduled_for:
+    from_entity: "oe:aanvraag"
+    field: "content.registered_at"   # or "registered_at" — the leading "content." is optional
+  ```
+  The field must contain an ISO 8601 datetime string, a date-only string (`"2026-05-01"` → midnight UTC), or a Python `datetime` (for handler-built tasks that insert one directly). Uses the same `from_entity`/`field` idiom you already know from authorization scopes and finalization status mappings. Raises 500 at scheduling time if the entity isn't in the activity's `used`/`generated` block, or if the field is null/missing/unparseable.
+- **Entity field + offset** — the same dict with an additional signed offset. The killer use case for reminders: *"fire 7 days before the permit expires"* is `{from_entity: ..., field: expires_at, offset: "-7d"}`. The offset uses the same signed-relative grammar (`+20d` / `-7d`).
 - **Omit** — the task runs immediately after the activity completes.
+
+For schedules depending on more than one entity, or needing arithmetic the DSL doesn't cover, compute `scheduled_for` inside a handler and return a pre-formatted ISO string.
 
 #### Supersession — what happens when you schedule the same task twice
 
@@ -1054,7 +1066,7 @@ All three worker-backed kinds share a set of optional fields. `fire_and_forget` 
 
 | Field | Type | Purpose |
 |---|---|---|
-| `scheduled_for` | `str` | When to fire. Relative `"+Nd"/"+Nh"/"+Nm"/"+Nw"` or absolute ISO 8601. Omit for immediate. |
+| `scheduled_for` | `str` or `dict` | When to fire. See *Scheduling-format grammar* below. Omit for immediate. |
 | `cancel_if_activities` | `list[str]` | Activity types that cancel this task if they run in the dossier before the scheduled time. |
 | `allow_multiple` | `bool` | Default `false`. When `false`, scheduling a new task with the same `target_activity` (or `function`) in the same dossier supersedes any existing scheduled task — the prior's content is rewritten with `status: superseded`. When `true`, multiple scheduled tasks with the same shape coexist. `allow_multiple` only governs scheduling; cancellation still fires on every matching task regardless. |
 
@@ -1066,11 +1078,15 @@ All three worker-backed kinds share a set of optional fields. `fire_and_forget` 
 
 | Form | Example | Resolved against |
 |---|---|---|
-| Relative offset | `"+20d"`, `"+2h"`, `"+45m"`, `"+3w"` | Activity start time |
+| Signed relative offset | `"+20d"`, `"-7d"`, `"+2h"`, `"+45m"`, `"+3w"` | Activity start time |
 | Absolute ISO 8601 | `"2026-12-31T23:59:59Z"`, `"2026-05-01T12:00:00+02:00"` | — (literal) |
+| Entity field reference | `{from_entity: "oe:aanvraag", field: "content.registered_at"}` | The field's datetime value |
+| Entity field + offset | `{from_entity: "oe:aanvraag", field: "expires_at", offset: "-7d"}` | The field's datetime value shifted by the offset |
 | Omitted | (no `scheduled_for` key) | Immediate — runs right after the activity |
 
-Units: `m` minutes, `h` hours, `d` days, `w` weeks. The `+` prefix is required — it's what tells the parser "this is an offset, not a date." Unknown units and negative offsets raise at activity execution time.
+Units: `m` minutes, `h` hours, `d` days, `w` weeks. A sign (`+` or `-`) is required on every relative offset — it's what tells the parser "this is an offset, not a date." Negative offsets are legal both at the top level (`"-7d"` = 7 days before activity start) and inside the entity field form (`offset: "-7d"` = 7 days before the field's value). Past-dated tasks are accepted; the worker picks them up on its next poll.
+
+The entity referenced by the dict form must be in the activity's `used` or `generated` block — the resolver reads from `state.resolved_entities` at scheduling time. A missing entity, missing field, null value, or unparseable datetime string raises a 500 at activity execution so YAML authors get a clear error instead of a silently-wrong schedule.
 
 ## Workflow YAML schema
 

@@ -858,19 +858,33 @@ activities:
       # --- Type 3: Scheduled activity (same dossier) ---
       # Worker executes the target activity at the scheduled time.
       #
-      # scheduled_for accepts two forms:
-      #   * Relative offset: "+Nd" / "+Nh" / "+Nm" / "+Nw" (resolved
-      #     against the activity's start time). Good for "N days after
-      #     the triggering activity" cases.
+      # scheduled_for accepts four forms:
+      #   * Signed relative offset: "+Nd" / "-Nd" / "+Nh" / "+Nm" /
+      #     "+Nw" (resolved against the activity's start time). The
+      #     sign is required. Good for "N days after the triggering
+      #     activity" (+30d) or "N days before some reference
+      #     point" (-7d, used inside the dict form below).
       #   * Absolute ISO 8601: "2026-05-01T00:00:00Z". Good for fixed
       #     wall-clock times (calibration dates, regulatory cutoffs).
+      #   * Entity field reference: a dict that reads an ISO datetime
+      #     (or date-only) from an entity this activity uses or
+      #     generates. Same from_entity/field idiom as authorization.
+      #       scheduled_for:
+      #         from_entity: "oe:aanvraag"
+      #         field: "content.registered_at"   # or "registered_at"
+      #   * Entity field + offset: the dict form plus a signed offset.
+      #     The reminder use case: "fire 7 days before permit expiry":
+      #       scheduled_for:
+      #         from_entity: "oe:aanvraag"
+      #         field: "expires_at"
+      #         offset: "-7d"
       #
-      # YAML cannot read entity fields — there is no templating. For
-      # dynamic deadlines that depend on entity content or runtime
-      # config, compute the ISO string in a handler and return it in
-      # HandlerResult.tasks (see "Conditional Task Queueing from
-      # Handlers" below and dossier_toelatingen's handle_beslissing
-      # for a worked example using context.constants).
+      # For schedules depending on more than one entity, or logic the
+      # DSL doesn't cover, compute the ISO string in a handler and
+      # return it in HandlerResult.tasks (see "Conditional Task
+      # Queueing from Handlers" below and dossier_toelatingen's
+      # handle_beslissing for a worked example using
+      # context.constants).
       #
       # cancel_if_activities: activity types that cancel this task if
       # they occur after the task was created.
