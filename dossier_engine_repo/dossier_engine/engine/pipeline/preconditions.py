@@ -43,7 +43,11 @@ async def check_idempotency(state: ActivityState) -> dict | None:
 
     if existing.dossier_id != state.dossier_id:
         raise ActivityError(409, "Activity ID already exists for different dossier")
-    if existing.type != state.activity_def["name"]:
+    # Match by local name to tolerate legacy rows stored with a bare
+    # name (pre-qualification) being re-replayed after the engine
+    # started normalizing names to qualified form.
+    from ...prov.activity_names import local_name
+    if local_name(existing.type) != local_name(state.activity_def["name"]):
         raise ActivityError(409, "Activity ID already exists with different type")
 
     return await build_replay_response(
@@ -164,6 +168,7 @@ async def check_workflow_rules(state: ActivityState) -> None:
 
     valid, error = await validate_workflow_rules(
         state.activity_def, state.repo, state.dossier_id,
+        plugin=state.plugin, now=state.now,
     )
     if not valid:
         raise ActivityError(409, error)

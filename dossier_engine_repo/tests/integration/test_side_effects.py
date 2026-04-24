@@ -33,6 +33,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import text
 
+from dossier_engine.auth import SYSTEM_USER, User
 from dossier_engine.db.models import Repository, AssociationRow
 from dossier_engine.engine.context import HandlerResult
 from dossier_engine.engine.pipeline.side_effects import (
@@ -41,6 +42,15 @@ from dossier_engine.engine.pipeline.side_effects import (
 
 
 D1 = UUID("11111111-1111-1111-1111-111111111111")
+
+# Marker user for the triggering_user kwarg on execute_side_effects /
+# _condition_met. These tests exercise structural side-effect
+# behaviour (conditions, depth, etc.), not attribution, so passing
+# the canonical SYSTEM_USER keeps the tests focused while still
+# satisfying the required kwarg. A dedicated "triggering_user gets
+# threaded correctly" assertion lives in the round's integration
+# test — not here.
+_TRIGGERING_USER = SYSTEM_USER
 
 
 class _SidePlugin:
@@ -53,6 +63,7 @@ class _SidePlugin:
         activity_defs: dict | None = None,
         handlers: dict | None = None,
         singletons: set[str] | None = None,
+        side_effect_conditions: dict | None = None,
     ):
         self._defs = activity_defs or {}
         self.handlers = handlers or {}
@@ -61,6 +72,8 @@ class _SidePlugin:
         self.validators = {}
         self.task_handlers = {}
         self.relation_validators = {}
+        self.side_effect_conditions = side_effect_conditions or {}
+        self.name = "test"
         self.workflow = {"activities": list(self._defs.values()),
                          "relations": []}
 
@@ -135,6 +148,7 @@ class TestExecuteSideEffects:
             plugin=plugin, repo=repo, dossier_id=D1,
             trigger_activity_id=trigger,
             side_effects=[],
+            triggering_user=_TRIGGERING_USER,
         )
 
         # No new activity rows beyond the trigger itself.
@@ -157,6 +171,7 @@ class TestExecuteSideEffects:
             trigger_activity_id=trigger,
             side_effects=[{"activity": "runMe"}],
             depth=10, max_depth=10,
+            triggering_user=_TRIGGERING_USER,
         )
 
         # No new activity rows written — depth gate fired.
@@ -178,6 +193,7 @@ class TestExecuteSideEffects:
             plugin=plugin, repo=repo, dossier_id=D1,
             trigger_activity_id=trigger,
             side_effects=[{"activity": "notInPlugin"}],
+            triggering_user=_TRIGGERING_USER,
         )
 
         # No side-effect activity row created.
@@ -203,6 +219,7 @@ class TestExecuteSideEffects:
             plugin=plugin, repo=repo, dossier_id=D1,
             trigger_activity_id=trigger,
             side_effects=[{"activity": "runMe"}],
+            triggering_user=_TRIGGERING_USER,
         )
 
         result = await repo.session.execute(
@@ -224,7 +241,8 @@ class TestExecuteSideEffects:
         await execute_side_effects(
             plugin=plugin, repo=repo, dossier_id=D1,
             trigger_activity_id=trigger,
-            side_effects=[{}],  # no activity field
+            side_effects=[{}],  # no activity field,
+            triggering_user=_TRIGGERING_USER,
         )
 
         result = await repo.session.execute(
@@ -260,6 +278,7 @@ class TestExecuteSideEffects:
             plugin=plugin, repo=repo, dossier_id=D1,
             trigger_activity_id=trigger,
             side_effects=[{"activity": "runMe"}],
+            triggering_user=_TRIGGERING_USER,
         )
         await repo.session.flush()
 
@@ -300,6 +319,7 @@ class TestExecuteSideEffects:
             plugin=plugin, repo=repo, dossier_id=D1,
             trigger_activity_id=trigger,
             side_effects=[{"activity": "runMe"}],
+            triggering_user=_TRIGGERING_USER,
         )
         await repo.session.flush()
 
@@ -341,6 +361,7 @@ class TestExecuteSideEffects:
             plugin=plugin, repo=repo, dossier_id=D1,
             trigger_activity_id=trigger,
             side_effects=[{"activity": "outer"}],
+            triggering_user=_TRIGGERING_USER,
         )
         await repo.session.flush()
 
@@ -371,6 +392,7 @@ class TestConditionMet:
             plugin=plugin, repo=repo, dossier_id=D1,
             trigger_generated=[], trigger_used=[],
             condition=None,
+            triggering_user=_TRIGGERING_USER,
         )
         assert result is True
 
@@ -388,6 +410,7 @@ class TestConditionMet:
                 "field": "type",
                 "value": "x",
             },
+            triggering_user=_TRIGGERING_USER,
         )
         assert result is False
 
@@ -412,6 +435,7 @@ class TestConditionMet:
                 "field": "type",
                 "value": "natuurlijk_persoon",
             },
+            triggering_user=_TRIGGERING_USER,
         )
         assert result is True
 
@@ -435,6 +459,7 @@ class TestConditionMet:
                 "field": "type",
                 "value": "natuurlijk_persoon",  # expected != stored
             },
+            triggering_user=_TRIGGERING_USER,
         )
         assert result is False
 
@@ -470,5 +495,127 @@ class TestConditionMet:
                 "field": "level",
                 "value": "owner",
             },
+            triggering_user=_TRIGGERING_USER,
         )
         assert result is True
+
+
+class TestConditionFn:
+    """Runtime dispatch tests for ``condition_fn``. The validator
+    tests in ``test_refs_and_plugin.py`` cover shape checks at plugin
+    load; these cover actual invocation of the predicate by
+    ``_condition_met`` against real EntityRow instances.
+    """
+
+    async def test_condition_fn_returns_true_allows_side_effect(self, repo):
+        """Predicate returns True → gate opens, side effect runs."""
+        trigger = await _bootstrap(repo)
+        await _seed_generated(
+            repo, trigger, "oe:beslissing",
+            {"beslissing": "goedgekeurd"},
+        )
+
+        calls = []
+        async def should_publish(ctx):
+            calls.append("called")
+            # Real predicates read the trigger's generated entities via
+            # context.get_used_row — we verify that plumbing works.
+            beslissing_row = ctx.get_used_row("oe:beslissing")
+            assert beslissing_row is not None
+            return True
+
+        plugin = _SidePlugin(side_effect_conditions={
+            "should_publish": should_publish,
+        })
+
+        gen_rows = await repo.get_entities_by_type(D1, "oe:beslissing")
+        result = await _condition_met(
+            plugin=plugin, repo=repo, dossier_id=D1,
+            trigger_generated=gen_rows, trigger_used=[],
+            condition=None,
+            condition_fn_name="should_publish",
+            triggering_user=_TRIGGERING_USER,
+        )
+        assert result is True
+        assert calls == ["called"]
+
+    async def test_condition_fn_returns_false_blocks_side_effect(self, repo):
+        """Predicate returns False → gate closed, side effect does not run."""
+        trigger = await _bootstrap(repo)
+        await _seed_generated(
+            repo, trigger, "oe:beslissing",
+            {"beslissing": "afgekeurd"},
+        )
+
+        async def should_publish(ctx):
+            beslissing_row = ctx.get_used_row("oe:beslissing")
+            if beslissing_row is None:
+                return False
+            return (beslissing_row.content or {}).get("beslissing") == "goedgekeurd"
+
+        plugin = _SidePlugin(side_effect_conditions={
+            "should_publish": should_publish,
+        })
+
+        gen_rows = await repo.get_entities_by_type(D1, "oe:beslissing")
+        result = await _condition_met(
+            plugin=plugin, repo=repo, dossier_id=D1,
+            trigger_generated=gen_rows, trigger_used=[],
+            condition=None,
+            condition_fn_name="should_publish",
+            triggering_user=_TRIGGERING_USER,
+        )
+        assert result is False
+
+    async def test_unregistered_condition_fn_fails_closed(self, repo):
+        """Load-time validation should prevent this, but if it leaks
+        through, the runtime fails closed (returns False) rather than
+        raising mid-pipeline — raising would abort the parent activity
+        for a configuration bug in the side effect."""
+        await _bootstrap(repo)
+        plugin = _SidePlugin()  # empty conditions dict
+
+        result = await _condition_met(
+            plugin=plugin, repo=repo, dossier_id=D1,
+            trigger_generated=[], trigger_used=[],
+            condition=None,
+            condition_fn_name="does_not_exist",
+            triggering_user=_TRIGGERING_USER,
+        )
+        assert result is False
+
+    async def test_condition_fn_wins_over_dict_form(self, repo):
+        """Mutex is enforced at load time, but the runtime also picks
+        condition_fn when both slip through. Guard against the edge
+        case where a future bug lets both reach the gate function."""
+        trigger = await _bootstrap(repo)
+        await _seed_generated(
+            repo, trigger, "oe:beslissing",
+            {"beslissing": "goedgekeurd"},
+        )
+
+        fn_called = []
+        async def always_false(ctx):
+            fn_called.append(True)
+            return False
+
+        plugin = _SidePlugin(side_effect_conditions={
+            "always_false": always_false,
+        })
+
+        gen_rows = await repo.get_entities_by_type(D1, "oe:beslissing")
+        result = await _condition_met(
+            plugin=plugin, repo=repo, dossier_id=D1,
+            trigger_generated=gen_rows, trigger_used=[],
+            # Dict form would return True (field matches), but the
+            # function form takes precedence and returns False.
+            condition={
+                "entity_type": "oe:beslissing",
+                "field": "beslissing",
+                "value": "goedgekeurd",
+            },
+            condition_fn_name="always_false",
+            triggering_user=_TRIGGERING_USER,
+        )
+        assert result is False
+        assert fn_called == [True]

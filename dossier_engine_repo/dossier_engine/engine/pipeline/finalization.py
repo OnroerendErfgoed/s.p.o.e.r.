@@ -30,8 +30,8 @@ import logging
 
 from ..state import ActivityState
 from .authorization import _resolve_field
-from .eligibility import compute_eligible_activities, filter_by_user_auth
-from .status import derive_status
+from ._helpers.eligibility import compute_eligible_activities, filter_by_user_auth
+from ._helpers.status import derive_status
 
 _log = logging.getLogger("dossier.engine")
 
@@ -49,7 +49,7 @@ async def run_pre_commit_hooks(state: ActivityState) -> None:
 
     Reads:  state.plugin.pre_commit_hooks, state.repo, state.dossier_id,
             state.plugin, state.activity_def, state.generated,
-            state.used_rows, state.user
+            state.used_rows_by_ref, state.user
     Writes: nothing directly (hooks may call state.repo themselves)
     Raises: whatever the hook raises (typically ActivityError)
     """
@@ -159,7 +159,15 @@ async def finalize_dossier(state: ActivityState) -> None:
                 entities={e.type: e for e in current_entities},
             )
         except Exception as e:
-            _log.warning(f"post_activity_hook failed: {e}")
+            # post_activity_hook is best-effort (ES reindex, etc.) —
+            # its failure doesn't invalidate the activity. Keep the
+            # swallow, but log with the traceback so Sentry's FastAPI
+            # integration picks up the full exception context, not
+            # just the str(e) summary.
+            _log.warning(
+                f"post_activity_hook failed: {e}",
+                exc_info=True,
+            )
 
     # 19. Cache status + eligible activities on the dossier row.
     eligible = await compute_eligible_activities(
@@ -202,15 +210,15 @@ def build_full_response(state: ActivityState) -> dict:
         },
         "used": [
             {
-                "entity": r["entity"],
-                "type": r.get("type", "external"),
-                **({"autoResolved": True} if r.get("auto_resolved") else {}),
+                "entity": r.entity,
+                "type": r.type or "external",
+                **({"autoResolved": True} if r.auto_resolved else {}),
             }
             for r in state.used_refs
         ],
         "generated": state.generated_response,
         "relations": [
-            {"entity": rel["ref"], "type": rel["relation_type"]}
+            {"entity": rel.ref, "type": rel.relation_type}
             for rel in state.validated_relations
         ],
         "dossier": {

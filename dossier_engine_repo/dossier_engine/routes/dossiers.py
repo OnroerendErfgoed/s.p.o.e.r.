@@ -28,11 +28,13 @@ The detail endpoint does a fair bit of work:
    don't match.
 3. **Visibility filtering**: the calling user's `dossier_access`
    entry resolves to a set of visible entity-type prefixes and an
-   activity-view mode (`all`, `own`, `related`). Entities outside
-   the visible prefixes are dropped from `currentEntities`. Activities
-   are filtered per the view mode: `own` shows only activities where
-   the user is the agent, `related` shows activities that touched
-   visible entities (plus the user's own).
+   activity-view mode (`all`, `own`, list of types, or a combined
+   dict). Entities outside the visible prefixes are dropped from
+   `currentEntities`. Activities are filtered per the view mode:
+   `own` shows only activities where the user is the agent; a list
+   shows only listed types; the dict form combines `own` with an
+   unconditional include-list. The ``"related"`` mode was removed
+   in Round 31.
 """
 
 from __future__ import annotations
@@ -41,22 +43,26 @@ import json as _json
 from typing import Optional
 from uuid import UUID
 
+import logging
+
 from fastapi import Depends, FastAPI, HTTPException
-from sqlalchemy import select
 
 from dossier_common.signing import sign_token, token_to_query_string
 
 from ..auth import User
 from ..db import Repository, get_session_factory
-from ..db.models import AssociationRow, DossierRow
+from ..db.models import DossierRow
 from ..engine import (
     compute_eligible_activities,
     derive_status,
     filter_by_user_auth,
 )
+from ..db.graph_loader import load_dossier_graph_rows
 from ..file_refs import inject_download_urls
-from ._models import DossierDetailResponse
+from ._helpers.models import DossierDetailResponse
 from .access import check_dossier_access, get_visibility_from_entry
+
+_log = logging.getLogger("dossier.routes.dossiers")
 
 
 def register(app: FastAPI, *, registry, get_user, global_access) -> None:
@@ -103,6 +109,18 @@ def register(app: FastAPI, *, registry, get_user, global_access) -> None:
                 try:
                     eligible = _json.loads(dossier.eligible_activities)
                 except (ValueError, TypeError):
+                    # The cache is populated by the engine's finalize
+                    # phase (``json.dumps`` of a known-clean dict), so
+                    # a parse failure here is cache corruption — either
+                    # a truncated write or a schema migration that
+                    # changed the shape underneath an existing row.
+                    # Safe fallback: recompute. Log at WARNING so the
+                    # anomaly surfaces in Sentry.
+                    _log.warning(
+                        "Corrupt eligible_activities cache on dossier "
+                        "%s; recomputing.",
+                        dossier_id, exc_info=True,
+                    )
                     eligible = await compute_eligible_activities(
                         plugin, repo, dossier_id,
                     )
@@ -162,18 +180,48 @@ def register(app: FastAPI, *, registry, get_user, global_access) -> None:
                     visible_entity_version_ids.add(e.id)
 
             # Activity log filtered per the calling user's view mode.
-            activities = await repo.get_activities_for_dossier(dossier_id)
+            # Bug 9 (Round 29): pre-load activities + associations + used
+            # rows into per-activity dicts via ``load_dossier_graph_rows``
+            # instead of calling per-activity async helpers in the
+            # visibility loop. The previous shape issued two DB
+            # round-trips per activity (``_user_is_agent`` +
+            # ``get_used_entity_ids_for_activity``) which turned a
+            # dossier with N activities into O(N) queries whenever the
+            # user's ``activity_view`` was ``"own"`` or ``"related"``
+            # (``"related"`` was removed in Round 31; the preload
+            # pattern still matters for ``"own"`` and for the list/dict
+            # modes that can trigger include-list evaluation).
+            # The ``prov.py`` endpoints already used this pattern since
+            # Round 5's D1/D2 consolidation; dossier-detail was the
+            # straggler. The dict-lookup closures match the signatures
+            # ``is_activity_visible`` expects, so the visibility logic
+            # itself is unchanged.
+            from ._helpers.activity_visibility import parse_activity_view, is_activity_visible
+            parsed_view = parse_activity_view(activity_view_mode)
+            graph_rows = await load_dossier_graph_rows(session, dossier_id)
+            activities = graph_rows.activities
+            assoc_by_activity = graph_rows.assoc_by_activity
+            used_by_activity = graph_rows.used_by_activity
+
+            async def _is_agent(act_id, uid):
+                assocs = assoc_by_activity.get(act_id, [])
+                return any(a.agent_id == uid for a in assocs)
+
+            async def _used_ids(act_id):
+                return {u.entity_id for u in used_by_activity.get(act_id, [])}
+
             activity_list = []
             for a in activities:
-                include = await _activity_visible(
-                    session=session,
-                    repo=repo,
-                    activity=a,
-                    user=user,
-                    activity_view_mode=activity_view_mode,
-                    visible_entity_version_ids=visible_entity_version_ids,
+                visible = await is_activity_visible(
+                    parsed_view,
+                    activity_type=a.type,
+                    activity_id=a.id,
+                    user_id=user.id,
+                    visible_entity_ids=visible_entity_version_ids,
+                    lookup_is_agent=_is_agent,
+                    lookup_used_entity_ids=_used_ids,
                 )
-                if include:
+                if visible:
                     activity_list.append({
                         "id": str(a.id),
                         "type": a.type,
@@ -190,18 +238,28 @@ def register(app: FastAPI, *, registry, get_user, global_access) -> None:
             # field names and can produce accidental rule matches
             # against built-in rules that key on the static `status`
             # slot.
-            from ..audit import emit_audit
-            emit_audit(
+            from ..observability.audit import emit_dossier_audit
+            emit_dossier_audit(
                 action="dossier.read",
-                actor_id=user.id,
-                actor_name=user.name,
-                target_type="Dossier",
-                target_id=str(dossier_id),
+                user=user,
+                dossier_id=dossier_id,
                 outcome="allowed",
-                dossier_id=str(dossier_id),
                 workflow=dossier.workflow,
                 dossier_status=status,
             )
+
+            # Load active domain relations for the response.
+            domain_rels = await repo.get_active_domain_relations(dossier_id)
+            domain_relations_out = [
+                {
+                    "type": r.relation_type,
+                    "from": r.from_ref,
+                    "to": r.to_ref,
+                    "createdBy": str(r.created_by_activity_id),
+                    "createdAt": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in domain_rels
+            ]
 
             return DossierDetailResponse(
                 id=str(dossier_id),
@@ -210,115 +268,44 @@ def register(app: FastAPI, *, registry, get_user, global_access) -> None:
                 allowedActivities=allowed,
                 currentEntities=current_entities,
                 activities=activity_list,
+                domainRelations=domain_relations_out,
             )
 
     @app.get(
         "/dossiers",
         tags=["dossiers"],
-        summary="List dossiers (stub)",
+        summary="Search dossiers (cross-workflow)",
         description=(
-            "Basic dossier listing. For production, use the workflow-"
-            "specific search endpoints (e.g. /dossiers/toelatingen/search) "
-            "which query Elasticsearch."
+            "Search the common dossier index. Supports fuzzy match on "
+            "onderwerp and exact filter on workflow. Results are "
+            "filtered to dossiers the current user may see (ACL = "
+            "user.roles ∪ user.id, includes global_access roles). "
+            "The common index is the only source — when Elasticsearch "
+            "is not configured or the index is missing, this endpoint "
+            "returns zero results. Set DOSSIER_ES_URL and run "
+            "/admin/search/common/recreate + reindex to populate it."
         ),
     )
     async def list_dossiers(
+        q: Optional[str] = None,
         workflow: Optional[str] = None,
+        limit: int = 100,
         user: User = Depends(get_user),
     ):
-        session_factory = get_session_factory()
-        async with session_factory() as session, session.begin():
-            query = select(DossierRow)
-            if workflow:
-                query = query.where(DossierRow.workflow == workflow)
-            query = query.order_by(DossierRow.created_at.desc()).limit(100)
+        from ..search.common_index import search_common
 
-            result = await session.execute(query)
-            dossiers = list(result.scalars().all())
-
-            items = [
+        result = await search_common(
+            user=user, workflow=workflow, onderwerp=q, limit=limit,
+        )
+        return {
+            "dossiers": [
                 {
-                    "id": str(d.id),
-                    "workflow": d.workflow,
-                    "createdAt": d.created_at.isoformat() if d.created_at else None,
+                    "id": hit.get("dossier_id"),
+                    "workflow": hit.get("workflow"),
+                    "onderwerp": hit.get("onderwerp"),
                 }
-                for d in dossiers
-            ]
-            return {"dossiers": items}
-
-
-async def _activity_visible(
-    *,
-    session,
-    repo: Repository,
-    activity,
-    user: User,
-    activity_view_mode: str | list[str] | dict,
-    visible_entity_version_ids: set,
-) -> bool:
-    """Decide whether the calling user can see this activity in the
-    dossier's activity log.
-
-    Modes:
-
-    * ``"all"`` — show every activity.
-    * ``"own"`` — show only activities where the user is the agent.
-    * ``"related"`` — show activities that touched visible entities,
-      plus the user's own activities.
-    * ``list[str]`` — show only activities whose type is in the list.
-    * ``dict`` — combined mode. Requires ``mode`` (one of the string
-      sentinels above) and optional ``include`` (a list of activity
-      type names that are always visible regardless of the base mode).
-
-      Example::
-
-          activity_view:
-            mode: "own"
-            include: ["neemBeslissing", "neemOntvankelijkheidsbeslissing"]
-
-      This means "show my own activities, PLUS always show any
-      neemBeslissing or neemOntvankelijkheidsbeslissing regardless
-      of who performed it."
-    """
-    # Unwrap dict form: extract the include-list (if any) and the
-    # base mode, then check includes first (short-circuits the more
-    # expensive agent/related queries for the named types).
-    include: set[str] = set()
-    base_mode = activity_view_mode
-    if isinstance(activity_view_mode, dict):
-        base_mode = activity_view_mode.get("mode", "own")
-        include = set(activity_view_mode.get("include", []))
-
-    # Include-list always wins: if the activity type is listed,
-    # show it unconditionally.
-    if include and activity.type in include:
-        return True
-
-    # Fall through to the base mode logic.
-    if base_mode == "all":
-        return True
-
-    if base_mode == "own":
-        return await _user_is_agent(session, activity.id, user.id)
-
-    if base_mode == "related":
-        used_ids = await repo.get_used_entity_ids_for_activity(activity.id)
-        if used_ids & visible_entity_version_ids:
-            return True
-        return await _user_is_agent(session, activity.id, user.id)
-
-    # List of activity type names — match on the activity's type.
-    if isinstance(base_mode, list):
-        return activity.type in base_mode
-
-    return False
-
-
-async def _user_is_agent(session, activity_id: UUID, user_id: str) -> bool:
-    """Return True if `user_id` has an association row for `activity_id`."""
-    result = await session.execute(
-        select(AssociationRow)
-        .where(AssociationRow.activity_id == activity_id)
-        .where(AssociationRow.agent_id == user_id)
-    )
-    return result.scalar_one_or_none() is not None
+                for hit in result.get("hits", [])
+            ],
+            "total": result.get("total", 0),
+            **({"reason": result["reason"]} if "reason" in result else {}),
+        }

@@ -63,13 +63,24 @@ async def file_client(tmp_path):
         fs_module.get_config = original_get_config
 
 
-def _sign(file_id: str, action: str = "upload", user_id: str = "u1"):
-    """Produce a signed token dict for the given file_id + action."""
+def _sign(
+    file_id: str,
+    action: str = "upload",
+    user_id: str = "u1",
+    dossier_id: str = "",
+):
+    """Produce a signed token dict for the given file_id + action.
+
+    ``dossier_id`` defaults to empty (back-compat with tests written
+    before the dossier-binding check). Tests that exercise the
+    binding-check itself pass an explicit value.
+    """
     return sign_token(
         file_id=file_id,
         action=action,
         signing_key=SIGNING_KEY,
         user_id=user_id,
+        dossier_id=dossier_id,
     )
 
 
@@ -79,9 +90,18 @@ def _qs(token: dict) -> dict:
     return dict(pair.split("=", 1) for pair in qs.split("&"))
 
 
-async def _upload(client, file_id: str, content: bytes = b"test data"):
-    """Upload a file with a valid signature. Returns the response."""
-    token = _sign(file_id, "upload")
+async def _upload(
+    client, file_id: str,
+    content: bytes = b"test data",
+    dossier_id: str = "",
+):
+    """Upload a file with a valid signature. Returns the response.
+
+    ``dossier_id`` defaults to empty; tests that need the binding
+    stamped into the .meta file pass an explicit value (which also
+    gets signed into the upload token).
+    """
+    token = _sign(file_id, "upload", dossier_id=dossier_id)
     params = _qs(token)
     return await client.put(
         f"/upload/{file_id}",
@@ -177,14 +197,38 @@ class TestUpload:
 
 class TestDownload:
 
-    async def test_valid_download_after_upload(self, file_client):
-        """Upload a file, then download it with a valid download
-        token. The response should return the file bytes."""
+    async def test_valid_download_after_upload_and_move(self, file_client):
+        """Upload a file, move it to a dossier's permanent location,
+        then download it with a valid download token for that
+        dossier. The response should return the file bytes.
+
+        Updated from the pre-Bug-44-fix behavior: downloads from
+        temp are no longer served. The realistic flow is
+        upload → /internal/move → download, which mirrors what the
+        engine + worker do in production."""
         fid = str(uuid4())
+        did = str(uuid4())
         await _upload(file_client, fid, b"download me")
 
-        token = _sign(fid, "download")
-        params = _qs(token)
+        # Move to permanent before attempting download.
+        move_r = await file_client.post(
+            "/internal/move",
+            params={"file_id": fid, "dossier_id": did},
+        )
+        assert move_r.status_code == 200
+
+        # Sign a download token for this specific dossier_id so the
+        # signature validates against the same triple we'll query.
+        from dossier_common.signing import sign_token, token_to_query_string
+        token = sign_token(
+            file_id=fid, action="download",
+            signing_key=SIGNING_KEY, user_id="u1",
+            dossier_id=did,
+        )
+        params = dict(
+            pair.split("=", 1)
+            for pair in token_to_query_string(token).split("&")
+        )
         r = await file_client.get(f"/download/{fid}", params=params)
         assert r.status_code == 200
         assert r.content == b"download me"
@@ -271,3 +315,305 @@ class TestInternalMove:
             params={"file_id": str(uuid4()), "dossier_id": str(uuid4())},
         )
         assert r.status_code == 404
+
+
+# --------------------------------------------------------------------
+# Bug 44 fix — download no longer falls back to temp
+# Bug 47 mitigation — /internal/move enforces uploader consistency
+# --------------------------------------------------------------------
+#
+# These tests pin down two security-relevant behaviors that were
+# added together:
+#
+# 1. The download endpoint no longer serves files from temp. Once a
+#    legitimate file_id leaks out of its tenant's boundary (via a
+#    log line, a buggy sibling endpoint, a Sentry event), the old
+#    code's temp-fallback allowed any user with a valid download
+#    token for any dossier to retrieve that file by naming its
+#    file_id in the URL. Removing the fallback forces the retrieval
+#    path through the permanent location — which is dossier-scoped
+#    on disk, closing the cross-tenant exfiltration path.
+#
+# 2. The /internal/move endpoint now accepts an optional
+#    expected_uploader_user_id and rejects with 403 when the file's
+#    temp metadata reports a different uploader. Combined with the
+#    worker wiring the triggering activity's attributed agent into
+#    that parameter, this closes the attach-someone-else's-upload
+#    variant: Bob can't reference Alice's in-flight file_id in his
+#    own dienAanvraagIn and have the worker cheerfully copy Alice's
+#    bytes into Bob's dossier.
+
+
+class TestDownloadNoLongerFallsBackToTemp:
+
+    async def test_download_before_move_returns_404(self, file_client):
+        """Upload a file. Do NOT call /internal/move. Request
+        download with a valid token. The old code would fall back
+        to temp and return the bytes; the new code must 404.
+
+        This is the primary defensive behavior: a file in temp is
+        an upload-in-flight, not yet attached to any dossier, and
+        must not be downloadable by its (dossier_id, file_id) token
+        pair until the move has placed it in the permanent
+        location."""
+        fid = str(uuid4())
+        did = str(uuid4())
+        await _upload(file_client, fid, b"should not be downloadable from temp")
+
+        # Sign a download token for the target dossier — the
+        # attacker here has a legitimate token pair for SOME
+        # dossier, and is testing whether the file_service will
+        # serve a temp-located file_id against that dossier's
+        # scope. Pre-Bug-44-fix: yes. Post-fix: 404.
+        from dossier_common.signing import sign_token, token_to_query_string
+        token = sign_token(
+            file_id=fid, action="download",
+            signing_key=SIGNING_KEY, user_id="u1",
+            dossier_id=did,
+        )
+        params = dict(
+            pair.split("=", 1)
+            for pair in token_to_query_string(token).split("&")
+        )
+
+        r = await file_client.get(f"/download/{fid}", params=params)
+        assert r.status_code == 404, (
+            f"expected 404 (no temp fallback), got {r.status_code}: "
+            f"{r.text}"
+        )
+
+    async def test_download_succeeds_after_move(self, file_client):
+        """Happy path: upload, move, then download → 200. Confirms
+        the fix doesn't break the normal flow."""
+        fid = str(uuid4())
+        did = str(uuid4())
+        await _upload(file_client, fid, b"downloadable after move")
+
+        move_r = await file_client.post(
+            "/internal/move",
+            params={"file_id": fid, "dossier_id": did},
+        )
+        assert move_r.status_code == 200
+
+        token = _sign(fid, "download", user_id="u1")
+        params = _qs(token)
+        # Re-sign with the correct dossier_id (the one we just
+        # moved into) so the signature matches.
+        from dossier_common.signing import sign_token
+        correct_token = sign_token(
+            file_id=fid, action="download",
+            signing_key=SIGNING_KEY, user_id="u1",
+            dossier_id=did,
+        )
+        from dossier_common.signing import token_to_query_string
+        correct_params = dict(
+            pair.split("=", 1)
+            for pair in token_to_query_string(correct_token).split("&")
+        )
+
+        r = await file_client.get(f"/download/{fid}", params=correct_params)
+        assert r.status_code == 200
+        assert r.content == b"downloadable after move"
+
+
+class TestMoveEnforcesDossierBinding:
+    """The /internal/move endpoint enforces the dossier-binding
+    invariant: a file uploaded for dossier X can only be moved
+    into dossier X. The binding is established at upload time
+    (the engine's /files/upload/request requires dossier_id, signs
+    it into the token, and the upload handler writes it as
+    intended_dossier_id in the temp .meta). If the move target
+    doesn't match, the file_service returns 403 before bytes cross
+    dossier boundaries.
+
+    This closes Bug 47 (cross-tenant graft via file_id reuse) at
+    the layer where the truth lives — no inline SQL in task code,
+    no separate uploader-identity tracking, no cross-service
+    compare of user identities. The binding is intrinsic to the
+    file."""
+
+    async def test_move_rejects_when_dossier_mismatches(self, file_client):
+        """Alice uploads with dossier_id=D1 in the signed token.
+        The file_service writes intended_dossier_id=D1 into the
+        .meta. A move request targeting dossier_id=D2 triggers the
+        mismatch check → 403. This is the core attack path Bug 47
+        enabled; the fix prevents any bytes from crossing the
+        dossier boundary."""
+        fid = str(uuid4())
+        d1 = str(uuid4())
+        d2 = str(uuid4())
+
+        # Alice uploads bound to D1.
+        r_up = await _upload(file_client, fid, b"alice's bytes", dossier_id=d1)
+        assert r_up.status_code == 200
+
+        # Something (Bob's activity, via the worker) attempts to
+        # move into D2. The dossier binding says no.
+        r = await file_client.post(
+            "/internal/move",
+            params={"file_id": fid, "dossier_id": d2},
+        )
+        assert r.status_code == 403
+        body = r.json()
+        assert "dossier mismatch" in body["detail"].lower()
+        assert d1 in body["detail"]
+        assert d2 in body["detail"]
+
+    async def test_move_succeeds_when_dossier_matches(self, file_client):
+        """Alice uploads bound to D1 and moves into D1 → 200.
+        Same-dossier is the legitimate path and must keep working."""
+        fid = str(uuid4())
+        d1 = str(uuid4())
+
+        r_up = await _upload(file_client, fid, b"alice's bytes", dossier_id=d1)
+        assert r_up.status_code == 200
+
+        r = await file_client.post(
+            "/internal/move",
+            params={"file_id": fid, "dossier_id": d1},
+        )
+        assert r.status_code == 200
+        assert r.json()["moved"] is True
+
+    async def test_move_allows_when_intended_dossier_not_set(
+        self, file_client,
+    ):
+        """Back-compat path: if the temp .meta lacks
+        intended_dossier_id (empty string, legacy upload predating
+        the binding), the check is skipped. This door closes
+        naturally as old temp files drain — new uploads through
+        the engine always carry the binding because
+        /files/upload/request requires dossier_id and signs it in."""
+        fid = str(uuid4())
+        did = str(uuid4())
+        # Upload without a dossier_id in the token → intended is empty.
+        r_up = await _upload(file_client, fid, b"legacy upload")
+        assert r_up.status_code == 200
+
+        # Move succeeds regardless of dossier choice.
+        r = await file_client.post(
+            "/internal/move",
+            params={"file_id": fid, "dossier_id": did},
+        )
+        assert r.status_code == 200
+
+    async def test_move_allows_when_meta_missing(self, file_client, tmp_path):
+        """A file in temp with no .meta file (legacy data, manual
+        placement, edge case) skips the binding check rather than
+        erroring. Opportunistic: if we can't determine the
+        intended dossier, fall back to permissive rather than
+        blocking a legitimate operation."""
+        fid = str(uuid4())
+        did = str(uuid4())
+        temp_dir = tmp_path / "storage" / "temp"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        (temp_dir / fid).write_bytes(b"legacy orphan")
+
+        r = await file_client.post(
+            "/internal/move",
+            params={"file_id": fid, "dossier_id": did},
+        )
+        assert r.status_code == 200
+
+    async def test_meta_records_intended_dossier_id(self, file_client, tmp_path):
+        """Verify the upload-time write of intended_dossier_id
+        into .meta — this is the invariant that makes the move
+        check possible. Direct disk inspection, since the field
+        is internal and not exposed on any read endpoint."""
+        fid = str(uuid4())
+        did = str(uuid4())
+        await _upload(file_client, fid, b"x", dossier_id=did)
+
+        meta_path = tmp_path / "storage" / "temp" / f"{fid}.meta"
+        assert meta_path.exists()
+        meta = json.loads(meta_path.read_text())
+        assert meta.get("intended_dossier_id") == did
+    async def test_move_rejects_when_meta_is_corrupt(
+        self, file_client, tmp_path,
+    ):
+        """Bug 76: if the ``.meta`` file exists but is corrupted
+        (truncated JSON, non-UTF-8 bytes, whatever), we refuse the
+        move rather than silently falling back to "no binding info."
+
+        The pre-fix behaviour was ``except (OSError, JSONDecodeError):
+        meta = {}`` followed by ``if intended and intended != dossier_id``
+        — an empty ``intended`` made the mismatch branch fall through
+        and the move succeeded. An attacker who could corrupt the
+        ``.meta`` (local filesystem access, race, disk issue) would
+        bypass the whole Bug 47 check.
+
+        The back-compat door "``.meta`` missing entirely" stays open
+        (covered by ``test_move_allows_when_meta_missing``). Only the
+        "present-but-unreadable" case rejects."""
+        fid = str(uuid4())
+        d1 = str(uuid4())
+        d2 = str(uuid4())
+
+        # Upload normally so the file + .meta land in temp.
+        r_up = await _upload(
+            file_client, fid, b"uploaded with binding", dossier_id=d1,
+        )
+        assert r_up.status_code == 200
+
+        # Now corrupt the .meta on disk. The file_service's move
+        # endpoint reads it back with json.load — truncating mid-JSON
+        # raises JSONDecodeError, which is what we want to exercise.
+        meta_path = tmp_path / "storage" / "temp" / f"{fid}.meta"
+        assert meta_path.exists(), "setup: .meta must exist from upload"
+        meta_path.write_text('{"intended_dossier_id": "')  # truncated JSON
+
+        # Even targeting the correct dossier id, the move must reject —
+        # the point isn't mismatch detection, it's that we can't
+        # *trust* the meta to do mismatch detection in the first place.
+        r = await file_client.post(
+            "/internal/move",
+            params={"file_id": fid, "dossier_id": d1},
+        )
+        assert r.status_code == 500, (
+            f"Expected 500, got {r.status_code}: {r.text}"
+        )
+        # The error message should hint at the cause so operators
+        # don't have to dig through logs to understand why the move
+        # failed.
+        assert "metadata" in r.text.lower() or "unreadable" in r.text.lower()
+
+        # Symmetric check: same rejection when targeting a *different*
+        # dossier. The response is the same whether or not the target
+        # matches — we never read the intended_dossier_id, so we can't
+        # distinguish the cases, and "corrupt .meta refuses all moves"
+        # is the right strict behaviour anyway.
+        r2 = await file_client.post(
+            "/internal/move",
+            params={"file_id": fid, "dossier_id": d2},
+        )
+        assert r2.status_code == 500
+
+    async def test_move_rejects_when_meta_is_non_json_garbage(
+        self, file_client, tmp_path,
+    ):
+        """Same Bug 76 fix, different corruption shape. Truncated
+        JSON raises ``JSONDecodeError``; binary garbage can raise
+        either ``JSONDecodeError`` or ``UnicodeDecodeError`` depending
+        on bytes. Both are caught by the (OSError, JSONDecodeError)
+        clause — UnicodeDecodeError is a subclass of ValueError not
+        JSONDecodeError, so we verify the catch handles that path
+        too."""
+        fid = str(uuid4())
+        did = str(uuid4())
+        r_up = await _upload(file_client, fid, b"x", dossier_id=did)
+        assert r_up.status_code == 200
+
+        meta_path = tmp_path / "storage" / "temp" / f"{fid}.meta"
+        # Binary garbage — not valid UTF-8, not valid JSON.
+        meta_path.write_bytes(b"\x00\x01\xff\xfe\xfd")
+
+        r = await file_client.post(
+            "/internal/move",
+            params={"file_id": fid, "dossier_id": did},
+        )
+        # Accept either 500 (our explicit reject) or 400 if the FastAPI
+        # stack turns the UnicodeDecodeError into a request error
+        # first. What matters is that it's NOT 200.
+        assert r.status_code != 200, (
+            f"Corrupt .meta bypass: got 200 with body {r.text!r}"
+        )

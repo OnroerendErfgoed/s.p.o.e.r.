@@ -7,7 +7,12 @@ The engine uses a single canonical string format for entity references:
 
 For example: `oe:aanvraag/e1000000-0000-0000-0000-000000000001@f1000000-0000-0000-0000-000000000001`.
 
-The `prefix:type` part is the entity type (e.g. `oe:aanvraag`, `system:task`).
+The `prefix:type` part is the entity type (e.g. `oe:aanvraag`, `system:task`,
+`foaf:Person`, `dcterms:BibliographicResource`). Both prefix and local name
+allow letters, digits, underscores, and hyphens. The first character of each
+must be a letter — this matches standard RDF/XML QName conventions and SPARQL
+prefixed names.
+
 The `entity_id` is the logical identity — every revision of the same
 conceptual entity shares it. The `version_id` is the row identity —
 each revision gets its own.
@@ -31,8 +36,24 @@ from dataclasses import dataclass
 from uuid import UUID
 
 
+# Ref pattern: prefix:LocalName/uuid@uuid
+#
+# Prefix and LocalName both accept:
+#   - start with a letter (a-z or A-Z)
+#   - followed by letters, digits, underscores, hyphens
+#
+# This accepts standard RDF vocabularies:
+#   oe:aanvraag, system:task                    — existing
+#   foaf:Person, dcterms:BibliographicResource  — external ontologies
+#   schema:CreativeWork, prov:Activity          — W3C standards
+#   eli:LegalResource                           — European legislation
+#
+# It rejects structurally invalid forms:
+#   1invalid:thing (leading digit), :bare (missing prefix),
+#   aaa/bbb (missing colon), oe:aanvraag:extra (multiple colons)
 ENTITY_REF_PATTERN = re.compile(
-    r'^(?P<prefix>[a-z_]+:[a-z_]+)/(?P<id>[0-9a-f-]+)@(?P<version>[0-9a-f-]+)$'
+    r'^(?P<prefix>[A-Za-z][A-Za-z0-9_-]*:[A-Za-z][A-Za-z0-9_-]*)'
+    r'/(?P<id>[0-9a-f-]+)@(?P<version>[0-9a-f-]+)$'
 )
 
 
@@ -69,29 +90,83 @@ class EntityRef:
     def parse(cls, ref: str | None) -> "EntityRef | None":
         """Parse a canonical entity reference.
 
+        Accepts two input forms:
+
+        * **Shorthand**: ``prefix:type/entity_id@version_id``
+        * **Full platform IRI**: ``{DOSSIER_BASE}{did}/entities/prefix:type/{eid}/{vid}``
+
         Returns an ``EntityRef`` on success, ``None`` for anything that
         doesn't match — callers should treat ``None`` as "this is an
         external URI or not a ref at all". Use ``is_external_uri`` for
         the boolean form if you only need the classification.
 
-        Accepts ``None`` as an input and returns ``None`` — a small
-        convenience for call sites that already handle "ref might be
-        missing" and don't want to special-case the None check before
-        calling parse.
+        Accepts ``None`` as an input and returns ``None``.
         """
         if ref is None:
             return None
+        # Shorthand form.
         match = ENTITY_REF_PATTERN.match(ref)
-        if not match:
-            return None
-        return cls(
-            type=match.group("prefix"),
-            entity_id=UUID(match.group("id")),
-            version_id=UUID(match.group("version")),
-        )
+        if match:
+            return cls(
+                type=match.group("prefix"),
+                entity_id=UUID(match.group("id")),
+                version_id=UUID(match.group("version")),
+            )
+        # Full IRI form — check if it's a platform entity IRI and
+        # reverse-parse the path segments.
+        full = _parse_full_entity_iri(ref)
+        if full:
+            return full
+        return None
 
 
 # --- Top-level helpers ------------------------------------------------------
+
+
+def _parse_full_entity_iri(ref: str) -> "EntityRef | None":
+    """Reverse-parse a full platform entity IRI into an EntityRef.
+
+    Handles the canonical expanded form::
+
+        {DOSSIER_BASE}{dossier_id}/entities/{prefix:type}/{eid}/{vid}
+
+    Example::
+
+        https://id.erfgoed.net/dossiers/d1000000-.../entities/oe:aanvraag/e1.../v1...
+
+    Returns None if the ref isn't a platform entity IRI (wrong base,
+    missing ``/entities/``, or malformed path segments).
+
+    This gives clients a second accepted input form — shorthand is
+    more convenient, but full IRIs are sometimes easier (e.g. when
+    copy-pasting from a PROV export).
+    """
+    # Late import to avoid circular dependency: prov_iris imports
+    # this module for reverse expansion.
+    from ..prov.iris import DOSSIER_BASE
+
+    # DOSSIER_BASE looks like "https://.../dossiers/{dossier_id}/".
+    # Strip the placeholder to get the bare prefix every platform
+    # IRI shares.
+    platform_prefix = DOSSIER_BASE.split("{dossier_id}")[0]
+    if not ref.startswith(platform_prefix):
+        return None
+
+    remainder = ref[len(platform_prefix):]
+    # Expected shape: {did}/entities/{type}/{eid}/{vid}
+    parts = remainder.split("/")
+    if len(parts) != 5 or parts[1] != "entities":
+        return None
+
+    _did, _entities, type_name, eid_str, vid_str = parts
+    try:
+        return EntityRef(
+            type=type_name,
+            entity_id=UUID(eid_str),
+            version_id=UUID(vid_str),
+        )
+    except (ValueError, AttributeError):
+        return None
 
 
 def is_external_uri(ref: str) -> bool:

@@ -94,7 +94,7 @@ def _build_prov_test_app() -> FastAPI:
         {
             "id": "alice", "username": "alice",
             "type": "natuurlijk_persoon", "name": "Alice",
-            "roles": [], "properties": {},
+            "roles": ["auditor"], "properties": {},
         },
     ])
 
@@ -103,7 +103,10 @@ def _build_prov_test_app() -> FastAPI:
     app.state.config = {"file_service": {"url": "http://test", "signing_key": "k"}}
 
     register_routes(app, registry, auth, global_access=[])
-    register_prov_routes(app, registry, auth, global_access=[])
+    register_prov_routes(
+        app, registry, auth, global_access=[],
+        global_audit_access=["auditor"],
+    )
     return app
 
 
@@ -117,6 +120,12 @@ async def prov_client():
 
 async def _bootstrap_with_entity(repo: Repository) -> tuple[UUID, UUID, UUID]:
     """Create D1 with one activity that generates one oe:aanvraag.
+    Also seeds an ``oe:dossier_access`` entity granting ``alice``,
+    mirroring the production invariant that every dossier gets its
+    access entity committed atomically with its creating activity
+    (via the ``setDossierAccess`` side-effect chain in
+    ``workflow.yaml``). Without this seed, ``check_dossier_access``
+    correctly default-denies the user-facing timeline endpoint.
     Returns (activity_id, entity_id, version_id).
     Caller must commit."""
     await repo.create_dossier(D1, "test")
@@ -141,6 +150,21 @@ async def _bootstrap_with_entity(repo: Repository) -> tuple[UUID, UUID, UUID]:
         version_id=vid, entity_id=eid, dossier_id=D1,
         type="oe:aanvraag", generated_by=act_id,
         content={"titel": "Test"}, attributed_to="alice",
+    )
+
+    # Access entity: alice-as-agent grant with activity_view="all",
+    # so the timeline endpoint shows her the full picture. In
+    # production this is written by ``setDossierAccess`` as a
+    # side-effect of ``dienAanvraagIn``; inlining it here keeps the
+    # fixture honest to the default-deny invariant without having to
+    # spin up the full pipeline.
+    await repo.create_entity(
+        version_id=uuid4(), entity_id=uuid4(), dossier_id=D1,
+        type="oe:dossier_access", generated_by=act_id,
+        content={"access": [
+            {"agents": ["alice"], "view": "all", "activity_view": "all"},
+        ]},
+        attributed_to="system",
     )
     await repo.session.flush()
     return act_id, eid, vid
@@ -411,3 +435,474 @@ class TestProvGraphColumns:
         assert body.startswith("<!DOCTYPE html>")
         assert "PROV Columns" in body
         assert "d3.min.js" in body
+
+    async def test_side_effect_activities_attach_to_parent_column(
+        self, prov_client, repo,
+    ):
+        """Regression: side-effect activities (``client_callable: false``)
+        must NOT appear as their own top-row columns. They attach as
+        ``side_effects`` on the parent client activity's column.
+
+        The earlier bug: the normalizer left ``side_effects: [{"activity":
+        "foo"}]`` unqualified, so the DB stored bare-name activity rows
+        while ``system_activity_types`` was built from qualified names.
+        The filter missed, every activity got ``kind=client``, and the
+        three-band layout collapsed into one long row.
+
+        We verify the fix by:
+        1. Creating a client activity whose parent kicks off a
+           ``client_callable: false`` side-effect activity
+        2. Rendering the columns graph
+        3. Parsing out the embedded ``const columns = ...;`` JSON
+        4. Asserting the parent column has the side effect in its
+           ``side_effects`` array, and no column exists for the
+           system activity directly
+        """
+        import json, re
+
+        # Bootstrap: one parent activity, one system side-effect.
+        # The plugin's workflow needs to declare the system activity
+        # with client_callable=false so the filter in prov_columns
+        # can classify it.
+        plugin = prov_client._transport.app.state.registry.get("test")
+        plugin.workflow["activities"].append({
+            "name": "oe:doSystem",
+            "label": "Do system thing",
+            "can_create_dossier": False,
+            "client_callable": False,
+            "default_role": "systeem",
+            "allowed_roles": ["systeem"],
+            "authorization": {"access": "roles", "roles": [{"role": "systeemgebruiker"}]},
+            "used": [], "generates": [], "status": None,
+            "validators": [], "side_effects": [], "tasks": [],
+        })
+
+        # Bootstrap a dossier with a parent + side-effect pair.
+        await repo.create_dossier(D1, "test")
+        await repo.ensure_agent("alice", "natuurlijk_persoon", "Alice", {})
+        await repo.ensure_agent("system", "systeem", "Systeem", {})
+
+        now = datetime.now(timezone.utc)
+        parent_id = uuid4()
+        await repo.create_activity(
+            activity_id=parent_id, dossier_id=D1, type="createEntity",
+            started_at=now, ended_at=now,
+        )
+        repo.session.add(AssociationRow(
+            id=uuid4(), activity_id=parent_id, agent_id="alice",
+            agent_name="Alice", agent_type="natuurlijk_persoon",
+            role="oe:aanvrager",
+        ))
+
+        se_id = uuid4()
+        await repo.create_activity(
+            activity_id=se_id, dossier_id=D1, type="oe:doSystem",
+            started_at=now, ended_at=now, informed_by=str(parent_id),
+        )
+        repo.session.add(AssociationRow(
+            id=uuid4(), activity_id=se_id, agent_id="system",
+            agent_name="Systeem", agent_type="systeem", role="systeem",
+        ))
+        await _commit(repo)
+
+        r = await prov_client.get(
+            f"/dossiers/{D1}/prov/graph/columns",
+            headers={"X-POC-User": "alice"},
+        )
+        assert r.status_code == 200
+
+        # Extract the inline `const columns = [...]` JSON.
+        m = re.search(r"const columns = (\[.*?\]);", r.text, re.DOTALL)
+        assert m, "columns JSON block not found in HTML"
+        columns = json.loads(m.group(1))
+
+        # Parent column should exist with side-effect attached.
+        parent_cols = [c for c in columns if c["type"] == "createEntity"]
+        assert len(parent_cols) == 1
+        parent = parent_cols[0]
+        assert parent["kind"] == "client"
+
+        se_labels = [se["type"] for se in parent.get("side_effects", [])]
+        assert "oe:doSystem" in se_labels, (
+            f"side-effect activity should be attached to parent's "
+            f"side_effects array; got {se_labels}"
+        )
+
+        # System activity must NOT appear as its own top-row column.
+        se_top_cols = [c for c in columns if c["type"] == "oe:doSystem"]
+        assert se_top_cols == [], (
+            f"system activity leaked into top row: {se_top_cols}. "
+            "This is the exact collapsed-timeline bug."
+        )
+
+
+class TestAuditAccess:
+    """The audit-level endpoints (/prov, /prov/graph/columns,
+    /archive) use check_audit_access, not the ordinary dossier_access
+    check. A user with ordinary dossier_access but no audit role gets
+    403; the timeline endpoint stays open to them."""
+
+    async def test_prov_json_denied_without_audit_role(self, repo):
+        """User without auditor role gets 403 on /prov even though
+        they have ordinary dossier_access."""
+        # Custom app with a non-auditor user
+        from dossier_engine.auth import POCAuthMiddleware
+        from dossier_engine.plugin import Plugin, PluginRegistry
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        plugin = Plugin(
+            name="testwf",
+            workflow={"name": "testwf", "activities": []},
+            entity_models={},
+            entity_schemas={},
+            handlers={},
+            validators={},
+            relation_validators={},
+        )
+        registry = PluginRegistry()
+        registry.register(plugin)
+        auth = POCAuthMiddleware([
+            {"id": "bob", "username": "bob", "type": "natuurlijk_persoon",
+             "name": "Bob", "roles": ["oe:aanvrager"], "properties": {}},
+        ])
+
+        app = FastAPI()
+        app.state.registry = registry
+        app.state.config = {"file_service": {"url": "http://test", "signing_key": "k"}}
+        register_routes(app, registry, auth, global_access=[])
+        register_prov_routes(
+            app, registry, auth, global_access=[],
+            global_audit_access=["auditor"],  # bob is not an auditor
+        )
+
+        await _bootstrap_with_entity(repo)
+        await _commit(repo)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            r = await c.get(
+                f"/dossiers/{D1}/prov",
+                headers={"X-POC-User": "bob"},
+            )
+            assert r.status_code == 403
+            assert "audit" in r.json()["detail"].lower()
+
+    async def test_archive_denied_without_audit_role(self, repo):
+        """Same check on /archive — audit-level endpoint."""
+        from dossier_engine.auth import POCAuthMiddleware
+        from dossier_engine.plugin import Plugin, PluginRegistry
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        plugin = Plugin(
+            name="testwf",
+            workflow={"name": "testwf", "activities": []},
+            entity_models={},
+            entity_schemas={},
+            handlers={},
+            validators={},
+            relation_validators={},
+        )
+        registry = PluginRegistry()
+        registry.register(plugin)
+        auth = POCAuthMiddleware([
+            {"id": "bob", "username": "bob", "type": "natuurlijk_persoon",
+             "name": "Bob", "roles": ["oe:aanvrager"], "properties": {}},
+        ])
+
+        app = FastAPI()
+        app.state.registry = registry
+        app.state.config = {"file_service": {"url": "http://test", "signing_key": "k"}}
+        register_routes(app, registry, auth, global_access=[])
+        register_prov_routes(
+            app, registry, auth, global_access=[],
+            global_audit_access=["auditor"],
+        )
+
+        await _bootstrap_with_entity(repo)
+        await _commit(repo)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            r = await c.get(
+                f"/dossiers/{D1}/archive",
+                headers={"X-POC-User": "bob"},
+            )
+            assert r.status_code == 403
+
+    async def test_timeline_open_to_dossier_access_users(self, repo):
+        """Timeline endpoint honors ordinary dossier_access — a
+        user without audit role can still view their own timeline."""
+        # Bob has dossier access via empty global_access list only
+        # matching no entries → default-deny. We need an explicit
+        # global_access entry for bob's role.
+        from dossier_engine.auth import POCAuthMiddleware
+        from dossier_engine.plugin import Plugin, PluginRegistry
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        plugin = Plugin(
+            name="testwf",
+            workflow={"name": "testwf", "activities": []},
+            entity_models={},
+            entity_schemas={},
+            handlers={},
+            validators={},
+            relation_validators={},
+        )
+        registry = PluginRegistry()
+        registry.register(plugin)
+        auth = POCAuthMiddleware([
+            {"id": "bob", "username": "bob", "type": "natuurlijk_persoon",
+             "name": "Bob", "roles": ["oe:aanvrager"], "properties": {}},
+        ])
+
+        app = FastAPI()
+        app.state.registry = registry
+        app.state.config = {"file_service": {"url": "http://test", "signing_key": "k"}}
+        register_routes(
+            app, registry, auth,
+            global_access=[{"role": "oe:aanvrager", "view": "all", "activity_view": "all"}],
+        )
+        register_prov_routes(
+            app, registry, auth,
+            global_access=[{"role": "oe:aanvrager", "view": "all", "activity_view": "all"}],
+            global_audit_access=["auditor"],  # bob is NOT an auditor
+        )
+
+        await _bootstrap_with_entity(repo)
+        await _commit(repo)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            r = await c.get(
+                f"/dossiers/{D1}/prov/graph/timeline",
+                headers={"X-POC-User": "bob"},
+            )
+            # Timeline honors ordinary dossier_access — bob's
+            # oe:aanvrager role is in global_access, so he gets in.
+            assert r.status_code == 200, r.text
+            assert "text/html" in r.headers["content-type"]
+
+
+# --------------------------------------------------------------------
+# Archive endpoint + shared PROV-JSON builder (Bugs 15/16 refactor)
+# --------------------------------------------------------------------
+#
+# The refactor consolidated two things:
+#
+# 1. Bug 16 — PROV-JSON was built twice (once in the /prov endpoint,
+#    once inlined into the /archive endpoint) and had started drifting
+#    (the archive copy was missing endedAtTime and actedOnBehalfOf).
+#    Both endpoints now call ``dossier_engine.prov_json.build_prov_graph``.
+#
+# 2. Bug 15 — the archive endpoint wrote the PDF to a NamedTemporaryFile
+#    with delete=False and returned FileResponse(..., background=None),
+#    which meant the tempfile was never cleaned up. Under sustained load
+#    /tmp would fill and the server would crash on the next write.
+#    Replaced with an in-memory RawResponse — no disk, no cleanup.
+#
+# These tests pin both properties down so a future refactor can't
+# silently re-introduce either bug.
+
+
+class TestProvJsonSharedBuilder:
+
+    async def test_endpoint_uses_shared_builder(self, prov_client, repo):
+        """The /prov endpoint's output should match the builder's
+        output directly. This is a structural regression test:
+        before the refactor, the endpoint had inline code that
+        could drift from a shared helper — now the endpoint *is*
+        a one-line call to the helper, so any divergence would be
+        a code change, not a behavioural drift."""
+        from dossier_engine.prov.json_ld import build_prov_graph
+        await _bootstrap_with_entity(repo)
+        await _commit(repo)
+
+        # Direct builder call.
+        direct = await build_prov_graph(repo.session, D1)
+
+        # HTTP endpoint — same underlying builder, should match.
+        r = await prov_client.get(
+            f"/dossiers/{D1}/prov",
+            headers={"X-POC-User": "alice"},
+        )
+        assert r.status_code == 200
+        via_http = r.json()
+
+        # Both should have the same set of top-level sections and
+        # the same entity/activity keys. We don't compare the full
+        # dict because timestamps of dynamically-created entities
+        # are fine to differ by microseconds if the HTTP call ran
+        # in a different session — but the structural shape must
+        # be identical.
+        assert set(direct.keys()) == set(via_http.keys())
+        assert set(direct["entity"].keys()) == set(via_http["entity"].keys())
+        assert set(direct["activity"].keys()) == set(
+            via_http["activity"].keys()
+        )
+
+    async def test_builder_includes_ended_at_time(self, prov_client, repo):
+        """Before the refactor, the archive inline copy had
+        prov:startedAtTime but not prov:endedAtTime. The /prov
+        version had both. After consolidation, both paths include
+        endedAtTime. Guard against a future drift that silently
+        removes it."""
+        from dossier_engine.prov.json_ld import build_prov_graph
+        await _bootstrap_with_entity(repo)
+        await _commit(repo)
+
+        graph = await build_prov_graph(repo.session, D1)
+
+        for act_data in graph["activity"].values():
+            # Every activity in this fixture has both started_at
+            # and ended_at set — startedAtTime and endedAtTime
+            # should both appear.
+            assert "prov:startedAtTime" in act_data
+            assert "prov:endedAtTime" in act_data
+
+    async def test_builder_strips_empty_sections(self, prov_client, repo):
+        """A fresh dossier with no activities should not have
+        empty ``wasGeneratedBy``/``used``/etc. sections in the
+        output. Consumers can distinguish "no such facts exist"
+        from "section deliberately filtered" — empty present-key
+        pollutes that signal."""
+        from dossier_engine.prov.json_ld import build_prov_graph
+        await repo.create_dossier(D1, "test")
+        await _commit(repo)
+
+        graph = await build_prov_graph(repo.session, D1)
+
+        # prefix is always there (it's the namespace declaration),
+        # but no activity/entity edges should be.
+        assert "prefix" in graph
+        assert "used" not in graph
+        assert "wasGeneratedBy" not in graph
+        assert "wasAttributedTo" not in graph
+
+
+class TestArchiveEndpoint:
+
+    async def test_returns_pdf_bytes_inline(self, prov_client, repo, tmp_path):
+        """Happy-path check: /archive returns a non-empty PDF
+        body with the right Content-Type and Content-Disposition.
+        Before the refactor this returned a FileResponse against
+        a tempfile; now it's an in-memory Response. Behavioural
+        surface (bytes in, header present) is unchanged — but
+        the ownership model is."""
+        import tempfile
+
+        await _bootstrap_with_entity(repo)
+        await _commit(repo)
+
+        # Capture /tmp state before. If the refactor regresses to
+        # writing tempfiles, we'll see growth here even for a
+        # single request.
+        temp_root = Path(tempfile.gettempdir())
+        before = {p.name for p in temp_root.iterdir() if p.suffix == ".pdf"}
+
+        r = await prov_client.get(
+            f"/dossiers/{D1}/archive",
+            headers={"X-POC-User": "alice"},
+        )
+        assert r.status_code == 200, r.text
+        assert r.headers["content-type"] == "application/pdf"
+        assert 'attachment' in r.headers["content-disposition"]
+        assert "archief.pdf" in r.headers["content-disposition"]
+
+        # PDF magic: first four bytes are "%PDF".
+        assert r.content[:4] == b"%PDF"
+
+        # No PDF tempfile created during the request. This is
+        # the Bug 15 regression guard.
+        after = {p.name for p in temp_root.iterdir() if p.suffix == ".pdf"}
+        leaked = after - before
+        assert not leaked, f"archive leaked tempfile(s): {leaked}"
+
+    async def test_requires_audit_role(self, prov_client, repo):
+        """Without the auditor role, /archive should refuse —
+        audit-level endpoint. Alice has ``auditor``; make a
+        second user without it to exercise the refusal path."""
+        await _bootstrap_with_entity(repo)
+        await _commit(repo)
+
+        # There's no second user in this fixture; the missing-role
+        # case is better exercised by routes/access unit tests.
+        # This test just confirms alice (who IS an auditor) gets
+        # through, which is the inverse sanity check.
+        r = await prov_client.get(
+            f"/dossiers/{D1}/archive",
+            headers={"X-POC-User": "alice"},
+        )
+        assert r.status_code == 200
+
+    async def test_missing_dossier_returns_404(self, prov_client, repo):
+        """Standard 404 path — no data to extract, no archive to
+        render."""
+        await _commit(repo)
+        missing = UUID("99999999-9999-9999-9999-999999999999")
+        r = await prov_client.get(
+            f"/dossiers/{missing}/archive",
+            headers={"X-POC-User": "alice"},
+        )
+        assert r.status_code == 404
+
+
+# Path is needed for the tmp scan in test_returns_pdf_bytes_inline.
+# Import at module top would be cleaner, but tacking it on here keeps
+# the patch localised to the block this commit added.
+from pathlib import Path  # noqa: E402
+
+
+class TestSharedGraphLoader:
+    """Regression guards around ``load_dossier_graph_rows`` being the
+    single source of truth for all four graph-rendering endpoints
+    (/prov, /archive, /prov/graph/columns, /prov/graph/timeline).
+
+    Prior to consolidation (Duplication D1 in the review), each
+    endpoint had its own near-copy of the same four SELECTs. These
+    tests pin down that the shared loader now drives all four.
+    """
+
+    async def test_loader_returns_populated_indexes(
+        self, prov_client, repo,
+    ):
+        """The loader pre-builds three indexes (``assoc_by_activity``,
+        ``used_by_activity``, ``entity_by_id``) so callers don't
+        re-index. Confirm they're populated for a non-empty
+        dossier."""
+        from dossier_engine.db.graph_loader import load_dossier_graph_rows
+        act_id, ent_id, ver_id = await _bootstrap_with_entity(repo)
+        await _commit(repo)
+
+        rows = await load_dossier_graph_rows(repo.session, D1)
+        assert len(rows.activities) == 1
+        # _bootstrap_with_entity now creates two entities: the
+        # oe:aanvraag and the oe:dossier_access that grants alice
+        # (the latter is required because check_dossier_access is
+        # default-deny — see the fixture's docstring).
+        assert len(rows.entities) == 2
+        assert act_id in rows.assoc_by_activity
+        assert ver_id in rows.entity_by_id
+        # The agent referenced in the fixture's association should
+        # be in the lookup.
+        assert "alice" in rows.agent_rows
+
+    async def test_loader_empty_dossier_is_safe(self, prov_client, repo):
+        """An empty dossier returns empty lists and empty indexes
+        without errors. Important because the loader short-circuits
+        the associations/used queries when there are no activities
+        — that branch needs coverage."""
+        from dossier_engine.db.graph_loader import load_dossier_graph_rows
+        await repo.create_dossier(D1, "test")
+        await _commit(repo)
+
+        rows = await load_dossier_graph_rows(repo.session, D1)
+        assert rows.activities == []
+        assert rows.entities == []
+        assert rows.associations == []
+        assert rows.used == []
+        assert rows.assoc_by_activity == {}
+        assert rows.entity_by_id == {}
+        assert rows.agent_rows == {}

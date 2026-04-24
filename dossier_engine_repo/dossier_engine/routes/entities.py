@@ -21,6 +21,17 @@ endpoint. The bulk endpoints render their results through
 `entity_version_dict` from `_serializers.py`; the single-version
 endpoint produces a flatter dict inline because it doesn't have a
 sibling list to drive the `redirectTo` / tombstone-reference machinery.
+
+The single-version endpoint pipes its entity content through
+`inject_download_urls` (Bug 57 fix) so file_id fields in the payload
+are accompanied by short-lived signed download URLs — matching the
+`dossiers.py` route's behaviour. The two bulk endpoints deliberately
+do NOT inject URLs: they're "inspection / revision history" shaped,
+clients follow up with a single-version fetch to actually download,
+and minting one signed URL per file per version across every version
+of every entity is waste in the common case. If a future client
+actually needs URLs in the bulk responses, the fix is the same
+per-entity inject call in the per-version loop.
 """
 
 from __future__ import annotations
@@ -30,9 +41,12 @@ from uuid import UUID
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 
+from dossier_common.signing import sign_token, token_to_query_string
+
 from ..auth import User
 from ..db import Repository, get_session_factory
-from ._serializers import entity_version_dict
+from ..file_refs import inject_download_urls
+from ._helpers.serializers import entity_version_dict
 from .access import check_dossier_access, get_visibility_from_entry
 
 
@@ -139,10 +153,22 @@ def register(app: FastAPI, *, get_user, global_access) -> None:
             )
 
             entity = await repo.get_entity(version_id)
+            # 404 on any URL segment mismatch. Before the Bug 62 fix
+            # the ``entity_id`` segment was not checked — the endpoint
+            # happily returned the version as long as the version
+            # existed in the right dossier with the right type, so a
+            # client with a stale or wrong ``entity_id`` in the URL
+            # would get a response whose actual ``entity_id`` field
+            # differed from what they asked for (silent mis-attribution).
+            # Fail fast on the mismatch instead; the URL
+            # ``(dossier, type, entity_id, version_id)`` tuple must
+            # address a single canonical row, not a set of rows where
+            # ``entity_id`` is decorative.
             if (
                 not entity
                 or entity.dossier_id != dossier_id
                 or entity.type != entity_type
+                or entity.entity_id != entity_id
             ):
                 raise HTTPException(404, detail="Entity version not found")
 
@@ -169,12 +195,60 @@ def register(app: FastAPI, *, get_user, global_access) -> None:
                     detail="Entity version was tombstoned and has no replacement",
                 )
 
+            # Bug 57 fix: inject download URLs for file_id fields in
+            # the content. Resolve the plugin that owns this entity
+            # type via registry stored on app.state (wired at app
+            # startup — see app.py's ``app.state.registry = registry``),
+            # then mint a per-request signer closure scoped to this
+            # dossier and user (same pattern as ``routes/dossiers.py``;
+            # tokens are dossier-scoped per Round 11 Bug 47 so a token
+            # leaked from dossier A can't pull a file from dossier B).
+            #
+            # If no plugin owns this type (shouldn't happen for stored
+            # entities — they went through validation — but defensive
+            # fallback for the case of a temporarily unloaded plugin)
+            # or if the resolved model class is None, inject_download_urls
+            # returns the content unchanged.
+            registry = app.state.registry
+            plugin = None
+            for p in registry.all_plugins():
+                if entity_type in p.entity_models:
+                    plugin = p
+                    break
+            model_class = (
+                plugin.resolve_schema(entity_type, entity.schema_version)
+                if plugin is not None else None
+            )
+
+            file_config = app.state.config.get("file_service", {})
+            signing_key = file_config.get(
+                "signing_key", "poc-signing-key-change-in-production",
+            )
+            file_service_url = file_config.get("url", "http://localhost:8001")
+
+            def sign(file_id: str) -> str:
+                token = sign_token(
+                    file_id=file_id,
+                    action="download",
+                    signing_key=signing_key,
+                    user_id=user.id,
+                    dossier_id=str(dossier_id),
+                )
+                return (
+                    f"{file_service_url}/download/{file_id}"
+                    f"?{token_to_query_string(token)}"
+                )
+
+            content_with_urls = inject_download_urls(
+                model_class, entity.content, sign,
+            )
+
             return {
                 "dossier_id": str(dossier_id),
                 "entity_type": entity_type,
                 "entity_id": str(entity.entity_id),
                 "versionId": str(entity.id),
-                "content": entity.content,
+                "content": content_with_urls,
                 "generatedBy": str(entity.generated_by),
                 "derivedFrom": (
                     str(entity.derived_from) if entity.derived_from else None

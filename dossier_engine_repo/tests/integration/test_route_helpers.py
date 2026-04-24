@@ -42,8 +42,8 @@ from dossier_engine.auth import User
 from dossier_engine.db.models import Repository, AssociationRow
 from dossier_engine.engine.errors import ActivityError
 from dossier_engine.file_refs import FileId, inject_download_urls
-from dossier_engine.routes._errors import activity_error_to_http
-from dossier_engine.routes._serializers import entity_version_dict
+from dossier_engine.routes._helpers.errors import activity_error_to_http
+from dossier_engine.routes._helpers.serializers import entity_version_dict
 from dossier_engine.routes.access import (
     check_dossier_access, get_visibility_from_entry,
 )
@@ -332,13 +332,22 @@ async def _seed_access_entity(
 
 class TestCheckDossierAccess:
 
-    async def test_no_access_entity_returns_none(self, repo):
+    async def test_no_access_entity_raises_403(self, repo):
         """If there's no oe:dossier_access entity in the dossier,
-        no access restrictions apply — every authenticated user
-        gets through with entry=None."""
+        default-deny applies — an authenticated user with no global
+        role match gets 403. The alternate entry point is
+        ``global_access`` (see ``test_global_access_role_match``);
+        on this platform every dossier is expected to get its
+        ``oe:dossier_access`` entity provisioned atomically by the
+        ``setDossierAccess`` side effect of its creating activity,
+        so reaching this branch means something is wrong (migration
+        half-applied, dossier created outside the pipeline, etc.).
+        Default-deny is the safe floor.
+        """
         await _bootstrap(repo)
-        result = await check_dossier_access(repo, D1, _user())
-        assert result is None
+        with pytest.raises(HTTPException) as exc:
+            await check_dossier_access(repo, D1, _user())
+        assert exc.value.status_code == 403
 
     async def test_global_access_role_match(self, repo):
         """global_access matches first — before any dossier-
@@ -412,10 +421,13 @@ class TestCheckDossierAccess:
             await check_dossier_access(repo, D1, _user("stranger"))
         assert exc.value.status_code == 403
 
-    async def test_empty_access_entity_content_returns_none(self, repo):
-        """An oe:dossier_access row exists but its content is
-        null or empty. Treated as 'no restrictions' — same as
-        having no access entity at all."""
+    async def test_empty_access_entity_content_raises_403(self, repo):
+        """An oe:dossier_access row exists but its content is null
+        or empty. Treated as 'no access configured' — same default-
+        deny floor as missing-entity. An empty-content row cannot
+        authorize anyone (there are no entries to match against),
+        so the operational meaning is identical to having no row at
+        all."""
         boot = await _bootstrap(repo)
         await repo.create_entity(
             version_id=uuid4(), entity_id=uuid4(), dossier_id=D1,
@@ -424,8 +436,77 @@ class TestCheckDossierAccess:
         )
         await repo.session.flush()
 
-        result = await check_dossier_access(repo, D1, _user())
-        assert result is None
+        with pytest.raises(HTTPException) as exc:
+            await check_dossier_access(repo, D1, _user())
+        assert exc.value.status_code == 403
+
+    async def test_denial_reasons_distinguish_no_entity_vs_no_match(
+        self, repo, monkeypatch,
+    ):
+        """The two default-deny paths (no access entity configured
+        vs. entity exists but user matched nothing) emit different
+        ``reason`` strings on ``dossier.denied`` audit events. SIEM
+        triage depends on the distinction: the first indicates a
+        provisioning anomaly (migration, manual edit), the second
+        is the expected flow for an unauthorized user trying to hit
+        someone else's dossier. Pin the contract so a future
+        refactor that collapses both paths to a generic 'denied' is
+        caught here."""
+        boot = await _bootstrap(repo)
+        captured: list[dict] = []
+
+        def capture(**kwargs):
+            captured.append(kwargs)
+
+        monkeypatch.setattr(
+            "dossier_engine.routes.access.emit_dossier_audit",
+            capture,
+        )
+
+        # Path 1: no access entity at all — D1 is freshly bootstrapped
+        # without one.
+        with pytest.raises(HTTPException):
+            await check_dossier_access(repo, D1, _user("alice"))
+
+        # Path 2: seed an access entity on the same dossier with an
+        # entry that doesn't match the user, then retry. The singleton
+        # lookup returns the newly-seeded row.
+        await _seed_access_entity(repo, boot, [
+            {"role": "oe:admin", "activity_view": "all"},
+        ])
+        with pytest.raises(HTTPException):
+            await check_dossier_access(repo, D1, _user("stranger"))
+
+        assert len(captured) == 2
+        assert captured[0]["action"] == "dossier.denied"
+        assert captured[0]["outcome"] == "denied"
+        assert captured[0]["reason"] == (
+            "Dossier has no access entity configured"
+        )
+        assert captured[1]["action"] == "dossier.denied"
+        assert captured[1]["outcome"] == "denied"
+        assert captured[1]["reason"] == (
+            "User has no matching role or agent entry for this dossier"
+        )
+
+    async def test_global_access_bypasses_missing_entity_deny(self, repo):
+        """A user whose role matches ``global_access`` must pass
+        even on a dossier that has no ``oe:dossier_access`` entity.
+        This pins the bypass ordering: the global_access loop runs
+        *before* the access-entity lookup, so operators listed in
+        config.yaml remain functional against un-provisioned
+        dossiers (which is exactly the situation an admin might
+        need to investigate)."""
+        await _bootstrap(repo)
+        global_access = [
+            {"role": "beheerder", "view": "all", "activity_view": "all"},
+        ]
+        result = await check_dossier_access(
+            repo, D1, _user("admin", "beheerder"),
+            global_access=global_access,
+        )
+        assert result is not None
+        assert result["role"] == "beheerder"
 
 
 class TestGetVisibilityFromEntry:
@@ -437,15 +518,58 @@ class TestGetVisibilityFromEntry:
         assert visible is None
         assert mode == "all"
 
-    def test_entry_with_no_view_key_no_restrictions(self):
-        """Matched entry but it doesn't carry a `view` key →
-        None for visible types (sees all) but honors the entry's
-        activity_view if set."""
-        visible, mode = get_visibility_from_entry(
-            {"role": "oe:admin", "activity_view": "own"},
+    def test_entry_with_no_view_key_defaults_deny(self, caplog):
+        """Bug 79 (Round 27.5): matched entry but no `view:` key →
+        default-deny. The module docstring always said this should
+        be empty set ("Key absent — empty set (see nothing)"); the
+        previous code shipped `None` (fail-open) instead. Flipped
+        to match the docstring.
+
+        The entry's `activity_view` is still honoured — the entry
+        matched the user, so activity-timeline access is granted
+        per the matched entry. Only entity-content visibility is
+        affected by the missing view key.
+
+        Paranoia check: with this test in place, revert the
+        ``view is None`` branch in ``get_visibility_from_entry``
+        to return ``None``; this test should go red. Did before
+        shipping."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="dossier.engine.access"):
+            visible, mode = get_visibility_from_entry(
+                {"role": "oe:admin", "activity_view": "own"},
+            )
+        assert visible == set()  # default-deny, not None
+        assert mode == "own"  # activity_view still honoured
+        # Warning logged so operators can find the broken access config.
+        assert any(
+            "lacks a `view:` key" in rec.getMessage()
+            for rec in caplog.records
         )
-        assert visible is None
-        assert mode == "own"
+
+    def test_entry_with_unrecognised_view_value_defaults_deny(self, caplog):
+        """Bug 79 (Round 27.5): an unrecognised `view:` value
+        (e.g. a typo like ``"al"``) was previously treated as
+        "no restriction" with the rationale ``so a typo doesn't
+        lock people out``. That's backwards for security-
+        adjacent code — a typo should lock you out so the
+        author notices. Fail-open silently granted more access
+        than intended. Flipped to default-deny.
+
+        Paranoia check: with this test in place, revert the
+        ``else`` branch to return ``None``; this test should go
+        red."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="dossier.engine.access"):
+            visible, mode = get_visibility_from_entry(
+                {"role": "oe:admin", "view": "al", "activity_view": "all"},
+            )
+        assert visible == set()  # default-deny, not None
+        assert mode == "all"
+        assert any(
+            "invalid `view:` value" in rec.getMessage()
+            for rec in caplog.records
+        )
 
     def test_entry_with_empty_view_sees_nothing(self):
         """Entry has `view: []` — an explicit 'see nothing'
@@ -471,7 +595,14 @@ class TestGetVisibilityFromEntry:
         )
         assert mode == "own"
 
-    def test_entry_with_activity_view_related(self):
+    def test_entry_passes_through_legacy_related_value_verbatim(self):
+        """``get_visibility_from_entry`` is a pass-through; it doesn't
+        validate the ``activity_view`` value. Legacy ``"related"``
+        entries (mode removed in Round 31) land unchanged at this
+        layer and are deny-safed downstream in ``parse_activity_view``.
+        Pinning the pass-through shape so a future "cleanup" that
+        tries to filter ``"related"`` out here — instead of at the
+        proper evaluation layer — gets caught."""
         visible, mode = get_visibility_from_entry(
             {"view": ["oe:aanvraag"], "activity_view": "related"},
         )

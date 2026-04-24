@@ -4,17 +4,11 @@ Integration tests for `cancel_matching_tasks` in
 
 This is the phase that runs after every activity and cancels any
 scheduled `system:task` whose `cancel_if_activities` list includes
-the activity we just ran. The subtlety is **anchor scope**: an
-anchored task is only cancelled when this activity actually
-advanced the anchored entity (wrote a new version of it). Global
-tasks (no anchor) are cancelled whenever the canceling activity
-type fires, no additional scoping.
-
-This exact invariant is why the worker's `check_cancelled` was
-deleted earlier in the session — it existed as a shadow of the
-pipeline's logic AND had a bug (ignored anchors entirely). The
-pipeline's version handles anchors correctly, but nothing currently
-tests that. These tests lock it in.
+the activity we just ran. Cancellation fires whenever the
+canceling activity runs in the same dossier — no additional
+scoping. `allow_multiple` does not affect cancellation; a task
+being allowed to coexist with others of its type doesn't change
+whether the event it's waiting on has fired.
 
 Branches:
 
@@ -23,15 +17,8 @@ Branches:
   Task remains scheduled.
 * `activity_not_in_cancel_list_noop` — task has a list but the
   canceling activity isn't in it. No cancel.
-* `global_task_matching_activity_cancelled` — task has no anchor,
-  canceling activity is in the list. Task cancelled unconditionally.
-* `anchored_task_activity_advanced_anchor_cancelled` — task has
-  anchor A, canceling activity's `generated` includes entity A.
-  Task cancelled.
-* `anchored_task_activity_did_not_advance_anchor_not_cancelled` —
-  THE regression gate for the anchor-scope bug. Task has anchor A,
-  canceling activity is in the cancel list BUT doesn't generate
-  a new version of A. Task must remain scheduled.
+* `matching_activity_cancelled` — canceling activity is in the
+  list. Task cancelled.
 * `task_already_completed_ignored` — a task whose latest version
   is `completed` must be ignored — no attempt to write a cancel
   revision.
@@ -61,8 +48,6 @@ from dossier_engine.engine.state import ActivityState, Caller
 
 UTC = timezone.utc
 D1 = UUID("11111111-1111-1111-1111-111111111111")
-ANCHOR_A = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
-ANCHOR_B = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 
 
 async def _bootstrap_dossier(repo: Repository) -> UUID:
@@ -86,8 +71,6 @@ async def _seed_task(
     *,
     status: str = "scheduled",
     cancel_if_activities: list[str] | None = None,
-    anchor_entity_id: UUID | None = None,
-    anchor_type: str | None = None,
 ) -> tuple[UUID, UUID]:
     """Seed one scheduled task and return (entity_id, version_id).
     1ms sleep after the insert guarantees the task's `created_at`
@@ -103,10 +86,6 @@ async def _seed_task(
         "status": status,
         "cancel_if_activities": cancel_if_activities or [],
     }
-    if anchor_entity_id is not None:
-        content["anchor_entity_id"] = str(anchor_entity_id)
-    if anchor_type is not None:
-        content["anchor_type"] = anchor_type
     await repo.create_entity(
         version_id=vid, entity_id=eid, dossier_id=D1,
         type="system:task", generated_by=activity_id,
@@ -130,7 +109,6 @@ async def _state_and_persist_activity(
     repo: Repository,
     *,
     activity_name: str,
-    generated: list[dict] | None = None,
 ) -> ActivityState:
     """Build the minimum ActivityState `cancel_matching_tasks`
     reads, AND persist a real ActivityRow for state.activity_id
@@ -138,13 +116,13 @@ async def _state_and_persist_activity(
     foreign key.
 
     The phase reads repo, dossier_id, activity_def['name'],
-    activity_id, generated (list of dicts with entity_id), and
-    `now` (the activity's started_at). When it cancels a task, it
-    writes a new task version with `generated_by = state.activity_id`,
-    which must reference a real activity row. In production, the
-    orchestrator's `create_activity_row` phase runs before this
-    one and creates that row; our tests bypass the orchestrator so
-    we have to create it ourselves.
+    activity_id, and `now` (the activity's started_at). When it
+    cancels a task, it writes a new task version with
+    `generated_by = state.activity_id`, which must reference a
+    real activity row. In production, the orchestrator's
+    `create_activity_row` phase runs before this one and creates
+    that row; our tests bypass the orchestrator so we have to
+    create it ourselves.
 
     `state.now` is set to now()-plus-one-second so seeded tasks
     (whose created_at is strictly before this moment) pass the
@@ -174,7 +152,6 @@ async def _state_and_persist_activity(
         generated_items=[],
         relation_items=[],
         caller=Caller.CLIENT,
-        generated=generated or [],
         now=now + timedelta(seconds=1),
     )
 
@@ -183,7 +160,6 @@ def _state(
     repo: Repository,
     *,
     activity_name: str,
-    generated: list[dict] | None = None,
 ) -> ActivityState:
     """Non-persisting variant used by tests that expect the phase
     to short-circuit before writing (no-op branches). A bogus
@@ -201,7 +177,6 @@ def _state(
         generated_items=[],
         relation_items=[],
         caller=Caller.CLIENT,
-        generated=generated or [],
         now=datetime.now(UTC) + timedelta(seconds=1),
     )
 
@@ -234,10 +209,9 @@ class TestCancelMatchingTasks:
 
         assert await _latest_task_status(repo, task_eid) == "scheduled"
 
-    async def test_global_task_matching_activity_cancelled(self, repo):
-        """Task has no anchor. Canceling activity is in the list.
-        Task cancelled unconditionally — this is the 'global
-        scope' branch."""
+    async def test_matching_activity_cancelled(self, repo):
+        """Canceling activity is in the task's cancel list. Task
+        cancelled."""
         act = await _bootstrap_dossier(repo)
         task_eid, _ = await _seed_task(
             repo, act, cancel_if_activities=["vervolledigAanvraag"],
@@ -250,91 +224,6 @@ class TestCancelMatchingTasks:
         await repo.session.flush()
 
         assert await _latest_task_status(repo, task_eid) == "cancelled"
-
-    async def test_anchored_task_activity_advanced_anchor_cancelled(self, repo):
-        """Task is anchored to entity A. The canceling activity's
-        `state.generated` includes an item with `entity_id = A`,
-        meaning the activity wrote a new version of A. This is
-        the "state actually advanced on the anchored entity"
-        branch — cancel fires."""
-        act = await _bootstrap_dossier(repo)
-        task_eid, _ = await _seed_task(
-            repo, act,
-            cancel_if_activities=["vervolledigAanvraag"],
-            anchor_entity_id=ANCHOR_A,
-            anchor_type="oe:aanvraag",
-        )
-        # State's `generated` has entity A in it — simulating
-        # that the canceling activity revised A.
-        state = await _state_and_persist_activity(
-            repo,
-            activity_name="vervolledigAanvraag",
-            generated=[{"entity_id": ANCHOR_A}],
-        )
-
-        await cancel_matching_tasks(state)
-        await repo.session.flush()
-
-        assert await _latest_task_status(repo, task_eid) == "cancelled"
-
-    async def test_anchored_task_activity_did_not_advance_anchor_not_cancelled(
-        self, repo,
-    ):
-        """THE regression gate for the anchor-scope bug. Task is
-        anchored to entity A. Canceling activity is in the cancel
-        list BUT its `state.generated` does NOT include A — it
-        touched something else, maybe entity B. The task must NOT
-        be cancelled, because the state of A didn't actually
-        advance.
-
-        This is the invariant the deleted worker `check_cancelled`
-        violated. The pipeline's version handles it correctly and
-        this test locks that correctness in place so a future
-        refactor can't silently lose it."""
-        act = await _bootstrap_dossier(repo)
-        task_eid, _ = await _seed_task(
-            repo, act,
-            cancel_if_activities=["vervolledigAanvraag"],
-            anchor_entity_id=ANCHOR_A,
-            anchor_type="oe:aanvraag",
-        )
-        # State generated entity B, not A. Anchor doesn't match.
-        state = _state(
-            repo,
-            activity_name="vervolledigAanvraag",
-            generated=[{"entity_id": ANCHOR_B}],
-        )
-
-        await cancel_matching_tasks(state)
-        await repo.session.flush()
-
-        # Must still be scheduled.
-        assert await _latest_task_status(repo, task_eid) == "scheduled"
-
-    async def test_anchored_task_activity_generated_nothing_not_cancelled(
-        self, repo,
-    ):
-        """Edge case: anchored task, canceling activity matches by
-        name, but state.generated is empty (activity was read-only
-        or side-effect-only). No entity was advanced, so the
-        anchor-scope check correctly fails. Task stays scheduled."""
-        act = await _bootstrap_dossier(repo)
-        task_eid, _ = await _seed_task(
-            repo, act,
-            cancel_if_activities=["vervolledigAanvraag"],
-            anchor_entity_id=ANCHOR_A,
-            anchor_type="oe:aanvraag",
-        )
-        state = _state(
-            repo,
-            activity_name="vervolledigAanvraag",
-            generated=[],  # nothing generated
-        )
-
-        await cancel_matching_tasks(state)
-        await repo.session.flush()
-
-        assert await _latest_task_status(repo, task_eid) == "scheduled"
 
     async def test_task_already_completed_ignored(self, repo):
         """A task whose latest version is already `completed`

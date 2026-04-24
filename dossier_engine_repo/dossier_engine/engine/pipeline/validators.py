@@ -54,6 +54,8 @@ async def run_custom_validators(state: ActivityState) -> None:
             used_entities=state.resolved_entities,
             entity_models=state.plugin.entity_models,
             plugin=state.plugin,
+            user=state.user,
+            triggering_user=state.user,
         )
         result = await validator_fn(ctx)
         if result is not None and not result:

@@ -23,8 +23,8 @@ from uuid import UUID
 from ..db.models import Repository, ActivityRow
 from ..plugin import Plugin
 from ..auth import User
-from .pipeline.eligibility import derive_allowed_activities
-from .pipeline.status import derive_status
+from .pipeline._helpers.eligibility import derive_allowed_activities
+from .pipeline._helpers.status import derive_status
 
 
 async def build_replay_response(

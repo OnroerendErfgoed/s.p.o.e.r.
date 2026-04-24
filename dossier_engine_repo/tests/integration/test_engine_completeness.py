@@ -3,9 +3,9 @@ Integration tests for the last engine/worker branches:
 
 * `_auto_resolve_for_system_caller` — the system-caller second
   pass of `resolve_used`, which fills in `auto_resolve: latest`
-  slots from trigger scope / anchor / singleton fallback.
+  slots from trigger scope / singleton fallback.
 * `_auto_resolve_used` — the side-effect variant (same general
-  shape but with a different fall-through order and no anchor).
+  shape but with a different fall-through order).
 * `_persist_se_generated` — side-effect handler-generated
   persistence, including schema_version resolution.
 * `_process_cross_dossier` — worker branch for cross-dossier
@@ -128,8 +128,6 @@ def _state(
     activity_def: dict,
     caller: Caller = Caller.SYSTEM,
     informed_by: str | None = None,
-    anchor_entity_id: UUID | None = None,
-    anchor_type: str | None = None,
 ) -> ActivityState:
     s = ActivityState(
         plugin=plugin,
@@ -145,8 +143,6 @@ def _state(
         caller=caller,
         informed_by=informed_by,
     )
-    s.anchor_entity_id = anchor_entity_id
-    s.anchor_type = anchor_type
     return s
 
 
@@ -285,52 +281,13 @@ class TestAutoResolveForSystemCaller:
         assert "oe:aanvraag" in state.resolved_entities
         assert state.resolved_entities["oe:aanvraag"].id == target_vid
         assert len(state.used_refs) == 1
-        assert state.used_refs[0]["auto_resolved"] is True
-        assert state.used_refs[0]["type"] == "oe:aanvraag"
-
-    async def test_anchor_fallback_when_trigger_scope_empty(self, repo):
-        """Trigger scope doesn't have the type, but an anchor of
-        matching type was supplied at task scheduling time.
-        Phase falls back to the anchor."""
-        boot = await _bootstrap(repo)
-        # Seed an anchored entity (outside the trigger's scope)
-        eid, vid = await _seed_entity(
-            repo, boot, "oe:aanvraag", content={"v": 1},
-        )
-        # Create an unrelated trigger activity with no matching entity
-        trigger_act = uuid4()
-        now = datetime.now(timezone.utc)
-        await repo.create_activity(
-            activity_id=trigger_act, dossier_id=D1, type="unrelated",
-            started_at=now, ended_at=now,
-        )
-        repo.session.add(AssociationRow(
-            id=uuid4(), activity_id=trigger_act, agent_id="system",
-            agent_name="Systeem", agent_type="systeem", role="systeem",
-        ))
-        await repo.session.flush()
-
-        plugin = _SystemCallerPlugin()  # not singleton
-        state = _state(
-            repo, plugin=plugin,
-            activity_def={
-                "name": "test",
-                "used": [{"type": "oe:aanvraag", "auto_resolve": "latest"}],
-            },
-            informed_by=str(trigger_act),
-            anchor_entity_id=eid,
-            anchor_type="oe:aanvraag",
-        )
-
-        await _auto_resolve_for_system_caller(state)
-
-        assert state.resolved_entities["oe:aanvraag"].id == vid
-        assert state.used_refs[0]["auto_resolved"] is True
+        assert state.used_refs[0].auto_resolved is True
+        assert state.used_refs[0].type == "oe:aanvraag"
 
     async def test_singleton_fallback_when_nothing_else_matches(self, repo):
-        """Trigger scope empty AND no anchor. But the type is a
-        singleton and an instance exists in the dossier → fall
-        back to singleton lookup."""
+        """Trigger scope empty. But the type is a singleton and an
+        instance exists in the dossier → fall back to singleton
+        lookup."""
         boot = await _bootstrap(repo)
         eid, vid = await _seed_entity(
             repo, boot, "oe:dossier_access", content={"level": "owner"},
@@ -343,7 +300,7 @@ class TestAutoResolveForSystemCaller:
                 "name": "test",
                 "used": [{"type": "oe:dossier_access", "auto_resolve": "latest"}],
             },
-            # No informed_by, no anchor
+            # No informed_by
         )
 
         await _auto_resolve_for_system_caller(state)
@@ -352,11 +309,10 @@ class TestAutoResolveForSystemCaller:
         assert state.resolved_entities["oe:dossier_access"].id == vid
 
     async def test_multi_cardinality_not_found_silently_skipped(self, repo):
-        """Multi-cardinality type, not in trigger scope, no
-        anchor, singleton fallback N/A. Phase silently skips —
-        the activity runs without it in resolved_entities, and
-        downstream phases that need it will raise their own
-        error."""
+        """Multi-cardinality type, not in trigger scope, singleton
+        fallback N/A. Phase silently skips — the activity runs
+        without it in resolved_entities, and downstream phases
+        that need it will raise their own error."""
         await _bootstrap(repo)
         plugin = _SystemCallerPlugin()  # nothing is singleton
         state = _state(
@@ -371,26 +327,6 @@ class TestAutoResolveForSystemCaller:
 
         assert state.resolved_entities == {}
         assert state.used_refs == []
-
-    async def test_anchor_wrong_type_ignored(self, repo):
-        """Anchor is supplied but its type doesn't match what
-        we're looking for. The anchor fallback is scoped to
-        matching type only; this call falls through to
-        singleton lookup (and then silently skips)."""
-        await _bootstrap(repo)
-        plugin = _SystemCallerPlugin()
-        state = _state(
-            repo, plugin=plugin,
-            activity_def={
-                "name": "test",
-                "used": [{"type": "oe:aanvraag", "auto_resolve": "latest"}],
-            },
-            anchor_entity_id=uuid4(),
-            anchor_type="oe:beslissing",  # mismatched
-        )
-
-        await _auto_resolve_for_system_caller(state)
-        assert state.resolved_entities == {}
 
 
 # --------------------------------------------------------------------

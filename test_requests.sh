@@ -9,11 +9,18 @@ BASE_URL="http://localhost:8000"
 # ----------------------------------------------------------------------------
 # File upload helper
 # ----------------------------------------------------------------------------
-# Usage: FID=$(upload_file <user> <local_filename> <display_filename>)
+# Usage: FID=$(upload_file <user> <local_filename> <display_filename> <dossier_id>)
 #
 # Calls POST /files/upload/request to get a signed upload URL, then PUTs a
 # small synthetic payload to the File Service. Echoes the resulting file_id
 # (and only the file_id) on stdout so it can be captured.
+#
+# Since the Bug 47 fix, dossier_id is required at token-mint time — the
+# engine signs it into the upload token and the file_service writes it as
+# intended_dossier_id into the temp .meta. At move time the file_service
+# rejects any attempt to move the file into a different dossier. Every
+# caller in this script knows the dossier_id because they've already
+# decided on one (this is the client-generates-UUIDs model).
 #
 # Errors are written to stderr; on failure the function returns the empty
 # string and the caller's curl will produce a 422 from the engine.
@@ -21,12 +28,18 @@ upload_file() {
   local user="$1"
   local content="$2"
   local filename="$3"
+  local dossier_id="$4"
+
+  if [ -z "$dossier_id" ]; then
+    echo "upload_file: dossier_id (4th arg) is required" >&2
+    return 1
+  fi
 
   local resp
   resp=$(curl -s -X POST "$BASE_URL/files/upload/request" \
     -H "Content-Type: application/json" \
     -H "X-POC-User: $user" \
-    -d "{\"filename\": \"$filename\"}")
+    -d "{\"filename\": \"$filename\", \"dossier_id\": \"$dossier_id\"}")
 
   local file_id upload_url
   file_id=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['file_id'])" 2>/dev/null)
@@ -56,9 +69,9 @@ echo "============================================"
 echo ""
 
 echo "--- D1 Step 1: dienAanvraagIn (with bijlage) ---"
-D1_BIJLAGE_FID=$(upload_file "jan.aanvrager" "Detailplan voor de gevelrestauratie." "detailplan.pdf")
+D1_BIJLAGE_FID=$(upload_file "jan.aanvrager" "Detailplan voor de gevelrestauratie." "detailplan.pdf" "d1000000-0000-0000-0000-000000000001")
 echo "  uploaded bijlage file_id=$D1_BIJLAGE_FID"
-curl -s -X PUT "$BASE_URL/dossiers/d1000000-0000-0000-0000-000000000001/activities/a1000000-0000-0000-0000-000000000001/dienAanvraagIn" \
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d1000000-0000-0000-0000-000000000001/activities/a1000000-0000-0000-0000-000000000001/oe:dienAanvraagIn" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: jan.aanvrager" \
   -d "{
@@ -105,8 +118,8 @@ print('  OK: file_download_url was injected on Bijlage.file_id')
 echo ""
 
 echo "--- D1 Step 2: neemBeslissing (onvolledig, direct) ---"
-D1_BRIEF1_FID=$(upload_file "marie.brugge" "Beslissingsbrief: aanvraag onvolledig." "d1-brief-001.pdf")
-curl -s -X PUT "$BASE_URL/dossiers/d1000000-0000-0000-0000-000000000001/activities/a1000000-0000-0000-0000-000000000002/neemBeslissing" \
+D1_BRIEF1_FID=$(upload_file "marie.brugge" "Beslissingsbrief: aanvraag onvolledig." "d1-brief-001.pdf" "d1000000-0000-0000-0000-000000000001")
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d1000000-0000-0000-0000-000000000001/activities/a1000000-0000-0000-0000-000000000002/oe:neemBeslissing" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
   -d "{
@@ -156,7 +169,7 @@ print('  OK: brief_download_url was injected on Beslissing.brief (default rule)'
 echo ""
 
 echo "--- D1 Step 3: vervolledigAanvraag ---"
-curl -s -X PUT "$BASE_URL/dossiers/d1000000-0000-0000-0000-000000000001/activities/a1000000-0000-0000-0000-000000000004/vervolledigAanvraag" \
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d1000000-0000-0000-0000-000000000001/activities/a1000000-0000-0000-0000-000000000004/oe:vervolledigAanvraag" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: jan.aanvrager" \
   -d '{
@@ -180,8 +193,8 @@ curl -s -X PUT "$BASE_URL/dossiers/d1000000-0000-0000-0000-000000000001/activiti
 echo ""
 
 echo "--- D1 Step 4: neemBeslissing (goedgekeurd, direct) ---"
-D1_BRIEF2_FID=$(upload_file "marie.brugge" "Beslissingsbrief: aanvraag goedgekeurd." "d1-brief-002.pdf")
-curl -s -X PUT "$BASE_URL/dossiers/d1000000-0000-0000-0000-000000000001/activities/a1000000-0000-0000-0000-000000000005/neemBeslissing" \
+D1_BRIEF2_FID=$(upload_file "marie.brugge" "Beslissingsbrief: aanvraag goedgekeurd." "d1-brief-002.pdf" "d1000000-0000-0000-0000-000000000001")
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d1000000-0000-0000-0000-000000000001/activities/a1000000-0000-0000-0000-000000000005/oe:neemBeslissing" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
   -d "{
@@ -213,7 +226,7 @@ curl -s "$BASE_URL/dossiers/d1000000-0000-0000-0000-000000000001" \
   -H "X-POC-User: marie.brugge" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Status: {d[\"status\"]}')"
 echo ""
 
-echo "D1 Graph: $BASE_URL/dossiers/d1000000-0000-0000-0000-000000000001/prov/graph"
+echo "D1 Graph: $BASE_URL/dossiers/d1000000-0000-0000-0000-000000000001/prov/graph/timeline"
 echo ""
 echo ""
 
@@ -226,7 +239,7 @@ echo "============================================"
 echo ""
 
 echo "--- D2 Step 1: dienAanvraagIn (firma.acme) ---"
-curl -s -X PUT "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000001/dienAanvraagIn" \
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000001/oe:dienAanvraagIn" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: firma.acme" \
   -d '{
@@ -250,8 +263,8 @@ curl -s -X PUT "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/activiti
 echo ""
 
 echo "--- D2 Step 2: doeVoorstelBeslissing — onvolledig (benjamma) ---"
-D2_BRIEF1_FID=$(upload_file "benjamma" "Beslissingsbrief D2: voorstel onvolledig." "d2-brief-001.pdf")
-curl -s -X PUT "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000002/doeVoorstelBeslissing" \
+D2_BRIEF1_FID=$(upload_file "benjamma" "Beslissingsbrief D2: voorstel onvolledig." "d2-brief-001.pdf" "d2000000-0000-0000-0000-000000000001")
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000002/oe:doeVoorstelBeslissing" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: benjamma" \
   -d "{
@@ -273,7 +286,7 @@ curl -s -X PUT "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/activiti
 echo ""
 
 echo "--- D2 Step 3: tekenBeslissing — sophie signs (triggers neemBeslissing → onvolledig) ---"
-curl -s -X PUT "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000003/tekenBeslissing" \
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000003/oe:tekenBeslissing" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: sophie.tekent" \
   -d '{
@@ -295,7 +308,7 @@ curl -s "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001" \
 echo ""
 
 echo "--- D2 Step 4: vervolledigAanvraag (firma.acme) ---"
-curl -s -X PUT "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000004/vervolledigAanvraag" \
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000004/oe:vervolledigAanvraag" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: firma.acme" \
   -d '{
@@ -319,7 +332,7 @@ curl -s -X PUT "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/activiti
 echo ""
 
 echo "--- D2 Step 5: bewerkAanvraag (benjamma) ---"
-curl -s -X PUT "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000005/bewerkAanvraag" \
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000005/oe:bewerkAanvraag" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: benjamma" \
   -d '{
@@ -343,8 +356,8 @@ curl -s -X PUT "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/activiti
 echo ""
 
 echo "--- D2 Step 6: doeVoorstelBeslissing — goedgekeurd (benjamma) ---"
-D2_BRIEF2_FID=$(upload_file "benjamma" "Beslissingsbrief D2: voorstel goedgekeurd." "d2-brief-002.pdf")
-curl -s -X PUT "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000006/doeVoorstelBeslissing" \
+D2_BRIEF2_FID=$(upload_file "benjamma" "Beslissingsbrief D2: voorstel goedgekeurd." "d2-brief-002.pdf" "d2000000-0000-0000-0000-000000000001")
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000006/oe:doeVoorstelBeslissing" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: benjamma" \
   -d "{
@@ -367,7 +380,7 @@ curl -s -X PUT "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/activiti
 echo ""
 
 echo "--- D2 Step 7: tekenBeslissing — sophie DECLINES (getekend: false → klaar_voor_behandeling) ---"
-curl -s -X PUT "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000007/tekenBeslissing" \
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000007/oe:tekenBeslissing" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: sophie.tekent" \
   -d '{
@@ -390,8 +403,8 @@ curl -s "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001" \
 echo ""
 
 echo "--- D2 Step 8: doeVoorstelBeslissing — goedgekeurd second attempt (benjamma) ---"
-D2_BRIEF3_FID=$(upload_file "benjamma" "Beslissingsbrief D2: tweede voorstel goedgekeurd." "d2-brief-003.pdf")
-curl -s -X PUT "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000008/doeVoorstelBeslissing" \
+D2_BRIEF3_FID=$(upload_file "benjamma" "Beslissingsbrief D2: tweede voorstel goedgekeurd." "d2-brief-003.pdf" "d2000000-0000-0000-0000-000000000001")
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000008/oe:doeVoorstelBeslissing" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: benjamma" \
   -d "{
@@ -414,7 +427,7 @@ curl -s -X PUT "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/activiti
 echo ""
 
 echo "--- D2 Step 9: tekenBeslissing — sophie SIGNS (triggers neemBeslissing → goedgekeurd) ---"
-curl -s -X PUT "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000009/tekenBeslissing" \
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d2000000-0000-0000-0000-000000000001/activities/a2000000-0000-0000-0000-000000000009/oe:tekenBeslissing" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: sophie.tekent" \
   -d '{
@@ -436,7 +449,7 @@ curl -s "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001" \
   -H "X-POC-User: benjamma" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Status: {d[\"status\"]}')"
 echo ""
 
-echo "D2 Graph: $BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/prov/graph"
+echo "D2 Graph: $BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001/prov/graph/timeline"
 echo ""
 echo ""
 
@@ -453,7 +466,7 @@ echo "============================================"
 echo ""
 
 echo "--- D3 Step 1: dienAanvraagIn ---"
-curl -s -X PUT "$BASE_URL/dossiers/d3000000-0000-0000-0000-000000000001/activities/a3000000-0000-0000-0000-000000000001/dienAanvraagIn" \
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d3000000-0000-0000-0000-000000000001/activities/a3000000-0000-0000-0000-000000000001/oe:dienAanvraagIn" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: jan.aanvrager" \
   -d '{
@@ -477,8 +490,8 @@ curl -s -X PUT "$BASE_URL/dossiers/d3000000-0000-0000-0000-000000000001/activiti
 echo ""
 
 echo "--- D3 Step 2: BATCH bewerkAanvraag + doeVoorstelBeslissing ---"
-D3_BRIEF1_FID=$(upload_file "marie.brugge" "Beslissingsbrief D3: kapel renovatie." "d3-brief-001.pdf")
-curl -s -X PUT "$BASE_URL/dossiers/d3000000-0000-0000-0000-000000000001/activities" \
+D3_BRIEF1_FID=$(upload_file "marie.brugge" "Beslissingsbrief D3: kapel renovatie." "d3-brief-001.pdf" "d3000000-0000-0000-0000-000000000001")
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d3000000-0000-0000-0000-000000000001/activities" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
   -d "{
@@ -531,7 +544,7 @@ curl -s "$BASE_URL/dossiers/d3000000-0000-0000-0000-000000000001" \
   -H "X-POC-User: marie.brugge" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Status: {d[\"status\"]}')"
 echo ""
 
-echo "D3 Graph: $BASE_URL/dossiers/d3000000-0000-0000-0000-000000000001/prov/graph"
+echo "D3 Graph: $BASE_URL/dossiers/d3000000-0000-0000-0000-000000000001/prov/graph/timeline"
 echo ""
 echo ""
 
@@ -543,7 +556,7 @@ echo "============================================"
 echo ""
 
 echo "--- D4 Step 1: dienAanvraagIn ---"
-curl -s -X PUT "$BASE_URL/dossiers/d4000000-0000-0000-0000-000000000001/activities/a4000000-0000-0000-0000-000000000001/dienAanvraagIn" \
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d4000000-0000-0000-0000-000000000001/activities/a4000000-0000-0000-0000-000000000001/oe:dienAanvraagIn" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: jan.aanvrager" \
   -d '{
@@ -567,8 +580,8 @@ curl -s -X PUT "$BASE_URL/dossiers/d4000000-0000-0000-0000-000000000001/activiti
 echo ""
 
 echo "--- D4 Step 2: BATCH bewerkAanvraag + doeVoorstelBeslissing (explicit used ref) ---"
-D4_BRIEF1_FID=$(upload_file "marie.brugge" "Beslissingsbrief D4: torenrestauratie." "d4-brief-001.pdf")
-curl -s -X PUT "$BASE_URL/dossiers/d4000000-0000-0000-0000-000000000001/activities" \
+D4_BRIEF1_FID=$(upload_file "marie.brugge" "Beslissingsbrief D4: torenrestauratie." "d4-brief-001.pdf" "d4000000-0000-0000-0000-000000000001")
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d4000000-0000-0000-0000-000000000001/activities" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
   -d "{
@@ -621,7 +634,7 @@ curl -s "$BASE_URL/dossiers/d4000000-0000-0000-0000-000000000001" \
   -H "X-POC-User: marie.brugge" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'Status: {d[\"status\"]}')"
 echo ""
 
-echo "D4 Graph: $BASE_URL/dossiers/d4000000-0000-0000-0000-000000000001/prov/graph"
+echo "D4 Graph: $BASE_URL/dossiers/d4000000-0000-0000-0000-000000000001/prov/graph/timeline"
 echo ""
 echo ""
 
@@ -639,10 +652,10 @@ echo "DOSSIER 5: derivation rules — negative tests"
 echo "============================================"
 echo ""
 
-D5_AANVRAAG_FID=$(upload_file "jan.aanvrager" "initiele aanvraag bijlage" "d5-initieel.pdf")
+D5_AANVRAAG_FID=$(upload_file "jan.aanvrager" "initiele aanvraag bijlage" "d5-initieel.pdf" "d5000000-0000-0000-0000-000000000001")
 
 echo "--- D5 Step 1: dienAanvraagIn (baseline v1) ---"
-curl -s -X PUT "$BASE_URL/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000001/dienAanvraagIn" \
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000001/oe:dienAanvraagIn" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: jan.aanvrager" \
   -d "{
@@ -666,7 +679,7 @@ echo "  baseline aanvraag v1 created"
 echo ""
 
 echo "--- D5 Step 2: bewerkAanvraag v2 (happy path — correct derivedFrom from v1) ---"
-curl -s -X PUT "$BASE_URL/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000002/bewerkAanvraag" \
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000002/oe:bewerkAanvraag" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
   -d '{
@@ -695,7 +708,7 @@ print('  OK: happy-path derivation v1->v2 accepted')
 echo ""
 
 echo "--- D5 Step 3: NEGATIVE — missing derivedFrom on existing entity (expect 422 missing_derivation_chain) ---"
-RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000003/bewerkAanvraag" \
+RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/toelatingen/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000003/oe:bewerkAanvraag" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
   -d '{
@@ -730,7 +743,7 @@ print(f'  OK: 422 missing_derivation_chain; latest_version.versionId={lv[\"versi
 echo ""
 
 echo "--- D5 Step 4: NEGATIVE — derivedFrom from non-latest version (expect 422 invalid_derivation_chain) ---"
-RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000004/bewerkAanvraag" \
+RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/toelatingen/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000004/oe:bewerkAanvraag" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
   -d '{
@@ -765,7 +778,7 @@ print(f'  OK: 422 invalid_derivation_chain; declared=v1, latest=v2, latest_versi
 echo ""
 
 echo "--- D5 Step 5: NEGATIVE — unknown parent version (expect 422 unknown_parent) ---"
-RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000005/bewerkAanvraag" \
+RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/toelatingen/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000005/oe:bewerkAanvraag" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
   -d '{
@@ -798,7 +811,7 @@ echo ""
 
 echo "--- D5 Step 6: NEGATIVE — cross-entity derivation (expect 422 cross_entity_derivation) ---"
 # NEW entity_id (e5...99) trying to derive from the existing e5...01 chain
-RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000006/bewerkAanvraag" \
+RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/toelatingen/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000006/oe:bewerkAanvraag" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
   -d '{
@@ -830,7 +843,7 @@ print(f'  OK: 422 cross_entity_derivation')
 echo ""
 
 echo "--- D5 Step 7: NEGATIVE — same logical entity in used and generated, local (expect 422 used_generated_overlap) ---"
-RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000007/bewerkAanvraag" \
+RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/toelatingen/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000007/oe:bewerkAanvraag" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
   -d '{
@@ -869,7 +882,7 @@ print(f'  OK: 422 used_generated_overlap (local entity_id)')
 echo ""
 
 echo "--- D5 Step 8: NEGATIVE — same external URI in used and generated (expect 422 used_generated_overlap) ---"
-RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000008/bewerkAanvraag" \
+RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/toelatingen/dossiers/d5000000-0000-0000-0000-000000000001/activities/a5000000-0000-0000-0000-000000000008/oe:bewerkAanvraag" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
   -d '{
@@ -929,8 +942,8 @@ echo "============================================"
 echo ""
 
 echo "--- D6 Step 1: dienAanvraagIn (aanvraag v1) ---"
-D6_FID=$(upload_file "jan.aanvrager" "D6 initieel" "d6.pdf")
-curl -s -X PUT "$BASE_URL/dossiers/d6000000-0000-0000-0000-000000000001/activities/a6000000-0000-0000-0000-000000000001/dienAanvraagIn" \
+D6_FID=$(upload_file "jan.aanvrager" "D6 initieel" "d6.pdf" "d6000000-0000-0000-0000-000000000001")
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d6000000-0000-0000-0000-000000000001/activities/a6000000-0000-0000-0000-000000000001/oe:dienAanvraagIn" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: jan.aanvrager" \
   -d "{
@@ -952,7 +965,7 @@ echo "  aanvraag v1 created"
 echo ""
 
 echo "--- D6 Step 2: bewerkAanvraag -> aanvraag v2 (latest) ---"
-curl -s -X PUT "$BASE_URL/dossiers/d6000000-0000-0000-0000-000000000001/activities/a6000000-0000-0000-0000-000000000002/bewerkAanvraag" \
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d6000000-0000-0000-0000-000000000001/activities/a6000000-0000-0000-0000-000000000002/oe:bewerkAanvraag" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
   -d '{
@@ -973,8 +986,8 @@ echo "  aanvraag v2 created (now latest)"
 echo ""
 
 echo "--- D6 Step 3: NEGATIVE — doeVoorstelBeslissing reads stale v1, no ack (expect 409 stale_used_reference) ---"
-D6_BRIEF_FID=$(upload_file "marie.brugge" "D6 brief" "d6-brief.pdf")
-RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/dossiers/d6000000-0000-0000-0000-000000000001/activities/a6000000-0000-0000-0000-000000000003/doeVoorstelBeslissing" \
+D6_BRIEF_FID=$(upload_file "marie.brugge" "D6 brief" "d6-brief.pdf" "d6000000-0000-0000-0000-000000000001")
+RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/toelatingen/dossiers/d6000000-0000-0000-0000-000000000001/activities/a6000000-0000-0000-0000-000000000003/oe:doeVoorstelBeslissing" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
   -d "{
@@ -1012,7 +1025,7 @@ print('  OK: 409 stale_used_reference with stale entry + intervening versions + 
 echo ""
 
 echo "--- D6 Step 4: NEGATIVE — ack an external URI (expect 422 — relations cannot reference externals) ---"
-RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/dossiers/d6000000-0000-0000-0000-000000000001/activities/a6000000-0000-0000-0000-000000000004/doeVoorstelBeslissing" \
+RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/toelatingen/dossiers/d6000000-0000-0000-0000-000000000001/activities/a6000000-0000-0000-0000-000000000004/oe:doeVoorstelBeslissing" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
   -d "{
@@ -1047,7 +1060,7 @@ print('  OK: 422 relations cannot reference external URIs')
 echo ""
 
 echo "--- D6 Step 5: POSITIVE — doeVoorstelBeslissing reads stale v1, acks v2 (expect 200) ---"
-RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/dossiers/d6000000-0000-0000-0000-000000000001/activities/a6000000-0000-0000-0000-000000000005/doeVoorstelBeslissing" \
+RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/toelatingen/dossiers/d6000000-0000-0000-0000-000000000001/activities/a6000000-0000-0000-0000-000000000005/oe:doeVoorstelBeslissing" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: marie.brugge" \
   -d "{
@@ -1088,20 +1101,20 @@ echo ""
 echo ""
 
 # ============================================================================
-# DOSSIER 7: anchor mechanism verification
+# DOSSIER 7: task cancellation end-to-end
 # ============================================================================
 # Reuses D2 state from earlier. Verifies that:
-# 1. The trekAanvraagIn task scheduled during D2 has anchor_entity_id set
-# 2. The anchor_type is oe:aanvraag
-# 3. The task got cancelled (status=cancelled) after vervolledigAanvraag ran
+# 1. A trekAanvraagIn task was scheduled during D2 (after the onvolledig
+#    beslissing)
+# 2. That task got cancelled (status=cancelled) after vervolledigAanvraag ran
 # ============================================================================
 
 echo "============================================"
-echo "DOSSIER 7: anchor mechanism (reuses D2)"
+echo "DOSSIER 7: task cancellation (reuses D2)"
 echo "============================================"
 echo ""
 
-echo "--- D7 Check: D2's trekAanvraagIn task has correct anchor + was cancelled ---"
+echo "--- D7 Check: D2's trekAanvraagIn task was cancelled ---"
 curl -s "$BASE_URL/dossiers/d2000000-0000-0000-0000-000000000001" \
   -H "X-POC-User: claeyswo" | python3 -c "
 import sys, json
@@ -1111,15 +1124,12 @@ task_entities = [e for e in ents if e.get('type') == 'system:task' and (e.get('c
 assert len(task_entities) >= 1, f'expected at least 1 trekAanvraagIn task, got {len(task_entities)}'
 task = task_entities[0]
 c = task['content']
-assert c.get('anchor_type') == 'oe:aanvraag', f'expected anchor_type=oe:aanvraag, got {c.get(\"anchor_type\")}'
-assert c.get('anchor_entity_id'), f'expected anchor_entity_id to be set, got {c.get(\"anchor_entity_id\")}'
-assert c.get('anchor_entity_id').startswith('e2000000'), f'expected anchor to be D2 aanvraag, got {c.get(\"anchor_entity_id\")}'
 assert c.get('status') == 'cancelled', f'expected status=cancelled (cancelled by vervolledigAanvraag), got {c.get(\"status\")}'
-print(f'  OK: trekAanvraagIn task correctly anchored to aanvraag {c[\"anchor_entity_id\"][:8]}... and cancelled by vervolledigAanvraag')
+print('  OK: trekAanvraagIn task was cancelled by vervolledigAanvraag')
 "
 echo ""
 
-echo "D7 summary: anchor mechanism verified end-to-end"
+echo "D7 summary: task cancellation verified end-to-end"
 
 # ============================================================================
 # DOSSIER 8: entity schema versioning
@@ -1138,10 +1148,10 @@ echo "DOSSIER 8: entity schema versioning"
 echo "============================================"
 echo ""
 
-D8_BIJLAGE_FID=$(upload_file "jan.aanvrager" "D8 v2 bijlage" "d8.pdf")
+D8_BIJLAGE_FID=$(upload_file "jan.aanvrager" "D8 v2 bijlage" "d8.pdf" "d8000000-0000-0000-0000-000000000001")
 
 echo "--- D8 Step 1: testDienAanvraagInV2 (creates v2 aanvraag) ---"
-D8_STEP1=$(curl -s -X PUT "$BASE_URL/dossiers/d8000000-0000-0000-0000-000000000001/activities/a8000000-0000-0000-0000-000000000001/testDienAanvraagInV2" \
+D8_STEP1=$(curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d8000000-0000-0000-0000-000000000001/activities/a8000000-0000-0000-0000-000000000001/oe:testDienAanvraagInV2" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: jan.aanvrager" \
   -d "{
@@ -1194,7 +1204,7 @@ echo ""
 
 echo "--- D8 Step 3: legacy bewerkAanvraag on v2 row — sticky version (relaxed) ---"
 D8_STEP3_CODE=$(curl -s -o /tmp/d8_step3.json -w "%{http_code}" \
-  -X PUT "$BASE_URL/dossiers/d8000000-0000-0000-0000-000000000001/activities/a8000000-0000-0000-0000-000000000002/bewerkAanvraag" \
+  -X PUT "$BASE_URL/toelatingen/dossiers/d8000000-0000-0000-0000-000000000001/activities/a8000000-0000-0000-0000-000000000002/oe:bewerkAanvraag" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: benjamma" \
   -d "{
@@ -1243,7 +1253,7 @@ for e in d.get('currentEntities', []):
 ")
 echo "  D1 latest aanvraag: $D1_LATEST"
 D8_STEP4_CODE=$(curl -s -o /tmp/d8_step4.json -w "%{http_code}" \
-  -X PUT "$BASE_URL/dossiers/d1000000-0000-0000-0000-000000000001/activities/a8000000-0000-0000-0000-000000000099/testBewerkAanvraagV2Only" \
+  -X PUT "$BASE_URL/toelatingen/dossiers/d1000000-0000-0000-0000-000000000001/activities/a8000000-0000-0000-0000-000000000099/oe:testBewerkAanvraagV2Only" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: benjamma" \
   -d "{
@@ -1311,10 +1321,10 @@ echo "DOSSIER 9: tombstone — irreversible redaction"
 echo "============================================"
 echo ""
 
-D9_BIJLAGE_FID=$(upload_file "jan.aanvrager" "D9 initial bijlage" "d9.pdf")
+D9_BIJLAGE_FID=$(upload_file "jan.aanvrager" "D9 initial bijlage" "d9.pdf" "d9000000-0000-0000-0000-000000000001")
 
 echo "--- D9 Step 1: dienAanvraagIn (creates v1) ---"
-curl -s -X PUT "$BASE_URL/dossiers/d9000000-0000-0000-0000-000000000001/activities/a9000000-0000-0000-0000-000000000001/dienAanvraagIn" \
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d9000000-0000-0000-0000-000000000001/activities/a9000000-0000-0000-0000-000000000001/oe:dienAanvraagIn" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: jan.aanvrager" \
   -d "{
@@ -1338,7 +1348,7 @@ echo "  v1 created"
 echo ""
 
 echo "--- D9 Step 2: bewerkAanvraag (creates v2) ---"
-curl -s -X PUT "$BASE_URL/dossiers/d9000000-0000-0000-0000-000000000001/activities/a9000000-0000-0000-0000-000000000002/bewerkAanvraag" \
+curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d9000000-0000-0000-0000-000000000001/activities/a9000000-0000-0000-0000-000000000002/oe:bewerkAanvraag" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: benjamma" \
   -d "{
@@ -1365,7 +1375,7 @@ echo "  v2 created"
 echo ""
 
 echo "--- D9 Step 3: tombstone v1+v2 with redacted replacement vT + reason note ---"
-D9_TS_RESPONSE=$(curl -s -X PUT "$BASE_URL/dossiers/d9000000-0000-0000-0000-000000000001/activities/a9000000-0000-0000-0000-000000000003/tombstone" \
+D9_TS_RESPONSE=$(curl -s -X PUT "$BASE_URL/toelatingen/dossiers/d9000000-0000-0000-0000-000000000001/activities/a9000000-0000-0000-0000-000000000003/oe:tombstone" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: claeyswo" \
   -d "{
@@ -1473,7 +1483,7 @@ echo ""
 
 echo "--- D9 Step 8: NEGATIVE — tombstone with no system:note (expect 422) ---"
 D9_NEG1_CODE=$(curl -s -o /tmp/d9_neg1.json -w "%{http_code}" \
-  -X PUT "$BASE_URL/dossiers/d9000000-0000-0000-0000-000000000001/activities/a9000000-0000-0000-0000-000000000004/tombstone" \
+  -X PUT "$BASE_URL/toelatingen/dossiers/d9000000-0000-0000-0000-000000000001/activities/a9000000-0000-0000-0000-000000000004/oe:tombstone" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: claeyswo" \
   -d "{
@@ -1509,7 +1519,7 @@ echo ""
 
 echo "--- D9 Step 9: NEGATIVE — tombstone targeting two entity_ids (expect 422) ---"
 D9_NEG2_CODE=$(curl -s -o /tmp/d9_neg2.json -w "%{http_code}" \
-  -X PUT "$BASE_URL/dossiers/d9000000-0000-0000-0000-000000000001/activities/a9000000-0000-0000-0000-000000000005/tombstone" \
+  -X PUT "$BASE_URL/toelatingen/dossiers/d9000000-0000-0000-0000-000000000001/activities/a9000000-0000-0000-0000-000000000005/oe:tombstone" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: claeyswo" \
   -d "{
@@ -1550,7 +1560,7 @@ echo ""
 
 echo "--- D9 Step 10: re-tombstone the replacement (allowed) ---"
 D9_RETS_CODE=$(curl -s -o /tmp/d9_rets.json -w "%{http_code}" \
-  -X PUT "$BASE_URL/dossiers/d9000000-0000-0000-0000-000000000001/activities/a9000000-0000-0000-0000-000000000006/tombstone" \
+  -X PUT "$BASE_URL/toelatingen/dossiers/d9000000-0000-0000-0000-000000000001/activities/a9000000-0000-0000-0000-000000000006/oe:tombstone" \
   -H "Content-Type: application/json" \
   -H "X-POC-User: claeyswo" \
   -d "{

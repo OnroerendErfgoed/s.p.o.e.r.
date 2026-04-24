@@ -73,7 +73,7 @@ async def submit_bewerking(
             }
         ],
     }
-    url = f"{BASE}/dossiers/{DOSSIER}/activities/{activity_id}/bewerkAanvraag"
+    url = f"{BASE}/toelatingen/dossiers/{DOSSIER}/activities/{activity_id}/oe:bewerkAanvraag"
     t0 = time.monotonic()
     async with session.put(url, json=payload, headers={"X-POC-User": USER}) as r:
         elapsed = time.monotonic() - t0

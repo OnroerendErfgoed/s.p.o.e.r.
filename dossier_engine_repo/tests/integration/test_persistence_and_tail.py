@@ -29,7 +29,7 @@ from sqlalchemy import text
 from dossier_engine.auth import User
 from dossier_engine.db.models import Repository, AssociationRow
 from dossier_engine.engine.context import HandlerResult
-from dossier_engine.engine.pipeline.eligibility import (
+from dossier_engine.engine.pipeline._helpers.eligibility import (
     compute_eligible_activities, filter_by_user_auth,
     derive_allowed_activities,
 )
@@ -40,8 +40,10 @@ from dossier_engine.engine.pipeline.finalization import (
 from dossier_engine.engine.pipeline.persistence import (
     create_activity_row, persist_outputs,
 )
-from dossier_engine.engine.pipeline.status import derive_status
-from dossier_engine.engine.state import ActivityState, Caller
+from dossier_engine.engine.pipeline._helpers.status import derive_status
+from dossier_engine.engine.state import (
+    ActivityState, Caller, UsedRef, ValidatedRelation,
+)
 
 
 D1 = UUID("11111111-1111-1111-1111-111111111111")
@@ -298,11 +300,11 @@ class TestPersistOutputs:
 
         state = _state(
             repo, activity_id=activity_id,
-            used_refs=[{
-                "entity": f"oe:aanvraag/xxx@{target_vid}",
-                "version_id": target_vid,
-                "type": "oe:aanvraag",
-            }],
+            used_refs=[UsedRef(
+                entity=f"oe:aanvraag/xxx@{target_vid}",
+                version_id=target_vid,
+                type="oe:aanvraag",
+            )],
         )
 
         await persist_outputs(state)
@@ -331,11 +333,11 @@ class TestPersistOutputs:
 
         state = _state(
             repo, activity_id=activity_id,
-            validated_relations=[{
-                "version_id": target_vid,
-                "relation_type": "oe:neemtAkteVan",
-                "ref": f"oe:aanvraag/xxx@{target_vid}",
-            }],
+            validated_relations=[ValidatedRelation(
+                version_id=target_vid,
+                relation_type="oe:neemtAkteVan",
+                ref=f"oe:aanvraag/xxx@{target_vid}",
+            )],
         )
 
         await persist_outputs(state)
@@ -591,15 +593,29 @@ class TestDeriveStatus:
 
 class _EligibilityPlugin:
     """Stub plugin for eligibility tests. workflow dict carries
-    the activities list. `_resolve_field` isn't needed here."""
-    def __init__(self, activities: list[dict]):
+    the activities list. `_resolve_field` isn't needed here.
+
+    `singletons` lets tests exercise the dict-form deadline path —
+    `resolve_deadline` calls `plugin.is_singleton` before the DB
+    lookup, so tests that declare ``not_after: {from_entity, field}``
+    must whitelist that type here or the resolver raises."""
+    def __init__(
+        self, activities: list[dict],
+        singletons: set[str] | None = None,
+    ):
         self.workflow = {"activities": activities, "relations": []}
         self.entity_models = {}
         self.validators = {}
         self.handlers = {}
+        self._singletons = singletons or set()
 
     def is_singleton(self, entity_type):
-        return False
+        return entity_type in self._singletons
+
+    def cardinality_of(self, entity_type):
+        """Only reached from lookup_singleton's error path if
+        is_singleton returns False. Satisfies its contract."""
+        return "single" if entity_type in self._singletons else "multiple"
 
 
 class TestComputeEligibleActivities:
@@ -703,6 +719,175 @@ class TestFilterByUserAuth:
         )
 
         assert [a["type"] for a in result] == ["a"]
+
+    # --- deadline fields in the response (Pass B) ----------------
+    #
+    # These lock in the flat-shape contract: `not_before` /
+    # `not_after` appear on an entry ONLY when (a) the activity_def
+    # declares the rule AND (b) the deadline resolves successfully.
+    # Missing singletons → field absent. Neither declared → entry
+    # shape is plain {type, label} (covered by the earlier tests).
+
+    async def test_not_after_iso_form_appears_in_response(self, repo):
+        """Activity declares `forbidden.not_after: "<ISO>"`. The
+        response entry includes `not_after` with the same ISO
+        string (normalized)."""
+        await repo.create_dossier(D1, "toelatingen")
+        plugin = _EligibilityPlugin([{
+            "name": "renew",
+            "authorization": {"access": "authenticated"},
+            "forbidden": {"not_after": "2026-12-31T23:59:59Z"},
+        }])
+
+        result = await filter_by_user_auth(
+            plugin, ["renew"], _user(), repo, D1,
+        )
+
+        assert len(result) == 1
+        entry = result[0]
+        assert entry["type"] == "renew"
+        assert entry["not_after"] == "2026-12-31T23:59:59+00:00"
+        # Confirm we didn't sneak in anything else (not_before absent).
+        assert "not_before" not in entry
+
+    async def test_not_before_iso_form_appears_in_response(self, repo):
+        """Symmetric check for `requirements.not_before`. Fields
+        are flat (per design choice in Q5); `not_before` is a
+        sibling of `type`/`label`, not nested under a `deadlines`
+        key."""
+        await repo.create_dossier(D1, "toelatingen")
+        plugin = _EligibilityPlugin([{
+            "name": "earlyAction",
+            "authorization": {"access": "authenticated"},
+            "requirements": {"not_before": "2026-01-01T00:00:00Z"},
+        }])
+
+        result = await filter_by_user_auth(
+            plugin, ["earlyAction"], _user(), repo, D1,
+        )
+
+        assert len(result) == 1
+        entry = result[0]
+        assert entry["not_before"] == "2026-01-01T00:00:00+00:00"
+        assert "not_after" not in entry
+
+    async def test_both_rules_both_fields_present(self, repo):
+        """An activity with both rules gets both fields in the
+        response. Frontends can show a 'window open from X to Y'
+        UI hint."""
+        await repo.create_dossier(D1, "toelatingen")
+        plugin = _EligibilityPlugin([{
+            "name": "windowedAction",
+            "authorization": {"access": "authenticated"},
+            "requirements": {"not_before": "2026-01-01T00:00:00Z"},
+            "forbidden": {"not_after": "2026-12-31T23:59:59Z"},
+        }])
+
+        result = await filter_by_user_auth(
+            plugin, ["windowedAction"], _user(), repo, D1,
+        )
+
+        assert len(result) == 1
+        entry = result[0]
+        assert "not_before" in entry
+        assert "not_after" in entry
+
+    async def test_no_rules_no_fields(self, repo):
+        """No deadline declared → response entry is the old
+        `{type, label}` shape exactly. Locks in that the new fields
+        don't leak in as null / None when absent from the YAML —
+        absent from the dict entirely."""
+        await repo.create_dossier(D1, "toelatingen")
+        plugin = _EligibilityPlugin([{
+            "name": "plain",
+            "authorization": {"access": "authenticated"},
+        }])
+
+        result = await filter_by_user_auth(
+            plugin, ["plain"], _user(), repo, D1,
+        )
+
+        assert result == [{"type": "plain", "label": "plain"}]
+
+    async def test_dict_form_not_after_resolves_from_singleton(self, repo):
+        """Dict-form `not_after` hits the DB via `lookup_singleton`.
+        Seed a singleton, declare the rule, confirm the response
+        carries the resolved ISO string."""
+        from dossier_engine.db.models import AssociationRow
+        await repo.create_dossier(D1, "toelatingen")
+        # Bootstrap activity so seeded entity has a valid generated_by.
+        act_id = uuid4()
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        await repo.create_activity(
+            activity_id=act_id, dossier_id=D1, type="systemAction",
+            started_at=now, ended_at=now,
+        )
+        repo.session.add(AssociationRow(
+            id=uuid4(), activity_id=act_id, agent_id="system",
+            agent_name="Systeem", agent_type="systeem", role="systeem",
+        ))
+        await repo.create_entity(
+            version_id=uuid4(), entity_id=uuid4(), dossier_id=D1,
+            type="oe:permit", generated_by=act_id,
+            content={"expires_at": "2026-12-31T00:00:00Z"},
+            attributed_to="system",
+        )
+        await repo.session.flush()
+
+        plugin = _EligibilityPlugin(
+            [{
+                "name": "renew",
+                "authorization": {"access": "authenticated"},
+                "forbidden": {
+                    "not_after": {
+                        "from_entity": "oe:permit",
+                        "field": "expires_at",
+                    },
+                },
+            }],
+            singletons={"oe:permit"},
+        )
+
+        result = await filter_by_user_auth(
+            plugin, ["renew"], _user(), repo, D1,
+        )
+
+        assert len(result) == 1
+        assert result[0]["not_after"] == "2026-12-31T00:00:00+00:00"
+
+    async def test_dict_form_singleton_missing_field_absent(self, repo):
+        """The 'rule inactive' path. Dict-form rule points at a
+        singleton type that isn't in the dossier yet. Resolver
+        returns None; the response entry has no `not_after` field.
+        Matches the validator semantics: when the anchor doesn't
+        exist, the deadline rule has no meaning, so nothing to
+        display to the user."""
+        await repo.create_dossier(D1, "toelatingen")
+        # NOTE: no oe:permit seeded.
+        plugin = _EligibilityPlugin(
+            [{
+                "name": "renew",
+                "authorization": {"access": "authenticated"},
+                "forbidden": {
+                    "not_after": {
+                        "from_entity": "oe:permit",
+                        "field": "expires_at",
+                    },
+                },
+            }],
+            singletons={"oe:permit"},
+        )
+
+        result = await filter_by_user_auth(
+            plugin, ["renew"], _user(), repo, D1,
+        )
+
+        # Activity is still eligible (rule treated as inactive when
+        # anchor missing, per Pass A semantics). But no not_after
+        # in the response because there's nothing to display.
+        assert len(result) == 1
+        assert "not_after" not in result[0]
 
 
 # --------------------------------------------------------------------
@@ -990,18 +1175,22 @@ class TestBuildFullResponse:
             now=now,
             dossier=dossier_row,
             used_refs=[
-                {"entity": "oe:aanvraag/x@y", "type": "oe:aanvraag"},
+                UsedRef(
+                    entity="oe:aanvraag/x@y",
+                    version_id=uuid4(),
+                    type="oe:aanvraag",
+                ),
             ],
             generated_response=[{
                 "entity": "oe:beslissing/a@b",
                 "type": "oe:beslissing",
                 "content": {"x": 1},
             }],
-            validated_relations=[{
-                "version_id": uuid4(),
-                "relation_type": "oe:references",
-                "ref": "oe:thing/q@r",
-            }],
+            validated_relations=[ValidatedRelation(
+                version_id=uuid4(),
+                relation_type="oe:references",
+                ref="oe:thing/q@r",
+            )],
             current_status="goedgekeurd",
             allowed_activities=[{"type": "foo", "label": "Foo"}],
         )
@@ -1036,11 +1225,12 @@ class TestBuildFullResponse:
             repo,
             activity_def={"name": "test"},
             now=datetime.now(timezone.utc),
-            used_refs=[{
-                "entity": "oe:aanvraag/x@y",
-                "type": "oe:aanvraag",
-                "auto_resolved": True,
-            }],
+            used_refs=[UsedRef(
+                entity="oe:aanvraag/x@y",
+                version_id=uuid4(),
+                type="oe:aanvraag",
+                auto_resolved=True,
+            )],
             generated_response=[],
             validated_relations=[],
             current_status="nieuw",

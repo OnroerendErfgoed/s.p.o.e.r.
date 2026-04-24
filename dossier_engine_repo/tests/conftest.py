@@ -123,15 +123,12 @@ def stub_state():
             "generated_items": [],
             "relation_items": [],
             # Optional fields with their dataclass defaults. Listed
-            # explicitly here so tests that need to override them
-            # (e.g. anchor_entity_id for anchor tests) can do so via
-            # the factory kwargs.
+            # explicitly here so tests that need to override them can
+            # do so via the factory kwargs.
             "workflow_name": None,
             "informed_by": None,
             "skip_cache": False,
             "caller": Caller.CLIENT,
-            "anchor_entity_id": None,
-            "anchor_type": None,
             "now": datetime.now(timezone.utc),
         }
         defaults.update(overrides)
@@ -180,6 +177,7 @@ async def db_session(db_session_factory):
     """
     tables = [
         "used",
+        "domain_relations",
         "activity_relations",
         "associations",
         "agents",

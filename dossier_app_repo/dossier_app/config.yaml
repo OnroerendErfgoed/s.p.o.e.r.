@@ -1,6 +1,13 @@
 database:
   url: "postgresql+asyncpg://dossier:dossier@127.0.0.1:5432/dossiers"
 
+# IRI namespace used to mint PROV entity/activity/agent IRIs and to
+# classify domain-relation refs as platform vs external. Change this
+# to your organisation's namespace before deploying.
+iri_base:
+  dossier: "https://id.erfgoed.net/dossiers/"
+  ontology: "https://id.erfgoed.net/vocab/ontology#"
+
 plugins:
   - dossier_toelatingen
 
@@ -34,3 +41,17 @@ global_access:
   - role: "beheerder"
     view: "all"
     activity_view: "all"
+
+# Audit-level access — roles that may view the full, unfiltered
+# provenance record (PROV-JSON export, columns graph, archive PDF).
+# Role-only (no per-agent grant). Default-deny: users without a
+# matching role here or in a dossier's audit_access list get 403.
+global_audit_access:
+  - "beheerder"
+
+# Admin-level access — roles that may run destructive / bulk
+# operations (search index recreate, reindex). Strict superset of
+# who should be allowed to reshape the cluster. Role-only, no
+# per-dossier grant — these are purely operational powers.
+global_admin_access:
+  - "beheerder"
