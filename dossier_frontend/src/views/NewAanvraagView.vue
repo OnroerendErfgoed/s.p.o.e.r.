@@ -115,7 +115,14 @@ async function submit() {
   };
 
   try {
-    await executeActivity(dossierId, activityId, "dienAanvraagIn", body);
+    // dienAanvraagIn is the kick-off activity for a brand-new
+    // toelatingen dossier — workflow is known at this point because
+    // this view only handles toelatingen applications. Activity type
+    // is qualified with the plugin prefix (oe:…) to match the
+    // engine's route scheme.
+    await executeActivity(
+      "toelatingen", dossierId, activityId, "oe:dienAanvraagIn", body,
+    );
     // On success, jump to the detail view for the new dossier.
     router.push(`/dossiers/${dossierId}`);
   } catch (e) {

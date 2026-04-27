@@ -96,6 +96,7 @@ async function submit() {
 
   try {
     await executeActivity(
+      props.dossier.workflow,
       props.dossier.id,
       activityId,
       props.activityType,

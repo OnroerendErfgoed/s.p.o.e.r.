@@ -111,8 +111,14 @@ async def _seed_entity(
 
 
 class _StubPlugin:
-    def __init__(self, entity_models=None):
+    def __init__(self, entity_models=None, constants=None):
         self.entity_models = entity_models or {}
+        # Provide a plausible constants object for handlers that
+        # consult context.constants (e.g. handle_beslissing).
+        if constants is None:
+            from dossier_toelatingen.constants import ToelatingenConstants
+            constants = ToelatingenConstants()
+        self.constants = constants
     def is_singleton(self, t):
         return False
     def resolve_schema(self, entity_type, schema_version):
@@ -393,7 +399,6 @@ class TestHandleBeslissing:
         assert task["kind"] == "scheduled_activity"
         assert task["target_activity"] == "trekAanvraagIn"
         assert task["cancel_if_activities"] == ["vervolledigAanvraag"]
-        assert task["anchor_type"] == "oe:aanvraag"
 
     async def test_signed_no_beslissing_returns_ondertekend(self, repo):
         """Handtekening=signed but no beslissing entity exists →

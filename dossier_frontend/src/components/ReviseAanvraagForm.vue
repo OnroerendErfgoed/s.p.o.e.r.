@@ -30,14 +30,15 @@ const error = ref(null);
 
 // Copy that depends on which activity we're driving. Kept as a
 // lookup table rather than if/else so the symmetry is obvious.
+// Keys are qualified activity types as emitted by the engine.
 const COPY = {
-  bewerkAanvraag: {
+  "oe:bewerkAanvraag": {
     intro: "Bewerk de aanvraag. Een nieuwe versie wordt gegenereerd met een verwijzing (derivedFrom) naar de huidige versie.",
     submitButton: "Opslaan",
     submittingButton: "Bezig …",
     successMsg: "Aanvraag bewerkt.",
   },
-  vervolledigAanvraag: {
+  "oe:vervolledigAanvraag": {
     intro: "Vervolledig je aanvraag met de ontbrekende informatie. Na indiening wordt de aanvraag opnieuw voorgelegd aan de behandelaar.",
     submitButton: "Opnieuw indienen",
     submittingButton: "Bezig …",
@@ -45,7 +46,7 @@ const COPY = {
   },
 };
 
-const copy = computed(() => COPY[props.activityType] ?? COPY.bewerkAanvraag);
+const copy = computed(() => COPY[props.activityType] ?? COPY["oe:bewerkAanvraag"]);
 
 // Find the current aanvraag entity. The backend guarantees there
 // is at most one per dossier (it's declared `singleton: true`).
@@ -116,6 +117,7 @@ async function submit() {
 
   try {
     await executeActivity(
+      props.dossier.workflow,
       props.dossier.id,
       activityId,
       props.activityType,

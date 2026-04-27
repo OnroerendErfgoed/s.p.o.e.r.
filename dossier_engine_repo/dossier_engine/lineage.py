@@ -25,12 +25,42 @@ Semantics:
   an entity of `target_type`.
 * Returns the match if exactly one distinct `entity_id` of that type
   appears at a visited activity.
-* Returns None on ambiguity (multiple distinct entity_ids of the
-  target type at one activity) — the caller must disambiguate.
-* Returns None if the start entity is a root (no generating activity
-  to walk from) or if the max_hops budget is exhausted.
-* Returns the start entity itself if `start_entity.type == target_type`
+* **Raises `LineageAmbiguous`** (Bug 54) if multiple distinct
+  ``entity_id`` values of the target type appear at one activity.
+  Ambiguity is a structural/data signal, not a normal "no result"
+  outcome — the caller must decide whether to log-and-skip or
+  propagate. Before Bug 54's fix, the walker returned ``None`` for
+  both ambiguity and not-found, making the two cases indistinguishable
+  at the callsite (and invisible to operators).
+* Returns ``None`` in all "no result" cases: start entity is a root
+  (no generating activity to walk from), frontier exhausted without
+  finding the target type, ``max_hops`` budget exhausted, or
+  ``start_entity.generated_by`` is ``None``. These three outcomes all
+  mean the same thing to a caller — "no anchor available for this
+  task" — so they share a return value. If a caller needs to
+  distinguish them, extend the API with a reason code rather than
+  asking callers to peek at internals.
+* Returns the start entity itself if ``start_entity.type == target_type``
   (trivial case, no walk needed).
+
+Frontier management (Bug 53):
+
+* The frontier is a **set** — activities appended through multiple
+  paths in one hop are deduplicated, bounding memory even for
+  high-fan-in PROV graphs (many activities using entities generated
+  by a common ancestor). Already-visited activities are skipped at
+  append time, so frontier growth is bounded by "activities not yet
+  visited" rather than by "paths taken through the graph."
+
+**Intra-dossier by construction.** The walker refuses to traverse
+any activity whose `dossier_id` differs from the `dossier_id`
+argument. In normal operation this never triggers — PROV edges
+are created within a single dossier scope — but the check is
+defense-in-depth against data integrity violations or PROV
+manipulation that would otherwise let the walker leak a
+confirmation signal about another dossier's activity graph.
+Cross-dossier references (`informed_by_uri`) are separately
+not walkable from within one repository scope.
 """
 
 from __future__ import annotations
@@ -39,6 +69,39 @@ from typing import Optional
 from uuid import UUID
 
 from .db.models import EntityRow, Repository
+
+
+class LineageAmbiguous(Exception):
+    """Raised by :func:`find_related_entity` when a visited activity
+    touches more than one distinct ``entity_id`` of the target type.
+
+    Carries the list of candidate ``entity_id`` values and the
+    ``activity_id`` at which the ambiguity was detected, so callers
+    (or operators triaging a log line) can identify which data
+    structure caused the ambiguity.
+
+    Before Bug 54 (Round 25), ambiguity and "no match found" both
+    returned ``None``, making the two indistinguishable at callsites.
+    This exception exists so callers can decide: a ``trekAanvraagIn``
+    task builder might log-and-skip (producing an unanchored task),
+    while a stricter caller might propagate to fail the activity.
+    """
+
+    def __init__(
+        self,
+        *,
+        activity_id: UUID,
+        target_type: str,
+        candidate_entity_ids: list[UUID],
+    ) -> None:
+        self.activity_id = activity_id
+        self.target_type = target_type
+        self.candidate_entity_ids = candidate_entity_ids
+        super().__init__(
+            f"Lineage walk found {len(candidate_entity_ids)} distinct "
+            f"entities of type {target_type!r} at activity "
+            f"{activity_id}: {candidate_entity_ids}"
+        )
 
 
 async def find_related_entity(
@@ -51,7 +114,12 @@ async def find_related_entity(
 ) -> Optional[EntityRow]:
     """Find an entity of `target_type` related to `start_entity` by
     walking the activity graph backwards. See module docstring for
-    semantics."""
+    semantics.
+
+    :raises LineageAmbiguous: if a visited activity touches more than
+        one distinct ``entity_id`` of the target type. See the
+        exception's docstring for context.
+    """
     if start_entity.type == target_type:
         return start_entity
 
@@ -60,17 +128,50 @@ async def find_related_entity(
         return None
 
     visited_activities: set[UUID] = set()
-    frontier: list[UUID] = [start_entity.generated_by]
+    frontier: set[UUID] = {start_entity.generated_by}
 
     for _ in range(max_hops):
         if not frontier:
             return None
 
-        next_frontier: list[UUID] = []
+        # Bug 53: next_frontier is a set, and we only add activities
+        # we haven't already visited. This bounds frontier growth to
+        # "activities in this dossier we haven't processed yet" —
+        # in the worst case the count of activities in the dossier,
+        # not the count of paths through the graph. Without this,
+        # high-fan-in graphs (e.g. 50 activities using an entity
+        # generated by activity A) put A in next_frontier 50 times
+        # on one hop; further iterations compound.
+        next_frontier: set[UUID] = set()
         for activity_id in frontier:
             if activity_id in visited_activities:
                 continue
             visited_activities.add(activity_id)
+
+            # Defense-in-depth: refuse to traverse activities from a
+            # different dossier. In normal operation the walker never
+            # encounters one — entity and activity rows are always
+            # created within a single dossier scope — but if a data
+            # integrity violation, PROV manipulation, or future refactor
+            # bug ever produced a cross-dossier edge, the walker would
+            # traverse into it and (at best) waste queries checking
+            # entities we'd never return, (at worst) leak a confirmation
+            # signal about another dossier's activity graph. Failing
+            # closed at the activity level — not just at the final
+            # ``get_latest_entity_by_id(dossier_id, ...)`` scope check
+            # (line below) — keeps the walker intra-dossier by
+            # construction, not by post-hoc filter.
+            #
+            # Concretely: ``get_entities_generated_by_activity`` and
+            # ``get_used_entities_for_activity`` are activity-id-only
+            # queries (see their docstrings — "caller is responsible
+            # for scoping to a known dossier"). This is the caller
+            # that the docstring contract is about.
+            activity_row = await repo.get_activity(activity_id)
+            if activity_row is None:
+                continue
+            if activity_row.dossier_id != dossier_id:
+                continue
 
             # What did this activity touch? generated + used.
             generated = await repo.get_entities_generated_by_activity(activity_id)
@@ -83,24 +184,42 @@ async def find_related_entity(
                 entity_ids = {e.entity_id for e in candidates}
                 if len(entity_ids) == 1:
                     # Return the current latest version of this entity_id.
+                    # The scope check above means this query is guaranteed
+                    # to be for an entity in ``dossier_id`` — the
+                    # ``dossier_id`` argument here is belt-and-braces,
+                    # not the primary defense.
                     return await repo.get_latest_entity_by_id(
                         dossier_id, candidates[0].entity_id,
                     )
-                return None  # ambiguous at this activity
+                # Bug 54: raise, don't silently return None. Ambiguity
+                # at a single activity is a structural signal (the
+                # PROV graph says "this activity touched two different
+                # aanvragen" or similar) — squashing it to None hid
+                # the distinction between "no anchor available" and
+                # "multiple candidate anchors, refusing to guess."
+                raise LineageAmbiguous(
+                    activity_id=activity_id,
+                    target_type=target_type,
+                    candidate_entity_ids=sorted(entity_ids),
+                )
 
             # No match here — expand the frontier backwards.
             # (a) Through each used entity's generating activity.
+            #     Skip activities already visited to keep the frontier
+            #     bounded (Bug 53).
             for used_entity in used:
-                if used_entity.generated_by is not None:
-                    next_frontier.append(used_entity.generated_by)
+                gen_by = used_entity.generated_by
+                if gen_by is not None and gen_by not in visited_activities:
+                    next_frontier.add(gen_by)
             # (b) Through the informed_by chain — only same-dossier.
             # Cross-dossier references (informed_by_uri) can't be walked
             # from within one repository scope; the lineage walker is
-            # intra-dossier by design.
-            activity_row = await repo.get_activity(activity_id)
-            if (activity_row is not None
-                    and activity_row.informed_by_activity_id is not None):
-                next_frontier.append(activity_row.informed_by_activity_id)
+            # intra-dossier by design. The dossier-scope check at the
+            # top of the loop will reject any informed_by_activity_id
+            # that somehow points cross-dossier.
+            informed_by = activity_row.informed_by_activity_id
+            if informed_by is not None and informed_by not in visited_activities:
+                next_frontier.add(informed_by)
 
         frontier = next_frontier
 

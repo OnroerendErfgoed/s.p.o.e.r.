@@ -2,6 +2,29 @@ name: "toelatingen"
 description: "Toelatingen beschermd erfgoed"
 version: "0.1"
 
+# Workflow constants — accessible from handlers via context.constants
+# and from hooks via plugin.constants. Precedence: env vars
+# (DOSSIER_TOELATINGEN_*) > this block > class defaults in
+# dossier_toelatingen/constants.py. The Pydantic class is the
+# authoritative schema; values here override its defaults.
+constants:
+  values:
+    # Example: tune the aanvraag deadline for this deployment without
+    # touching the Pydantic class. Uncomment to override.
+    # aanvraag_deadline_days: 60
+    # auto_approve_enabled: true
+
+# Namespace prefixes used in this workflow's entity types, relations,
+# and PROV output. ``oe:`` is pre-registered from config.yaml's
+# iri_base.ontology. Add any external vocabularies here to use them
+# in entity types (e.g. ``foaf:Person``) or relation types.
+# Built-in prefixes (prov, xsd, rdf, rdfs) are always available.
+namespaces:
+  # Example — uncomment to adopt an external ontology:
+  # foaf: "http://xmlns.com/foaf/0.1/"
+  # dcterms: "http://purl.org/dc/terms/"
+  # schema: "http://schema.org/"
+
 roles:
   - name: "oe:aanvrager"
     description: "Aanvrager van de toelating"
@@ -124,6 +147,76 @@ authorization:
 tombstone:
   allowed_roles: ["beheerder"]
 
+# Built-in exception-grant activities. The engine registers
+# `grantException`, `retractException`, and `consumeException` for
+# every workflow that opts in here; `grant_allowed_roles` and
+# `retract_allowed_roles` declare which roles may call them (consume
+# is system-only and always system-authorized). Absent block =
+# exceptions not registered for this workflow (deny by default, same
+# convention as tombstone).
+exceptions:
+  grant_allowed_roles: ["beheerder"]
+  retract_allowed_roles: ["beheerder"]
+
+# Static reference data served via GET /{workflow}/reference/{list_name}.
+# Loaded into memory at startup, sub-millisecond response, no DB hit.
+reference_data:
+
+  bijlagetypes:
+    - key: "detailplan"
+      label: "Detailplan"
+    - key: "foto"
+      label: "Foto"
+    - key: "inplantingsplan"
+      label: "Inplantingsplan"
+    - key: "motivatienota"
+      label: "Motivatienota"
+    - key: "vergunning"
+      label: "Vergunning eerder verleend"
+    - key: "overig"
+      label: "Overig"
+
+  handelingen:
+    - key: "renovatie"
+      label: "Renovatie"
+    - key: "restauratie"
+      label: "Restauratie"
+    - key: "sloop_deel"
+      label: "Gedeeltelijke sloop"
+    - key: "sloop_volledig"
+      label: "Volledige sloop"
+    - key: "nieuwbouw"
+      label: "Nieuwbouw in beschermd gebied"
+    - key: "herbestemming"
+      label: "Herbestemming"
+    - key: "onderhoud"
+      label: "Onderhoud en instandhouding"
+
+  beslissingstypes:
+    - key: "goedgekeurd"
+      label: "Goedgekeurd"
+    - key: "goedgekeurd_voorwaarden"
+      label: "Goedgekeurd met voorwaarden"
+    - key: "afgekeurd"
+      label: "Afgekeurd"
+
+  gemeenten:
+    - key: "brugge"
+      label: "Brugge"
+      nis_code: "31005"
+    - key: "gent"
+      label: "Gent"
+      nis_code: "44021"
+    - key: "antwerpen"
+      label: "Antwerpen"
+      nis_code: "11002"
+    - key: "leuven"
+      label: "Leuven"
+      nis_code: "24062"
+    - key: "mechelen"
+      label: "Mechelen"
+      nis_code: "12025"
+
 # Workflow-wide PROV-extension relations. Any activity in this workflow may
 # emit these on its request body unless it overrides the list with its own
 # `relations:` block. Each entry declares a relation type and the plugin
@@ -131,11 +224,48 @@ tombstone:
 # semantics if no validator is registered).
 relations:
   - type: "oe:neemtAkteVan"
+    kind: "process_control"
     description: >
       Acknowledges that the client is aware of a newer version of an entity
       it used, and has chosen to proceed with the older version anyway. The
       engine rejects an activity whose `used` block references a stale
       entity version unless every intervening newer version is listed here.
+
+  - type: "oe:betreft"
+    kind: "domain"
+    from_types: ["entity"]
+    to_types: ["external_uri"]
+    description: >
+      Links an entity to the external object it concerns (e.g. an aanvraag
+      to an erfgoedobject in the inventaris).
+
+  - type: "oe:valtOnder"
+    kind: "domain"
+    from_types: ["entity"]
+    to_types: ["external_uri"]
+    description: >
+      Legal basis classification — links a beslissing to the applicable
+      legal article or regulation.
+
+  - type: "oe:gerelateerd_aan"
+    kind: "domain"
+    from_types: ["dossier"]
+    to_types: ["dossier"]
+    description: >
+      Cross-dossier relation — links this dossier to another related dossier.
+
+# =====================================================================
+# Field-level validators
+# =====================================================================
+# Exposed as POST /{workflow}/validate/{url_key}. Unlike the other seven
+# Callable registries, the key stays a short user-facing string because
+# it's part of the HTTP URL — but resolution still uses dotted paths so
+# misconfiguration fails at plugin load, not at first-request time
+# (Obs 95 / Round 28).
+
+field_validators:
+  erfgoedobject: "dossier_toelatingen.field_validators.erfgoedobject"
+  handeling: "dossier_toelatingen.field_validators.handeling"
 
 activities:
 
@@ -166,7 +296,7 @@ activities:
     status: "ingediend"
 
     validators:
-      - name: "valideer_indiening"
+      - name: "dossier_toelatingen.validators.valideer_indiening"
         description: "Valideert de aanvraag bij indiening"
 
     side_effects:
@@ -175,9 +305,13 @@ activities:
 
     tasks:
       - kind: "recorded"
-        function: "move_bijlagen_to_permanent"
+        function: "dossier_toelatingen.tasks.move_bijlagen_to_permanent"
       - kind: "recorded"
-        function: "send_ontvangstbevestiging"
+        function: "dossier_toelatingen.tasks.send_ontvangstbevestiging"
+
+    relations:
+      - type: "oe:betreft"
+        operations: [add]
 
   - name: "bewerkAanvraag"
     label: "Bewerk aanvraag"
@@ -208,7 +342,7 @@ activities:
     status: "ingediend"
 
     validators:
-      - name: "valideer_indiening"
+      - name: "dossier_toelatingen.validators.valideer_indiening"
         description: "Valideert de bewerkte aanvraag"
 
     side_effects:
@@ -217,7 +351,7 @@ activities:
 
     tasks:
       - kind: "recorded"
-        function: "move_bijlagen_to_permanent"
+        function: "dossier_toelatingen.tasks.move_bijlagen_to_permanent"
 
   - name: "vervolledigAanvraag"
     label: "Vervolledig aanvraag"
@@ -253,7 +387,7 @@ activities:
     status: "ingediend"
 
     validators:
-      - name: "valideer_indiening"
+      - name: "dossier_toelatingen.validators.valideer_indiening"
         description: "Valideert de vervolledigde aanvraag"
 
     side_effects:
@@ -262,9 +396,9 @@ activities:
 
     tasks:
       - kind: "recorded"
-        function: "move_bijlagen_to_permanent"
+        function: "dossier_toelatingen.tasks.move_bijlagen_to_permanent"
       - kind: "recorded"
-        function: "send_ontvangstbevestiging"
+        function: "dossier_toelatingen.tasks.send_ontvangstbevestiging"
 
   - name: "doeVoorstelBeslissing"
     label: "Doe voorstel beslissing"
@@ -298,6 +432,7 @@ activities:
     side_effects: []
     relations:
       - type: "oe:neemtAkteVan"
+        validator: "dossier_toelatingen.relation_validators.validate_neemt_akte_van"
     tasks: []
 
   - name: "tekenBeslissing"
@@ -308,7 +443,13 @@ activities:
     allowed_roles: ["oe:ondertekenaar"]
     default_role: "oe:ondertekenaar"
 
-    handler: "handle_beslissing"
+    # Split-style hooks: status comes from the named resolver,
+    # tasks from the named builder(s). No handler — this activity
+    # doesn't compute entity content beyond what the client submits
+    # (the handtekening), so no handler is needed.
+    status_resolver: "dossier_toelatingen.handlers.resolve_beslissing_status"
+    task_builders:
+      - "dossier_toelatingen.handlers.schedule_trekAanvraag_if_onvolledig"
 
     authorization:
       access: "roles"
@@ -336,6 +477,7 @@ activities:
     side_effects: []
     relations:
       - type: "oe:neemtAkteVan"
+        validator: "dossier_toelatingen.relation_validators.validate_neemt_akte_van"
     tasks: []
 
   - name: "neemBeslissing"
@@ -346,7 +488,12 @@ activities:
     allowed_roles: ["oe:verantwoordelijke_organisatie"]
     default_role: "oe:verantwoordelijke_organisatie"
 
-    handler: "handle_beslissing"
+    # Split-style hooks (same as tekenBeslissing — the status and
+    # task logic are identical whether the beslissing is taken
+    # directly or triggered via tekenBeslissing).
+    status_resolver: "dossier_toelatingen.handlers.resolve_beslissing_status"
+    task_builders:
+      - "dossier_toelatingen.handlers.schedule_trekAanvraag_if_onvolledig"
 
     authorization:
       access: "roles"
@@ -378,9 +525,10 @@ activities:
     side_effects: []
     relations:
       - type: "oe:neemtAkteVan"
+        validator: "dossier_toelatingen.relation_validators.validate_neemt_akte_van"
     tasks:
       - kind: "recorded"
-        function: "log_beslissing_genomen"
+        function: "dossier_toelatingen.tasks.log_beslissing_genomen"
 
   - name: "trekAanvraagIn"
     label: "Trek aanvraag in"
@@ -424,7 +572,7 @@ activities:
     can_create_dossier: false
     client_callable: false
     default_role: "systeem"
-    handler: "set_dossier_access"
+    handler: "dossier_toelatingen.handlers.set_dossier_access"
 
     authorization:
       access: "roles"
@@ -451,7 +599,7 @@ activities:
     can_create_dossier: false
     client_callable: false
     default_role: "systeem"
-    handler: "set_verantwoordelijke_organisatie"
+    handler: "dossier_toelatingen.handlers.set_verantwoordelijke_organisatie"
 
     authorization:
       access: "roles"
@@ -480,7 +628,7 @@ activities:
       - activity: "setDossierAccess"
     tasks:
       - kind: "recorded"
-        function: "log_organisatie_aangeduid"
+        function: "dossier_toelatingen.tasks.log_organisatie_aangeduid"
 
   - name: "duidBehandelaarAan"
     label: "Duid behandelaar aan"
@@ -488,7 +636,7 @@ activities:
     can_create_dossier: false
     client_callable: false
     default_role: "systeem"
-    handler: "duid_behandelaar_aan"
+    handler: "dossier_toelatingen.handlers.duid_behandelaar_aan"
 
     authorization:
       access: "roles"
@@ -517,7 +665,7 @@ activities:
     side_effects: []
     tasks:
       - kind: "recorded"
-        function: "send_behandelaar_notificatie"
+        function: "dossier_toelatingen.tasks.send_behandelaar_notificatie"
 
   - name: "setSystemFields"
     label: "Stel systeemvelden in"
@@ -525,7 +673,7 @@ activities:
     can_create_dossier: false
     client_callable: false
     default_role: "systeem"
-    handler: "set_system_fields"
+    handler: "dossier_toelatingen.handlers.set_system_fields"
 
     authorization:
       access: "roles"
@@ -615,6 +763,39 @@ activities:
         allowed_versions: ["v2"]
 
     status: null
+    validators: []
+    side_effects: []
+    tasks: []
+
+  - name: "bewerkRelaties"
+    label: "Bewerk dossierrelaties"
+    description: "Voeg relaties toe of verwijder ze. Wijzigt geen entiteiten of dossierstatus."
+    can_create_dossier: false
+
+    allowed_roles: ["oe:behandelaar"]
+    default_role: "oe:behandelaar"
+
+    authorization:
+      access: "roles"
+      roles:
+        - role: "behandelaar"
+        - role: "beheerder"
+
+    # No status requirements — available at any point in the lifecycle.
+    requirements: {}
+
+    used: []
+    generates: []
+    status: null
+
+    relations:
+      - type: "oe:betreft"
+        operations: [add, remove]
+      - type: "oe:valtOnder"
+        operations: [add, remove]
+      - type: "oe:gerelateerd_aan"
+        operations: [add, remove]
+
     validators: []
     side_effects: []
     tasks: []

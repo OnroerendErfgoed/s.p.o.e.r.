@@ -43,14 +43,20 @@ export async function getDossier(id) {
   return handle(r);
 }
 
-export async function executeActivity(dossierId, activityId, activityType, body) {
-  // Typed endpoint: /dossiers/{id}/activities/{id}/{activity_type}
-  // The engine has both a generic endpoint (requires `type` in body)
-  // and a typed endpoint per activity. We use the typed one — it's
-  // self-documenting in the OpenAPI spec and matches the pattern
-  // test_requests.sh uses.
+export async function executeActivity(workflow, dossierId, activityId, activityType, body) {
+  // Workflow-scoped typed endpoint:
+  //   PUT /{workflow}/dossiers/{did}/activities/{aid}/{activity_type}
+  //
+  // The engine dropped the workflow-agnostic typed endpoint in favor
+  // of per-workflow routing — each plugin owns its own activity
+  // namespace. The workflow name comes from the dossier itself
+  // (`dossier.workflow` in the GET response).
+  //
+  // Activity types are qualified with the plugin's prefix
+  // ("oe:dienAanvraagIn"), which we pass through verbatim — the
+  // URL-encoded colon survives fine in practice.
   const r = await fetch(
-    `/api/dossiers/${dossierId}/activities/${activityId}/${activityType}`,
+    `/api/${workflow}/dossiers/${dossierId}/activities/${activityId}/${activityType}`,
     { method: "PUT", headers: apiHeaders(), body: JSON.stringify(body) }
   );
   return handle(r);

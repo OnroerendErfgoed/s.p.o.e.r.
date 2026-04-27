@@ -54,7 +54,7 @@ import pytest
 from dossier_engine.auth import User
 from dossier_engine.db.models import Repository, AssociationRow
 from dossier_engine.engine.context import HandlerResult
-from dossier_engine.engine.pipeline._identity import (
+from dossier_engine.engine.pipeline._helpers.identity import (
     resolve_handler_generated_identity, ResolvedIdentity,
 )
 from dossier_engine.engine.pipeline.handlers import run_handler

@@ -4,17 +4,15 @@ entity lookup functions they depend on:
 
 * `process_tasks` — the top-level task scheduling phase
 * `_fire_and_forget` — inline task handler invocation
-* `_resolve_anchor` — anchor entity_id resolution for scheduled tasks
 * `resolve_from_trigger` / `resolve_from_prefetched` — the entity
-  lookup used by anchor auto-fill and side-effect resolution
+  lookup used by side-effect resolution
 * `lookup_singleton` — the cardinality-enforcing singleton lookup
 
 `_schedule_recorded_task` isn't tested directly because it's a
-thin wrapper that composes `_resolve_anchor` + `_supersede_matching`
-+ `repo.create_entity`. Both the resolve and supersede halves are
-covered in detail elsewhere (`test_task_supersede.py` for supersede,
-the anchor classes below for resolve), and the persistence half is
-just a `create_entity` call. The effective coverage of the wrapper
+thin wrapper that composes `_supersede_matching` +
+`repo.create_entity`. The supersede half is covered in detail in
+`test_task_supersede.py`, and the persistence half is just a
+`create_entity` call. The effective coverage of the wrapper
 comes from the `process_tasks` end-to-end tests that verify a task
 gets written with the right content.
 """
@@ -27,20 +25,18 @@ import pytest
 
 from dossier_engine.db.models import Repository, AssociationRow
 from dossier_engine.engine.context import HandlerResult
-from dossier_engine.engine.errors import ActivityError, CardinalityError
+from dossier_engine.engine.errors import CardinalityError
 from dossier_engine.engine.lookups import (
     lookup_singleton, resolve_from_trigger, resolve_from_prefetched,
 )
 from dossier_engine.engine.pipeline.tasks import (
-    process_tasks, _fire_and_forget, _resolve_anchor,
+    process_tasks, _fire_and_forget,
 )
 from dossier_engine.engine.state import ActivityState, Caller
 from dossier_engine.auth import User
 
 
 D1 = UUID("11111111-1111-1111-1111-111111111111")
-ANCHOR_A = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
-ANCHOR_B = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 
 
 def _user() -> User:
@@ -236,78 +232,6 @@ class TestFireAndForget:
 
 
 # --------------------------------------------------------------------
-# _resolve_anchor
-# --------------------------------------------------------------------
-
-
-class TestResolveAnchor:
-
-    async def test_handler_override_passes_through(self, repo):
-        """When task_def carries `anchor_entity_id` directly (e.g.
-        from a handler that computed it), that value is used
-        verbatim without any DB lookup."""
-        state = _state(repo)
-        task_def = {
-            "anchor_type": "oe:aanvraag",
-            "anchor_entity_id": str(ANCHOR_A),
-        }
-        result = await _resolve_anchor(state, task_def)
-        assert result == ANCHOR_A
-
-    async def test_no_anchor_type_returns_none(self, repo):
-        """task_def has neither `anchor_type` nor explicit
-        `anchor_entity_id` → the task is global-scope, anchor is
-        None, no lookup attempted."""
-        state = _state(repo)
-        result = await _resolve_anchor(state, {})
-        assert result is None
-
-    async def test_auto_resolve_from_trigger_generated(self, repo):
-        """task_def declares `anchor_type: oe:aanvraag`. The
-        triggering activity generated one oe:aanvraag entity.
-        The resolver finds it and returns its entity_id."""
-        await _bootstrap(repo)
-        # Create a triggering activity that generated an oe:aanvraag
-        trigger_act = await _persist_triggering_activity(repo, "dienAanvraagIn")
-        target_eid, _ = await _seed_entity(
-            repo, trigger_act, "oe:aanvraag",
-        )
-
-        state = _state(
-            repo,
-            activity_id=trigger_act,
-            activity_def={"name": "dienAanvraagIn"},
-        )
-        task_def = {"anchor_type": "oe:aanvraag"}
-
-        result = await _resolve_anchor(state, task_def)
-        assert result == target_eid
-
-    async def test_auto_resolve_raises_500_when_no_entity(self, repo):
-        """task_def demands an anchor but the triggering activity
-        didn't touch any entity of that type. 500 — workflow
-        misconfiguration."""
-        await _bootstrap(repo)
-        trigger_act = await _persist_triggering_activity(repo, "someActivity")
-
-        state = _state(
-            repo,
-            activity_id=trigger_act,
-            activity_def={"name": "someActivity"},
-        )
-        task_def = {
-            "anchor_type": "oe:aanvraag",
-            "target_activity": "herinnerAanvrager",
-        }
-
-        with pytest.raises(ActivityError) as exc:
-            await _resolve_anchor(state, task_def)
-        assert exc.value.status_code == 500
-        assert "Cannot resolve anchor" in str(exc.value)
-        assert "oe:aanvraag" in str(exc.value)
-
-
-# --------------------------------------------------------------------
 # process_tasks top-level
 # --------------------------------------------------------------------
 
@@ -323,9 +247,8 @@ class TestProcessTasks:
         assert rows == []
 
     async def test_yaml_task_persisted(self, repo):
-        """A YAML-declared scheduled_activity task with no anchor
-        gets written as a system:task entity with the right
-        content."""
+        """A YAML-declared scheduled_activity task gets written as
+        a system:task entity with the right content."""
         await _bootstrap(repo)
         trigger_act = await _persist_triggering_activity(repo)
 
@@ -536,8 +459,8 @@ class TestResolveFromTrigger:
         entity of it. The resolver walks the second level and
         finds it. Returns the latest version (via
         get_latest_entity_by_id), not the version the trigger
-        actually consumed — that's by design, since anchor
-        resolution wants the current state, not the historical."""
+        actually consumed — that's by design, since callers want
+        the current state, not the historical."""
         await _bootstrap(repo)
         # Pre-seed an entity
         boot = await _persist_triggering_activity(repo, "bootstrap")

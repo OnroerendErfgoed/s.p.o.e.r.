@@ -70,6 +70,30 @@ The worker does NOT run migrations. It only connects to the database
 and expects the schema to already exist. Always start the API before
 the worker (or run `alembic upgrade head` manually first).
 
+### Migrations are append-only
+
+**Never edit a migration file that has ever been applied to a
+deployed environment.** Alembic tracks which revisions have run
+by hash in the `alembic_version` table. It does not compare
+content. If you mutate the body of an existing migration, the
+mutated form runs on fresh installs while older deployments —
+which already recorded the pre-mutation revision as "done" — will
+never re-run it. The result is two deployments with the same
+revision marker but divergent schemas, and the drift is invisible
+until something queries a column that exists in one install but
+not the other.
+
+If the schema needs to change, add a *new* migration file with a
+new revision ID. The `scripts/check_migrations_append_only.py`
+pre-commit guard enforces this: it rejects any diff that modifies
+or deletes an existing file under `alembic/versions/`.
+
+Before the first production deploy, this rule is relaxed — you
+can consolidate or refactor migrations freely because no
+`alembic_version` row exists yet in any deployment. After the
+first deploy, it's frozen. Treat that transition as a commitment
+to the current migration history.
+
 ### Manual migration commands
 
 ```bash
@@ -161,18 +185,24 @@ compatible ranges `>=0.1.0,<0.2.0`, the app pins strict `==0.1.0`):
 ┌──────────────────────────────────────────────────────────────┐
 │  Request pipeline — phase modules under engine/pipeline/:    │
 │  preconditions → authorization → used → disjoint invariant   │
-│  → generated (schema versioning) → relations → validators    │
-│  → tombstone shape → persistence → handler → side effects    │
-│  → tasks → finalization                                      │
+│  → generated (schema versioning) → relations (process-       │
+│  control + domain, IRI expansion) → validators → tombstone   │
+│  shape → persistence (incl. domain relation add/remove)      │
+│  → handler → side effects → tasks → finalization             │
 │                                                              │
 │  Route modules under routes/:                                │
-│  activities, dossiers, entities, files, access, prov         │
+│  activities, dossiers, entities, files, access, prov,        │
+│  reference (reference data + field validation)               │
+│  _activity_visibility (shared visibility logic)              │
 │                                                              │
 │  ✓ Single activity endpoint (PUT, idempotent)                │
 │  ✓ Batch endpoint (atomic multi-activity)                    │
+│  ✓ Workflow-scoped + workflow-agnostic URL families           │
 │  ✓ Authorization (direct, scoped, entity-derived)            │
-│  ✓ Workflow validation (requirements, forbidden, statuses)   │
-│  ✓ Activity-level relations opt-in + plugin validators       │
+│  ✓ Workflow validation (requirements, forbidden, deadlines)   │
+│  ✓ Process-control + domain relations (unified API)          │
+│  ✓ Per-operation relation validators (add/remove split)      │
+│  ✓ IRI expansion for domain relation refs                    │
 │  ✓ Schema versioning (per-activity new + allowed versions)   │
 │  ✓ Disjoint invariant (no overlap between used + generated)  │
 │  ✓ Tombstone redaction (NULL content, row survives)          │
@@ -181,9 +211,13 @@ compatible ranges `>=0.1.0,<0.2.0`, the app pins strict `==0.1.0`):
 │  ✓ Task system (4 types, entities with full PROV)            │
 │  ✓ Worker (polls for due tasks, executes atomically)         │
 │  ✓ Access control (dossier_access entity)                    │
+│  ✓ Activity visibility (own/related/all/combined modes)      │
 │  ✓ PROV-JSON export                                          │
 │  ✓ Interactive graph visualizations (timeline + columns)     │
 │  ✓ Search integration hooks (Elasticsearch)                  │
+│  ✓ Reference data endpoints (in-memory, sub-ms)              │
+│  ✓ Field validation endpoints (plugin-registered)            │
+│  ✓ Audit log (NDJSON → Wazuh SIEM)                           │
 │  ✓ Plugin interface                                          │
 │                                                              │
 │  No business logic. No domain-specific code.                 │
@@ -193,39 +227,62 @@ compatible ranges `>=0.1.0,<0.2.0`, the app pins strict `==0.1.0`):
 ### Plugin internals (under `dossier_toelatingen_repo/`)
 
 ```
-✓ workflow.yaml (activities, entities, roles, rules)
+✓ workflow.yaml (activities, entities, roles, rules, reference_data, relation_types)
 ✓ entities.py (Pydantic models — typed entity access)
 ✓ handlers/ (system activity logic, conditional tasks)
 ✓ relation_validators/ (activity-level relation semantics)
+✓ field_validators.py (lightweight validation between activities)
 ✓ validators/ (custom business rules)
 ✓ tasks/ (type 2 recorded task handlers)
 ✓ pre_commit_hooks (synchronous validation/side effects, can veto an activity)
 ✓ post_activity_hook (search index updates, advisory, exceptions swallowed)
-✓ search route (/dossiers/toelatingen/search)
+✓ search route (/{workflow}/dossiers)
 ```
 
 ## API Endpoints
 
+The API has two URL families: **workflow-scoped** routes (the workflow name is in the URL, no DB lookup needed to resolve the plugin) and **workflow-agnostic** routes (only a dossier UUID is needed; the engine resolves the workflow internally).
+
+### Workflow-scoped
+
 | Method | Path | Description |
 |---|---|---|
-| `PUT` | `/dossiers/{id}/activities/{id}/{type}` | Execute a typed activity |
+| `PUT` | `/{workflow}/dossiers/{id}/activities/{id}/{type}` | Execute a typed activity |
+| `PUT` | `/{workflow}/dossiers/{id}/activities/{id}` | Execute a generic activity |
+| `PUT` | `/{workflow}/dossiers/{id}/activities` | Execute batch activities atomically |
+| `GET` | `/{workflow}/dossiers` | Search workflow-specific index (fuzzy onderwerp, exact filters; ACL-filtered) |
+| `GET` | `/{workflow}/reference` | All reference data lists (sub-ms, in-memory) |
+| `GET` | `/{workflow}/reference/{list_name}` | Single reference data list |
+| `GET` | `/{workflow}/validate` | List available field validators |
+| `POST` | `/{workflow}/validate/{validator_name}` | Run a field-level validator |
+| `POST` | `/{workflow}/admin/search/recreate` | Drop + recreate workflow index (admin access) |
+| `POST` | `/{workflow}/admin/search/reindex` | Re-index workflow dossiers into workflow index (admin access) |
+| `POST` | `/{workflow}/admin/search/reindex-all` | Re-index workflow dossiers into workflow + common indices (admin access) |
+
+### Workflow-agnostic
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/dossiers` | Search common index (fuzzy onderwerp, exact workflow; ACL-filtered) |
+| `GET` | `/dossiers/{id}` | Get dossier detail (entities, activities, domain relations, filtered by access) |
 | `PUT` | `/dossiers/{id}/activities/{id}` | Execute a generic activity |
 | `PUT` | `/dossiers/{id}/activities` | Execute batch activities atomically |
-| `GET` | `/dossiers/{id}` | Get dossier detail (filtered by access) |
-| `GET` | `/dossiers` | List dossiers (stub) |
-| `GET` | `/dossiers/toelatingen/search` | Workflow-specific search (ES stub) |
 | `GET` | `/dossiers/{id}/entities/{type}` | All versions of an entity type |
 | `GET` | `/dossiers/{id}/entities/{type}/{eid}` | All versions of a logical entity |
 | `GET` | `/dossiers/{id}/entities/{type}/{eid}/{vid}` | Single entity version |
+| `GET` | `/dossiers/{id}/prov` | PROV-JSON export (audit access) |
+| `GET` | `/dossiers/{id}/prov/graph/timeline` | Timeline — user view (dossier access) |
+| `GET` | `/dossiers/{id}/prov/graph/columns` | Column layout — full record (audit access) |
+| `GET` | `/dossiers/{id}/archive` | PDF/A-3b archive — full record (audit access) |
+| `POST` | `/admin/search/common/recreate` | Drop + recreate common index (admin access) |
+| `POST` | `/admin/search/common/reindex` | Re-index every dossier into common (admin access) |
 | `POST` | `/files/upload/request` | Mint a signed upload URL for the file service |
-| `GET` | `/dossiers/{id}/prov` | PROV-JSON export |
-| `GET` | `/dossiers/{id}/prov/graph/timeline` | Timeline visualization |
-| `GET` | `/dossiers/{id}/prov/graph/columns` | Column layout visualization |
-| `GET` | `/dossiers/{id}/archive` | PDF/A-3b archive (self-contained, with embedded PROV-JSON and bijlagen) |
-| `GET` | `/health` | Liveness probe (always 200 if process is up) |
-| `GET` | `/health/ready` | Readiness probe (checks DB connection, 503 if down) |
+| `GET` | `/health` | Liveness probe |
+| `GET` | `/health/ready` | Readiness probe (checks DB) |
 
-Graph query parameters: `?include_system_activities=true`, `?include_tasks=true`
+Entity endpoint paths match the canonical IRI structure (`https://id.erfgoed.net/dossiers/{id}/entities/{type}/{eid}/{vid}`), so domain relation `from_ref` / `to_ref` values are directly resolvable as API URLs.
+
+**Access tiers:** the three endpoints marked "audit access" (`/prov`, `/prov/graph/columns`, `/archive`) require a role in `global_audit_access` (config.yaml) or the dossier's `audit_access` list. They return the complete unfiltered record — system activities, tasks, all entities — and are intended for auditors, compliance, and long-term preservation. The timeline endpoint (`/prov/graph/timeline`) uses ordinary dossier access and honors per-user filtering; it never shows system activities or tasks. No query-parameter toggles — behavior is determined by access tier.
 
 ### CORS
 
@@ -242,12 +299,11 @@ cors:
 ## Request Format
 
 ```bash
-# Create a dossier with dienAanvraagIn
-curl -X PUT http://localhost:8000/dossiers/{dossier_id}/activities/{activity_id}/dienAanvraagIn \
+# Create a dossier with dienAanvraagIn (workflow-scoped URL)
+curl -X PUT http://localhost:8000/toelatingen/dossiers/{dossier_id}/activities/{activity_id}/dienAanvraagIn \
   -H "Content-Type: application/json" \
   -H "X-POC-User: jan.aanvrager" \
   -d '{
-    "workflow": "toelatingen",
     "used": [
       { "entity": "https://id.erfgoed.net/erfgoedobjecten/10001" }
     ],
@@ -262,15 +318,25 @@ curl -X PUT http://localhost:8000/dossiers/{dossier_id}/activities/{activity_id}
           "object": "https://id.erfgoed.net/erfgoedobjecten/10001"
         }
       }
+    ],
+    "relations": [
+      {
+        "type": "oe:betreft",
+        "from": "oe:aanvraag/{entity_id}@{version_id}",
+        "to": "https://id.erfgoed.net/erfgoedobjecten/10001"
+      }
     ]
   }'
 ```
 
 Key concepts:
-- `workflow` — only needed for the first activity (creates the dossier)
+- `workflow` — only needed on the generic endpoint for the first activity (creates the dossier). On workflow-scoped URLs (`/{workflow}/dossiers/...`) it's inferred from the URL.
 - `used` — references to existing entities or external URIs (read-only)
 - `generated` — new entities with content (use `derivedFrom` for revisions). External URIs in `generated` don't need a `content` field; the engine auto-creates the external row.
-- `relations` — generic activity→entity links under a named type (e.g. `oe:neemtAkteVan`). The type must be declared in the activity's YAML relations block, and a plugin validator enforces the semantics.
+- `relations` — two kinds in one list:
+  - **Process-control** (activity→entity): `{"type": "oe:neemtAkteVan", "entity": "oe:aanvraag/X@v3"}` — the type must be declared in the activity's YAML. Plugin validators enforce semantics.
+  - **Domain** (entity→entity/URI): `{"type": "oe:betreft", "from": "oe:aanvraag/X@v1", "to": "https://..."}` — semantic links persisted in the `domain_relations` table. Shorthand refs (`oe:type/eid@vid`, `dossier:did`) are expanded to full IRIs before storage.
+- `remove_relations` — supersede existing domain relations: `{"type": "oe:betreft", "from": "oe:aanvraag/X@v1", "to": "https://..."}`. The engine sets `superseded_by_activity_id` on the matched row. Only allowed when the activity declares `operations: [remove]` for that type.
 - `informed_by` — optional, local UUID or cross-dossier URI
 - All IDs are client-generated UUIDs — PUTs are fully idempotent
 
@@ -293,7 +359,7 @@ Four types of tasks, all modeled as `system:task` entities with full PROV:
 | 3 | `scheduled_activity` | Worker executes an activity at a scheduled time |
 | 4 | `cross_dossier_activity` | Worker executes an activity in another dossier |
 
-Tasks can be defined statically in YAML or appended conditionally by handlers at runtime. Scheduled tasks can be anchored to an entity via `anchor_entity_id`/`anchor_type`, which lets the engine locate the anchored entity even when the triggering activity didn't directly touch it — crucial when `cancel_if_activities` cancels a task based on a later activity that doesn't share the original scope.
+Tasks can be defined statically in YAML or appended conditionally by handlers at runtime. Only one scheduled task of a given `target_activity` per dossier can be queued at a time — scheduling a second one supersedes the first (unless `allow_multiple: true`). Scheduled tasks declare `cancel_if_activities` to name activities whose execution should cancel the task before the worker picks it up.
 
 ### Worker
 
@@ -335,7 +401,7 @@ python -m dossier_engine.worker --requeue-dead-letters --task=<entity_uuid>
 python -m dossier_engine.worker --requeue-dead-letters --dossier=<uuid> --task=<entity_uuid>
 ```
 
-The requeue writes a fresh revision of each dead-lettered task with `status = "scheduled"`, `attempt_count = 0`, and `next_attempt_at = null`. The original `scheduled_for` is preserved as the historical record of when the task was first queued, and `last_attempt_at` is preserved so operators can still see when the task last tried. All other task content (function name, anchor, target_activity, etc.) is carried forward unchanged.
+The requeue writes a fresh revision of each dead-lettered task with `status = "scheduled"`, `attempt_count = 0`, and `next_attempt_at = null`. The original `scheduled_for` is preserved as the historical record of when the task was first queued, and `last_attempt_at` is preserved so operators can still see when the task last tried. All other task content (function name, target_activity, etc.) is carried forward unchanged.
 
 Each dossier's requeue is audited as a single `systemAction` activity that generates N task revisions plus one `system:note` explaining the scope and listing the requeued task entity_ids. Running `--requeue-dead-letters` once with 50 dead letters spread across 10 dossiers produces 10 audit entries, one per dossier, each listing the tasks requeued in that dossier. The systemAction is a first-class activity in the PROV graph — an auditor walking the dossier's history sees exactly when each requeue happened and which tasks were affected.
 
@@ -513,9 +579,278 @@ The question to ask: **if this hook fails, should the user see their activity su
 
 A flaky search index should not block users from submitting forms. A failed mandatory signature verification should.
 
+## Domain Relations
+
+Separate from PROV (which handles provenance — who did what when), domain relations capture semantic links between things: an aanvraag *concerns* an erfgoedobject, a beslissing *falls under* a legal article, one dossier *is related to* another.
+
+### Two kinds of relation, one API field
+
+The `relations` list on an activity request carries both:
+
+- **Process-control** (`oe:neemtAkteVan`): activity→entity, stored in `activity_relations`. The activity is one end of the relation.
+- **Domain** (`oe:betreft`, `oe:valtOnder`, `oe:gerelateerd_aan`): entity→entity/URI, stored in `domain_relations`. Neither end is the activity; the activity is the *provenance* of the relation.
+
+The engine distinguishes them by the `kind` field in the workflow YAML and by the request shape (`entity` for process-control, `from`+`to` for domain).
+
+### Ref formats and IRI expansion
+
+Domain relation endpoints accept shorthand refs for convenience. The engine expands them to full IRIs before storage via `expand_ref()` in `prov_iris.py`:
+
+| Shorthand | Expands to | Use case |
+|---|---|---|
+| `oe:type/eid@vid` | `https://id.erfgoed.net/dossiers/{current}/entities/oe:type/eid/vid` | Local entity |
+| `dossier:did/oe:type/eid@vid` | `https://id.erfgoed.net/dossiers/did/entities/oe:type/eid/vid` | Cross-dossier entity |
+| `dossier:did` | `https://id.erfgoed.net/dossiers/did/` | Dossier itself |
+| `https://...` | unchanged | External URI |
+
+`classify_ref()` determines the kind (entity, dossier, external_uri) from both shorthand and expanded forms.
+
+### Operations control
+
+Each activity declares which domain relation types it can add and/or remove:
+
+```yaml
+- name: dienAanvraagIn
+  relations:
+    - type: "oe:betreft"
+      kind: domain
+      operations: [add]           # can establish, can't remove
+
+- name: bewerkRelaties
+  relations:
+    - type: "oe:betreft"
+      kind: domain
+      operations: [add, remove]   # can do both
+```
+
+The engine rejects `remove_relations` entries for types where the activity only declares `[add]`.
+
+### Per-operation validators
+
+Relation validators can be split by operation:
+
+```yaml
+relations:
+  - type: "oe:betreft"
+    kind: domain
+    validators:
+      add: "validate_betreft_target"      # checks URI resolves
+      remove: "validate_betreft_removable" # checks no beslissing depends on it
+```
+
+Falls back to a single `validator:` string or the plugin-level `relation_validators[type]` if no per-operation split is declared.
+
+### Storage
+
+The `domain_relations` table stores every relation (active and superseded):
+
+| Column | Description |
+|---|---|
+| `relation_type` | e.g. `oe:betreft` |
+| `from_ref` | Full IRI of the source |
+| `to_ref` | Full IRI of the target |
+| `created_by_activity_id` | Which activity established this relation |
+| `superseded_by_activity_id` | Which activity removed it (NULL if active) |
+| `superseded_at` | When it was removed (NULL if active) |
+
+Active relations: `WHERE superseded_at IS NULL`. Full history is preserved — superseded rows stay for audit.
+
+### GET response
+
+`GET /dossiers/{id}` includes active domain relations:
+
+```json
+{
+  "domainRelations": [
+    {
+      "type": "oe:betreft",
+      "from": "https://id.erfgoed.net/dossiers/d1/entities/oe:aanvraag/e1/v1",
+      "to": "https://id.erfgoed.net/erfgoedobjecten/10001",
+      "createdBy": "a1000000-...",
+      "createdAt": "2026-04-17T10:00:00Z"
+    }
+  ]
+}
+```
+
+## Reference Data & Validation
+
+### Static reference data
+
+Workflow plugins declare reference lists in their `workflow.yaml`:
+
+```yaml
+reference_data:
+  bijlagetypes:
+    - key: "foto"
+      label: "Foto"
+    - key: "detailplan"
+      label: "Detailplan"
+  gemeenten:
+    - key: "brugge"
+      label: "Brugge"
+      nis_code: "31005"
+```
+
+Served from in-memory plugin config — no DB hit, sub-millisecond response:
+
+```
+GET /toelatingen/reference              → all lists in one call
+GET /toelatingen/reference/bijlagetypes → single list
+```
+
+Frontend caches aggressively; data only changes on deployment.
+
+### Field-level validation
+
+Plugins register lightweight async validators for checks that need server-side logic but shouldn't wait until activity submission:
+
+```python
+# In the plugin
+FIELD_VALIDATORS = {
+    "erfgoedobject": validate_erfgoedobject,
+    "handeling": validate_handeling,
+}
+plugin = Plugin(..., field_validators=FIELD_VALIDATORS)
+```
+
+Called between activities via POST:
+
+```
+POST /toelatingen/validate/erfgoedobject
+{"uri": "https://id.erfgoed.net/erfgoedobjecten/10001"}
+→ {"valid": true, "label": "Stadhuis Brugge", "type": "monument", "gemeente": "Brugge"}
+
+POST /toelatingen/validate/handeling
+{"erfgoedobject_uri": "https://...", "handeling": "sloop_deel"}
+→ {"valid": false, "error": "Handeling 'sloop_deel' is niet toegelaten voor type 'landschap'..."}
+
+GET /toelatingen/validate
+→ {"validators": ["erfgoedobject", "handeling"]}
+```
+
+No DB writes, no PROV records, no transaction — pure validation functions. The frontend calls these on blur/change for instant feedback.
+
+## Search (Elasticsearch)
+
+Dossier listing and search go through Elasticsearch, not Postgres. Two indices:
+
+- **`dossiers-common`** — one doc per dossier, every workflow. Fields: `dossier_id`, `workflow`, `onderwerp`, `__acl__`. Served at `GET /dossiers` with fuzzy match on `onderwerp` and exact filter on `workflow`.
+- **`dossiers-toelatingen`** — one doc per toelatingen dossier. Fields: `dossier_id`, `onderwerp`, `gemeente`, `beslissing`, `__acl__`. Served at `GET /toelatingen/dossiers` with fuzzy match on `onderwerp` and exact filters on `gemeente` and `beslissing`. Each workflow plugin owns its own specific index the same way.
+
+Both indices receive upserts after every activity via each plugin's `post_activity_hook`. When Elasticsearch is not configured, the hooks are silent no-ops (the activity still commits) and the search endpoints return empty results with an explanatory `reason` field — no Postgres fallback, deliberately. An index with no data is a configuration problem, not something to paper over.
+
+### ACL filtering
+
+Every indexed doc carries a flat `__acl__` list — role names and agent UUIDs concatenated from three sources:
+
+1. Per-dossier `access` entries in the `oe:dossier_access` entity (roles and agents)
+2. Per-dossier `audit_access` list on the same entity
+3. Global roles from `config.yaml`'s `global_access` block
+
+Every search query AND's in a `terms` filter that checks `__acl__` against `user.roles ∪ {user.id}`. Users see only dossiers they could also open directly via `GET /dossiers/{id}`. Global-access users (e.g. `beheerder`) see everything because their role is in every doc's `__acl__`.
+
+### Enabling Elasticsearch
+
+Set two environment variables before starting the app:
+
+```bash
+export DOSSIER_ES_URL="https://your-cluster.example.be:9200"
+export DOSSIER_ES_API_KEY="encoded-api-key-from-your-cluster"
+
+# Optional: disable for self-signed dev clusters
+export DOSSIER_ES_VERIFY_CERTS=false
+```
+
+The API key is used verbatim in the `Authorization: ApiKey <key>` header. Generate one in Kibana (Stack Management → Security → API keys) with permissions to read/write both indices. The URL and key should only come from env vars — never commit them to `config.yaml`.
+
+Add at least one role to `global_admin_access` in `config.yaml` so the admin endpoints are reachable:
+
+```yaml
+global_admin_access:
+  - "beheerder"
+```
+
+After setting env vars and restarting the app, create the indices and populate them:
+
+```bash
+# Create the dossiers-common index (drops first if it exists)
+curl -X POST http://localhost:8000/admin/search/common/recreate \
+  -H "X-POC-User: claeyswo"
+
+# Populate it from Postgres
+curl -X POST http://localhost:8000/admin/search/common/reindex \
+  -H "X-POC-User: claeyswo"
+
+# Same for the toelatingen-specific index
+curl -X POST http://localhost:8000/toelatingen/admin/search/recreate \
+  -H "X-POC-User: claeyswo"
+curl -X POST http://localhost:8000/toelatingen/admin/search/reindex \
+  -H "X-POC-User: claeyswo"
+
+# Convenience: toelatingen + common in one walk (both indices get
+# fresh docs for every toelatingen dossier)
+curl -X POST http://localhost:8000/toelatingen/admin/search/reindex-all \
+  -H "X-POC-User: claeyswo"
+```
+
+From then on, each activity's `post_activity_hook` keeps both indices in sync — no further manual reindexing needed unless the mapping changes.
+
+### Admin endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/admin/search/common/recreate` | Drop + recreate common index |
+| `POST` | `/admin/search/common/reindex` | Re-index every dossier into common |
+| `POST` | `/toelatingen/admin/search/recreate` | Drop + recreate toelatingen index |
+| `POST` | `/toelatingen/admin/search/reindex` | Re-index toelatingen dossiers (toelatingen index only) |
+| `POST` | `/toelatingen/admin/search/reindex-all` | Re-index toelatingen dossiers into both indices |
+
+All gated on `global_admin_access` (strict role check, default-deny on misconfiguration).
+
+### Three access tiers
+
+The platform now has three orthogonal role tiers in `config.yaml`:
+
+- **`global_access`** — day-to-day business views; controls dossier/entity visibility via `view`/`activity_view`. Also contributes to `__acl__` so these users find dossiers in search.
+- **`global_audit_access`** — full-record views (`/prov`, `/prov/graph/columns`, `/archive`). Role-only.
+- **`global_admin_access`** — destructive operations (recreate/reindex). Role-only. Default-deny if empty.
+
+They don't imply each other — a `beheerder` that appears in all three lists gets all three sets of powers explicitly. A role granted audit doesn't automatically get admin or vice versa.
+
+## Activity Visibility
+
+The `activity_view` setting on access entries controls which activities a user sees in the dossier timeline. Four input forms, all normalised to an `ActivityViewMode` dataclass by `parse_activity_view()`:
+
+| Form | Meaning |
+|---|---|
+| `"all"` | Every activity visible |
+| `"own"` | Only activities where the user is the PROV agent |
+| `["dienAanvraagIn", "neemBeslissing"]` | Only these activity types |
+| `{"mode": "own", "include": ["neemBeslissing"]}` | Combined: own activities plus named types regardless of agent |
+
+The combined dict form is useful for aanvragers who should see their own actions plus all decisions, even if someone else made them. The shared module `routes/_activity_visibility.py` provides `parse_activity_view()` and `is_activity_visible()`, used by both the dossier-detail and PROV endpoints via callback-based lookups (no code duplication).
+
+> **Round 31:** The `"related"` mode (activities touching visible entities, plus the user's own) was removed. It wasn't used in production and had confusing semantics. Legacy `"related"` values in dossier_access entities fall through to a deny-safe default at read time; Pydantic rejects `"related"` at write time.
+
+### Audit-level access
+
+Some endpoints expose the complete, unfiltered provenance record — all activities (including system ones), all tasks, all entities regardless of per-user filtering. These are the auditor, compliance, and long-term-preservation views:
+
+- `GET /dossiers/{id}/prov` — PROV-JSON export
+- `GET /dossiers/{id}/prov/graph/columns` — full-record column visualization
+- `GET /dossiers/{id}/archive` — PDF/A-3b archive
+
+Access to these is gated by `check_audit_access` rather than the ordinary dossier access check. A user with ordinary dossier access does **not** automatically get audit-level views; they need an explicit role grant. Two sources, both role-based (no per-agent grants):
+
+- `global_audit_access` in `config.yaml` — applies to every dossier.
+- `audit_access` list on the dossier's `oe:dossier_access` entity — per-dossier roles (e.g. a signing authority for this specific application).
+
+Default-deny: no match → 403 and an audit trail entry (`dossier.audit_denied`) for compliance investigations. The timeline endpoint (`/prov/graph/timeline`) is unaffected — it's the day-to-day user view and uses ordinary dossier access with per-user filtering.
+
 ## Dossier Archive (PDF/A-3b)
 
-The `GET /dossiers/{id}/archive` endpoint produces a self-contained PDF/A-3b archive suitable for long-term (30+ year) retention. The archive contains:
+The `GET /dossiers/{id}/archive` endpoint produces a self-contained PDF/A-3b archive suitable for long-term (30+ year) retention. It's an audit-level endpoint — see the [Audit-level access](#audit-level-access) section for role requirements. The archive contains:
 
 - **Cover page** — dossier metadata, workflow, status, creation date, all involved agents with their canonical URIs, and a full activity timeline.
 - **Provenance timeline** — a static SVG rendered server-side (pure Python, no D3 or browser required) showing activity columns and entity version markers.
@@ -821,23 +1156,25 @@ The test script (`test_requests.sh`) creates 9 dossiers:
 
 - **D1 — Brugge, RRN aanvrager.** `dienAanvraagIn` → `neemBeslissing(onvolledig)` → `vervolledigAanvraag` → `neemBeslissing(goedgekeurd)`. Exercises the happy path with direct decisions and file upload/download URL injection.
 
-- **D2 — Gent, KBO aanvrager, separate signer.** `dienAanvraagIn` → `doeVoorstelBeslissing(onvolledig)` → `tekenBeslissing` (signs) → `vervolledigAanvraag` → `bewerkAanvraag` → `doeVoorstelBeslissing(goedgekeurd)` → `tekenBeslissing` (declines) → `doeVoorstelBeslissing(goedgekeurd)` → `tekenBeslissing` (signs). Exercises the proposal-and-sign flow, decline/retry, and the anchor mechanism used by D7.
+- **D2 — Gent, KBO aanvrager, separate signer.** `dienAanvraagIn` → `doeVoorstelBeslissing(onvolledig)` → `tekenBeslissing` (signs) → `vervolledigAanvraag` → `bewerkAanvraag` → `doeVoorstelBeslissing(goedgekeurd)` → `tekenBeslissing` (declines) → `doeVoorstelBeslissing(goedgekeurd)` → `tekenBeslissing` (signs). Exercises the proposal-and-sign flow, decline/retry, and the task-cancellation end-to-end flow verified by D7.
 
 - **D3 — Batch auto-resolve.** `dienAanvraagIn` → BATCH[`bewerkAanvraag` + `doeVoorstelBeslissing`]. The second activity in the batch auto-resolves the revised aanvraag from the first activity's generated entities via the repo flush between batch steps.
 
 - **D4 — Batch explicit ref.** Same shape as D3 but with an explicit `used` reference between the two batched activities, exercising the non-auto-resolve path.
 
-- **D5 — Derivation rules (negative tests).** Five negative cases covering missing derivation chain, stale derivedFrom pointers, cross-entity derivation, unknown parent versions, and the disjoint-invariant check (an attempt to list the same entity in both `used` and `generated` fails with `422 used_generated_overlap`). Also a positive test for external URIs appearing in both `used` and `generated` in the same activity, which is allowed because externals are not PROV entities in the disjoint sense.
+- **D5 — Derivation rules (negative tests).** Six negative cases covering missing derivation chain, stale derivedFrom pointers, cross-entity derivation, unknown parent versions, and two flavors of the disjoint-invariant check: listing the same logical entity in both `used` and `generated` fails with `422 used_generated_overlap`, and the same rule applies symmetrically to external URIs — an external URI that appears in both blocks of the same activity is rejected with the same `kind: "external"` overlap payload. See `invariants.enforce_used_generated_disjoint` and `test_invariants.py::test_external_overlap_by_uri` for the authoritative behaviour.
 
-- **D6 — Stale used + `oe:neemtAkteVan`.** Positive and negative paths for acknowledging newer versions of an entity the activity chose not to revise. Uses `doeVoorstelBeslissing` (a read-only activity anchored to the aanvraag) as the test vehicle because stale-used semantics only apply to activities that inspect an entity they don't themselves revise.
+- **D6 — Stale used + `oe:neemtAkteVan`.** Positive and negative paths for acknowledging newer versions of an entity the activity chose not to revise. Uses `doeVoorstelBeslissing` (a read-only activity that inspects the aanvraag) as the test vehicle because stale-used semantics only apply to activities that inspect an entity they don't themselves revise.
 
-- **D7 — Anchor mechanism.** Verifies that D2's `trekAanvraagIn` scheduled task is anchored to the aanvraag and gets cancelled by `vervolledigAanvraag` even though `vervolledigAanvraag` doesn't list the task in its used block.
+- **D7 — Task cancellation.** Verifies that D2's `trekAanvraagIn` scheduled task (scheduled when `doeVoorstelBeslissing` returned `onvolledig`) gets cancelled by `vervolledigAanvraag` — the end-to-end cancel-on-activity-fires flow.
 
 - **D8 — Schema versioning.** Exercises per-activity `new_version` / `allowed_versions` declarations. A v1 aanvraag is revised to v2 by an activity that declares `allowed_versions: [v1, v2]`. A subsequent activity that declares `allowed_versions: [v2]` is then tried against the v1 parent and rejected with `422 unsupported_schema_version`.
 
 - **D9 — Tombstone.** Full shape check: the tombstone activity accepts one or more versions of a single logical entity in `used`, nulls their content, stamps `tombstoned_by`, and produces a generated replacement row. GETs on a tombstoned version 301-redirect to the live replacement. Re-tombstoning a later version is allowed.
 
-Expected result: **25 OKs, 0 failures.**
+- **D10 — Exception grants.** End-to-end legally-audited bypass lifecycle: a beheerder grants a `system:exception` for `oe:trekAanvraagIn` (blocked by status rule in this dossier), the read-side eligibility computation surfaces the activity in `allowedActivities` with an `exempted_by_exception` field naming the exception's version_id (so frontends can render "via exception" badging or confirmation prompts before consuming the single-use bypass), the aanvrager then runs the blocked activity and succeeds via the bypass, the engine auto-injects a `consumeException` side-effect that revises the exception to `status: consumed`, the beheerder re-grants via a revision of the same logical entity (same `entity_id`), and finally retracts it — ending with `status: cancelled`. Exercises `check_exceptions`, used-list injection, side-effect auto-injection, per-activity uniqueness, activity-field immutability across revisions, and bidirectional read/write consistency (eligibility surfacing matches bypass execution). The whole exception mechanism (model, three activities, validator, two handlers, bypass phase, eligibility surfacing) lives in the engine — toelatingen opts in via a 3-line `exceptions:` block in its workflow YAML.
+
+Expected result: **36 OKs, 0 failures.**
 
 ### Running the full test suite from scratch
 
@@ -986,27 +1323,39 @@ This sequence exercises the onvolledig → vervolledig → goedgekeurd loop, whi
 
 ## Key Design Decisions
 
-- **Activity-driven** — single endpoint pattern `PUT /dossiers/{id}/activities/{id}`, all state changes are activities.
-- **W3C PROV** is the data model — no separate audit log, the PROV graph IS the system state.
+- **Activity-driven** — single endpoint pattern `PUT /{workflow}/dossiers/{id}/activities/{id}/{type}`, all state changes are activities.
+- **Two URL families** — workflow-scoped routes (`/{workflow}/dossiers/...`) for activities, search, reference data, and validation; workflow-agnostic routes (`/dossiers/{id}/...`) for reads, PROV, archive, and entity access. A dossier's IRI (`https://id.erfgoed.net/dossiers/{id}`) is its identity; the workflow is an implementation detail.
+- **W3C PROV** is the provenance model — every entity version has a `wasGeneratedBy` activity, every revision has a `wasDerivedFrom` chain. PROV handles *who did what when*; domain relations handle *what relates to what*.
+- **Domain relations are separate from PROV** — semantic links (`oe:betreft`, `oe:valtOnder`, `oe:gerelateerd_aan`) live in the `domain_relations` table, not in the PROV graph. Both process-control and domain relations come through the same `relations` field on the activity request; the engine routes by `kind` in the YAML.
 - **All IDs client-generated** — PUTs are idempotent, safe for retry.
-- **Entity ref format**: `prefix:type/entity_id@version_id`.
-- **Append-only with redaction** — activity and entity rows are immutable except for tombstone, which NULLs content in place and leaves everything else (so the PROV graph keeps its shape).
+- **Entity ref format**: `prefix:type/entity_id@version_id` in the API; expanded to full IRIs (`https://id.erfgoed.net/dossiers/{did}/entities/...`) before storage in domain relations.
+- **Append-only with redaction** — activity and entity rows are immutable except for tombstone, which NULLs content in place and leaves everything else (so the PROV graph keeps its shape). Domain relations are superseded (not deleted) — the old row stays with `superseded_by_activity_id` for audit.
 - **Tasks are entities** — `system:task` with version lifecycle (scheduled → completed/cancelled).
 - **Typed entity access** — handlers use `context.get_singleton_typed("oe:type")` for Pydantic model instances on singleton entity types. For multi-cardinality types, use `context.get_entities_latest` to get the full list.
 - **Search delegated to Elasticsearch** — plugin provides `post_activity_hook` and search routes.
 - **External entities persisted** — external URIs stored as entities with type `"external"`, full PROV trail.
+- **Reference data is YAML-declared, served from memory** — no DB hit, sub-millisecond. Field validators are plugin-registered async callables, called between activities for fast feedback.
 - **Pipeline phases are small and documented** — every phase function in `engine/pipeline/` declares its Reads/Writes contract, which makes individual phases unit-testable against fixture `ActivityState` objects without needing the full HTTP stack.
+- **Two-tier access** — `check_dossier_access` gates business views (filtered per user); `check_audit_access` gates full-record views (`/prov`, `/prov/graph/columns`, `/archive`). A role in `global_audit_access` or the dossier's `audit_access` list is required for audit views; ordinary dossier access is not enough.
+- **Workflow constants typed and env-overridable** — each plugin declares a Pydantic `BaseSettings` subclass (`context.constants.x` from handlers, `plugin.constants.x` from hooks). Precedence: env vars > `workflow.yaml` > class defaults. Secrets go only via env vars. See `dossier_toelatingen/constants.py`.
+- **Qualified activity names** — activity names in YAML and URLs are prefixed with the plugin's IRI prefix (`oe:dienAanvraagIn`), so cross-plugin workflows can coexist without collision. The engine normalizes bare names and matches by local name where appropriate for backward-friendly plugin code.
+- **Namespace registry** — plugins declare the vocabularies they use (`namespaces:` block in workflow.yaml). Built-in prefixes (`prov`, `xsd`, `rdf`, `rdfs`) are always available; unknown prefixes fail at load time rather than producing bogus IRIs at runtime.
+- **Split-style activity hooks (opt-in)** — alongside the classic handler-returns-everything style, activities can declare `status_resolver: "name"` and/or `task_builders: [...]` in YAML to route those concerns through dedicated single-responsibility functions. Makes workflow side effects visible in the YAML without opening Python. Engine enforces "exactly one source per concern" — declaring a split hook forbids the handler from also returning that field. See `docs/plugin_guidebook.md` "Split-style hooks" for decision criteria.
 
 ## Adding a New Workflow
 
 1. Create a new plugin package (copy `dossier_toelatingen_repo/` as template)
-2. Define entities, workflow.yaml, handlers, validators, tasks, relation_validators
+2. Define entities, `workflow.yaml` (including `reference_data:` and `relation_types:`), handlers, validators, field_validators, tasks, relation_validators
 3. Add to `config.yaml`:
    ```yaml
    plugins:
      - dossier_toelatingen
-     - dossier_vergunningen
+     - dossier_inzageaanvragen
    ```
-4. Restart — new routes and search endpoints appear automatically
+4. Restart — new routes appear automatically:
+   - `/{workflow}/dossiers/...` — workflow-scoped activity, search, reference, validation endpoints
+   - Typed activity endpoints per client-callable activity
+   - Reference data served from the workflow's YAML
+   - Field validators registered by the plugin
 
 See `dossiertype_template.md` for the complete workflow definition reference.

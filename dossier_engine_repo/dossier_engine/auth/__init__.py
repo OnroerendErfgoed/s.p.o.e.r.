@@ -21,6 +21,22 @@ class User:
     uri: str | None = None  # canonical external IRI for this agent
 
 
+# Canonical system-user singleton. Used by the engine's side-effect
+# executor, the worker's task runner, and the app's bootstrap path to
+# attribute system-initiated work. Re-exported by ``dossier_engine.app``
+# as ``SYSTEM_USER`` for back-compat with callers that imported it
+# there before it moved to this module (still safe — ``app.SYSTEM_USER``
+# is the same object identity).
+SYSTEM_USER = User(
+    id="system",
+    type="systeem",
+    name="Systeem",
+    roles=["systeemgebruiker"],
+    properties={},
+    uri="https://id.erfgoed.net/agenten/system",
+)
+
+
 class POCAuthMiddleware:
     """Simulates auth by looking up X-POC-User header against config."""
 

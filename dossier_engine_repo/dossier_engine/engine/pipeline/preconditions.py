@@ -43,7 +43,11 @@ async def check_idempotency(state: ActivityState) -> dict | None:
 
     if existing.dossier_id != state.dossier_id:
         raise ActivityError(409, "Activity ID already exists for different dossier")
-    if existing.type != state.activity_def["name"]:
+    # Match by local name to tolerate legacy rows stored with a bare
+    # name (pre-qualification) being re-replayed after the engine
+    # started normalizing names to qualified form.
+    from ...prov.activity_names import local_name
+    if local_name(existing.type) != local_name(state.activity_def["name"]):
         raise ActivityError(409, "Activity ID already exists with different type")
 
     return await build_replay_response(
@@ -154,16 +158,33 @@ async def check_workflow_rules(state: ActivityState) -> None:
     has at least one activity (even a freshly-created one), all
     subsequent activities go through the full check.
 
-    Reads:  state.activity_def, state.repo, state.dossier_id
+    Also skipped when ``check_exceptions`` (the immediately preceding
+    phase) found an active ``oe:exception`` that authorizes bypass of
+    the workflow-rules layer. The exception's bypass is bypass-or-
+    nothing: ``check_exceptions`` only flags ``state.exempted_by_exception``
+    when the workflow rules would otherwise have failed, so a no-op
+    skip here is always legitimate — there was nothing that would
+    have passed to re-validate.
+
+    Reads:  state.activity_def, state.repo, state.dossier_id,
+            state.exempted_by_exception
     Writes: nothing
-    Raises: 409 if any structural rule is violated.
+    Raises: 409 if any structural rule is violated (and no bypass).
     """
     is_bootstrap = state.activity_def.get("can_create_dossier")
     if is_bootstrap and not await state.repo.get_activities_for_dossier(state.dossier_id):
         return  # First activity of a new dossier — skip structural checks.
 
+    # Exception bypass — the previous phase already established that
+    # the rules would fail AND an active exception legally overrides
+    # them. Skip the raise; side-effects will consume the exception
+    # after persistence.
+    if state.exempted_by_exception is not None:
+        return
+
     valid, error = await validate_workflow_rules(
         state.activity_def, state.repo, state.dossier_id,
+        plugin=state.plugin, now=state.now,
     )
     if not valid:
         raise ActivityError(409, error)

@@ -17,6 +17,7 @@ Features:
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from uuid import UUID
 
@@ -28,25 +29,37 @@ from sqlalchemy import select
 from ..db.models import (
     EntityRow, ActivityRow, AssociationRow, UsedRow, Repository
 )
+
+_log = logging.getLogger("dossier.routes.prov_columns")
 from ..db import get_session_factory
 from ..auth import User
-from .access import check_dossier_access, get_visibility_from_entry
+from .access import (
+    check_dossier_access, check_audit_access, get_visibility_from_entry,
+)
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 _jinja_env = Environment(loader=FileSystemLoader(str(_TEMPLATE_DIR)))
 
 
-def register_columns_graph(app, registry, get_user, global_access=None):
+def register_columns_graph(
+    app, registry, get_user,
+    global_access=None, global_audit_access=None,
+):
 
     @app.get(
         "/dossiers/{dossier_id}/prov/graph/columns",
         tags=["prov"],
         summary="PROV graph — column layout",
+        description=(
+            "Audit-level view of the complete provenance graph in a "
+            "three-band column layout. Always shows system activities "
+            "and tasks. Requires a role in global_audit_access or the "
+            "dossier's audit_access list."
+        ),
         response_class=HTMLResponse,
     )
     async def get_prov_graph_columns(
         dossier_id: UUID,
-        include_tasks: bool = True,
         user: User = Depends(get_user),
     ):
         session_factory = get_session_factory()
@@ -58,31 +71,22 @@ def register_columns_graph(app, registry, get_user, global_access=None):
                 raise HTTPException(404, detail="Dossier not found")
 
             plugin = registry.get(dossier.workflow)
-            access_entry = await check_dossier_access(repo, dossier_id, user, global_access)
-            visible_types, _ = get_visibility_from_entry(access_entry)
-
-            activities = await repo.get_activities_for_dossier(dossier_id)
-            all_entities_result = await session.execute(
-                select(EntityRow).where(EntityRow.dossier_id == dossier_id).order_by(EntityRow.created_at)
+            # Audit-level access: full graph, no filtering.
+            await check_audit_access(
+                repo, dossier_id, user, global_audit_access,
             )
-            all_entities = list(all_entities_result.scalars().all())
-            if visible_types is not None:
-                all_entities = [e for e in all_entities if e.type in visible_types]
 
-            activity_ids = [a.id for a in activities]
-            assoc_result = await session.execute(
-                select(AssociationRow).where(AssociationRow.activity_id.in_(activity_ids))
-            )
-            assoc_by_activity = {}
-            for a in assoc_result.scalars().all():
-                assoc_by_activity.setdefault(a.activity_id, []).append(a)
-
-            used_result = await session.execute(
-                select(UsedRow).where(UsedRow.activity_id.in_(activity_ids))
-            )
-            used_by_activity = {}
-            for u in used_result.scalars().all():
-                used_by_activity.setdefault(u.activity_id, []).append(u)
+            # Load the graph rowsets via the shared loader. Same four
+            # selects the /prov endpoint and /archive use, and same
+            # pre-built indexes. Layout-specific processing happens
+            # below on the returned rows; the SQL concern is owned
+            # by ``load_dossier_graph_rows``.
+            from ..db.graph_loader import load_dossier_graph_rows
+            graph_rows = await load_dossier_graph_rows(session, dossier_id)
+            activities = graph_rows.activities
+            all_entities = graph_rows.entities
+            assoc_by_activity = graph_rows.assoc_by_activity
+            used_by_activity = graph_rows.used_by_activity
 
             system_activity_types = set()
             if plugin:
@@ -90,9 +94,9 @@ def register_columns_graph(app, registry, get_user, global_access=None):
                     if act_def.get("client_callable") is False:
                         system_activity_types.add(act_def["name"])
 
-            if not include_tasks:
-                activities = [a for a in activities if a.type != "systemAction"]
-                all_entities = [e for e in all_entities if e.type != "system:task"]
+            # Audit view: always include tasks and system activities.
+            # No query param gating — this endpoint is for the full
+            # unfiltered record.
 
             activity_by_id = {a.id: a for a in activities}
             entity_by_id = {e.id: e for e in all_entities}
@@ -133,7 +137,21 @@ def register_columns_graph(app, registry, get_user, global_access=None):
                             try:
                                 scheduled_ids.add(UUID(raid))
                             except (ValueError, AttributeError):
-                                pass
+                                # result_activity_id is written by the
+                                # engine as ``str(uuid4())``, so a
+                                # malformed value here is row corruption
+                                # (or a pre-migration legacy row that
+                                # stored a non-UUID). Skipping drops this
+                                # task from the scheduled-activity column
+                                # set, which is safe — the task still
+                                # runs, it just doesn't get a dedicated
+                                # column in the graph. Log so the
+                                # corruption is visible.
+                                _log.warning(
+                                    "Malformed result_activity_id %r on "
+                                    "task entity %s; skipping column mapping",
+                                    raid, e.id,
+                                )
 
             # Build top row
             top_row = []
@@ -218,7 +236,20 @@ def register_columns_graph(app, registry, get_user, global_access=None):
                     try:
                         col_for_act[UUID(col["id"])] = i
                     except (ValueError, AttributeError):
-                        pass
+                        # Column ids come from either activity.id
+                        # (always a real UUID) or a dummy-column slot
+                        # where id is set to a non-UUID placeholder —
+                        # those are legitimately not UUIDs and we
+                        # correctly skip them. But if id looks UUID-ish
+                        # and fails to parse, that's anomalous; debug-
+                        # level log keeps the graph-rendering path
+                        # quiet for the expected-skip case while still
+                        # leaving a trail if a structural bug ever
+                        # starts producing malformed ids.
+                        _log.debug(
+                            "Column id %r is not a UUID; not mapped to an activity",
+                            col["id"],
+                        )
 
             # Assign side effects to columns
             side_effect_ids = set()
